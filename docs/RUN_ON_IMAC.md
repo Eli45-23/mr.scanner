@@ -53,6 +53,38 @@ Configure these private/local values:
 
 Never commit `.env`, `config.local.json`, or `secrets.json`.
 
+The local `.env` should contain this configuration. Keep all credential values private:
+
+```dotenv
+# Alpaca market-data credentials
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+ALPACA_STOCK_FEED=sip
+ALPACA_OPTIONS_FEED=opra
+ALPACA_ALLOW_INDICATIVE_OPTIONS_FALLBACK=true
+
+# Optional alert channels
+DISCORD_WEBHOOK_URL=
+ALERT_SMS_PHONE=
+PUSHOVER_APP_TOKEN=
+PUSHOVER_USER_KEY=
+
+# Telegram
+ENABLE_TELEGRAM_ALERTS=true
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_ALERT_TYPES=PHASE3_HEADS_UP,NORMAL_SMS
+TELEGRAM_AAPL_ONLY=true
+TELEGRAM_SEND_TEST_ON_START=false
+TELEGRAM_TIMEOUT_SECONDS=8
+PHASE3_HEADS_UP_SYMBOLS=AAPL
+MARKET_CONTEXT_SYMBOLS=SPY,QQQ
+
+# Optional AI dashboard review
+OPENAI_API_KEY=
+ENABLE_AI_REVIEW=false
+```
+
 ## 5. Verify the runtime
 
 ```bash
