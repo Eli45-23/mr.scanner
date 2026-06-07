@@ -1,12 +1,28 @@
 #!/bin/zsh
 set -u
 
-PROJECT="/Users/DayTrade/Documents/Codex/2026-05-23/files-mentioned-by-the-user-elite/elite_scanner"
+SCRIPT_PATH="${0:A}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  TARGET="$(readlink "$SCRIPT_PATH")"
+  [[ "$TARGET" = /* ]] && SCRIPT_PATH="$TARGET" || SCRIPT_PATH="${SCRIPT_PATH:h}/$TARGET"
+  SCRIPT_PATH="${SCRIPT_PATH:A}"
+done
+PROJECT="${SCRIPT_PATH:h}"
 DASHBOARD_URL="http://127.0.0.1:8765"
 PYTHON="$PROJECT/.venv/bin/python"
 
 cd "$PROJECT" || exit 1
 mkdir -p logs
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "Virtual environment missing. Run: ./tools/setup_imac.sh"
+  exit 1
+fi
+
+if ! command -v screen >/dev/null 2>&1; then
+  echo "screen is not installed. Install it first, then run this launcher again."
+  exit 1
+fi
 
 screen_running() {
   screen -ls 2>/dev/null | grep -q "[.]$1[[:space:]]"

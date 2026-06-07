@@ -1,1 +1,2 @@
-requests>=2.31.0
+# Runtime, Telegram, Alpaca REST market data, dashboard checks, and export tools.
+requests>=2.31.0,<3

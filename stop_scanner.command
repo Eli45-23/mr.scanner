@@ -1,6 +1,16 @@
 #!/bin/zsh
 set -u
 
+SCRIPT_PATH="${0:A}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  TARGET="$(readlink "$SCRIPT_PATH")"
+  [[ "$TARGET" = /* ]] && SCRIPT_PATH="$TARGET" || SCRIPT_PATH="${SCRIPT_PATH:h}/$TARGET"
+  SCRIPT_PATH="${SCRIPT_PATH:A}"
+done
+PROJECT="${SCRIPT_PATH:h}"
+
+cd "$PROJECT" || exit 1
+
 screen_running() {
   screen -ls 2>/dev/null | grep -q "[.]$1[[:space:]]"
 }

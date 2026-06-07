@@ -1,7 +1,10 @@
 # Secrets and local configuration
 .env
 .env.*
+*.env
 !.env.example
+config.local.json
+secrets.json
 
 # Python environments and caches
 .venv/
@@ -18,9 +21,9 @@ dashboard_export_*.json
 *.log
 *.out
 *.err
+*.zip
 
 # macOS and editor files
 .DS_Store
 .idea/
 .vscode/
-

@@ -1,5 +1,7 @@
 # Elite Momentum Scanner
 
+For installation on another Mac, see [docs/RUN_ON_IMAC.md](docs/RUN_ON_IMAC.md).
+
 A real-time stock momentum alert system built for traders who want to catch **unusual movement early** without auto-trading.
 
 ## What it detects
