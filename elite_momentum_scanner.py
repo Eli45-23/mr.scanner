@@ -1,0 +1,7696 @@
+#!/usr/bin/env python3
+"""
+Elite Momentum Scanner
+======================
+A real-time momentum alert system designed for active stock/options traders.
+
+What it does
+------------
+- Scans a symbol universe during premarket, regular hours, and postmarket.
+- Detects:
+  * fast intraday moves
+  * unusual relative volume
+  * breaks of premarket high / low
+  * opening-range breaks
+  * trend continuation / flush setups
+  * news catalysts (when provider supports it)
+- Sends rich Discord alerts.
+- Logs alerts to CSV + JSONL.
+- Keeps cooldowns so you are not spammed.
+- Includes a dry-run / mock test mode.
+
+What it does not do
+-------------------
+- Place trades
+- Guarantee profitable setups
+- Replace your chart reading or risk management
+
+Data provider
+-------------
+This version is built around Alpaca market data + Alpaca news.
+You can later swap the provider layer if needed.
+
+Environment variables
+---------------------
+Required for live mode:
+    ALPACA_API_KEY
+    ALPACA_SECRET_KEY
+Optional:
+    DISCORD_WEBHOOK_URL
+
+Run examples
+------------
+    python elite_momentum_scanner.py --mode live
+    python elite_momentum_scanner.py --mode dry-run
+    python elite_momentum_scanner.py --mode test
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import random
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
+
+import requests
+from strategies import evaluate_strategy_suite
+from strategies.base import ema as strategy_ema, vwap as strategy_vwap
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+UTC = timezone.utc
+
+APP_DIR = Path(__file__).resolve().parent
+LOG_DIR = APP_DIR / "logs"
+STATE_DIR = APP_DIR / "state"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
+NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
+
+logger = logging.getLogger("elite_scanner")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+
+# ------------------------------------------------------------
+# Default config
+# ------------------------------------------------------------
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "symbols": [
+        "AAPL",
+    ],
+    "scan_interval_seconds": 10,
+    "premarket_start": "04:00",
+    "market_open": "09:30",
+    "market_close": "16:00",
+    "postmarket_end": "20:00",
+    "lookback_minutes_fast_move": 5,
+    "fast_move_pct_threshold": 1.5,
+    "day_move_pct_threshold": 4.0,
+    "relative_volume_threshold": 3.0,
+    "opening_range_minutes": 5,
+    "opening_range_minutes_secondary": 15,
+    "opening_range_break_buffer_pct": 0.03,
+    "opening_range_watch_proximity_pct": 0.12,
+    "premarket_watch_proximity_pct": 0.15,
+    "alert_cooldown_seconds": 600,
+    "max_news_age_minutes": 720,
+    "only_symbols_with_options": True,
+    "symbols_with_options": [
+        "AAPL"
+    ],
+    "filters": {
+        "min_price": 2.0,
+        "max_price": 1000.0,
+        "min_day_volume": 100000,
+    },
+    "alert_rules": {
+        "fast_move": True,
+        "high_relative_volume": True,
+        "premarket_high_break": True,
+        "premarket_low_break": True,
+        "opening_range_break": True,
+        "news_catalyst": True,
+    },
+    "discord": {
+        "enabled": True,
+        "mention": "",
+    },
+    "notifications": {
+        "mac_desktop_enabled": True,
+        "pushover_enabled": True,
+        "messages_enabled": True,
+        "messages_watch_enabled": True,
+        "telegram_enabled": False,
+        "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS"],
+        "telegram_aapl_only": True,
+        "telegram_send_test_on_start": False,
+        "telegram_timeout_seconds": 8,
+    },
+    "outputs": {
+        "csv_log": str(LOG_DIR / "alerts.csv"),
+        "jsonl_log": str(LOG_DIR / "alerts.jsonl"),
+        "state_file": str(STATE_DIR / "scanner_state.json"),
+    },
+    "discovery": {
+        "enabled": True,
+        "max_universe_symbols": 1200,
+        "max_candidates": 100,
+        "batch_size": 150,
+        "include_etfs": True,
+        "include_otc": False,
+    },
+    "data_quality": {
+        "stale_after_minutes": 20,
+        "min_recent_bars": 10,
+    },
+    "market_data": {
+        "stock_feed": "sip",
+        "api_rate_limit_mode": "Algo Trader Plus expected",
+        "websocket_symbol_limit": "paid/unlimited expected",
+    },
+    "alert_quality": {
+        "sms_min_grade": "B",
+        "min_sms_score": 55,
+        "min_sms_options_score": 65,
+        "min_sms_rvol": 1.5,
+        "max_sms_bar_age_minutes": 2.0,
+        "max_sms_option_spread_pct": 8.0,
+        "market_alignment_required": True,
+        "hold_break_bars": 1,
+        "immediate_break_min_distance_pct": 0.08,
+        "immediate_break_min_fast_move_pct": 0.15,
+        "watch_min_rvol": 0.8,
+        "watch_min_score": 35,
+        "watch_text_min_rvol": 0.45,
+        "watch_text_min_score": 15,
+        "watch_text_min_options_score": 60,
+        "watch_market_alignment_required": False,
+        "watch_block_opposed_market": True,
+        "opposed_bearish_watch_enabled": True,
+        "opposed_bearish_watch_min_rvol": 0.30,
+        "opposed_bearish_watch_min_score": 15,
+        "opposed_bearish_watch_min_options_score": 65,
+        "opposed_bearish_watch_min_fast_move_pct": 0.08,
+        "opposed_bearish_watch_min_day_move_pct": 0.75,
+        "opposed_bearish_watch_max_counter_day_move_pct": 2.5,
+        "opposed_bearish_watch_max_break_distance_pct": 1.50,
+        "sms_symbol_cooldown_seconds": 1200,
+        "watch_symbol_cooldown_seconds": 600,
+        "strong_fast_break_min_rvol": 1.25,
+        "strong_fast_break_min_fast_move_pct": 0.75,
+        "allow_unknown_market_for_strong_fast_break": True,
+        "trend_flip_after_watch_enabled": True,
+        "trend_flip_after_watch_lookback_seconds": 900,
+        "trend_flip_after_watch_min_fast_move_pct": 0.12,
+        "trend_flip_after_watch_min_rvol": 1.0,
+        "failed_breakout_watch_enabled": True,
+        "failed_breakout_watch_min_fast_move_pct": 0.12,
+        "failed_breakout_watch_lookback_bars": 8,
+        "failed_breakout_watch_max_distance_pct": 0.60,
+        "block_text_when_fast_move_opposes_setup_pct": 0.08,
+        "sustained_trend_watch_enabled": True,
+        "sustained_trend_watch_lookback_bars": 12,
+        "sustained_trend_watch_min_move_pct": 0.12,
+        "sustained_trend_watch_min_index_move_pct": 0.08,
+        "sustained_trend_watch_min_rvol": 0.45,
+        "sustained_trend_watch_min_green_ratio": 0.58,
+        "fast_impulse_watch_enabled": True,
+        "fast_impulse_watch_lookback_bars": 3,
+        "fast_impulse_watch_min_move_pct": 0.18,
+        "fast_impulse_watch_min_index_move_pct": 0.08,
+        "fast_impulse_watch_min_rvol": 1.2,
+        "fast_impulse_watch_min_aligned_ratio": 0.66,
+        "generic_day_conflict_min_day_pct": 1.0,
+        "generic_day_conflict_max_fast_pct": 0.25,
+        "late_day_repeat_after": "14:30",
+        "late_day_generic_min_aligned_fast_move_pct": 0.12,
+        "late_day_generic_min_rvol": 3.5,
+        "trend_flip_watch_enabled": True,
+        "trend_flip_lookback_seconds": 3600,
+        "trend_flip_min_rvol": 1.0,
+        "trend_flip_min_options_score": 60,
+        "max_sms_break_distance_pct": 0.75,
+        "max_sms_index_break_distance_pct": 0.30,
+        "allow_indicative_sms": True,
+        "sms_min_confirmation_score": 60,
+        "sms_strong_confirmation_score": 70,
+        "sms_block_choppy_market": True,
+        "sms_require_candle_alignment": True,
+        "sms_require_no_direction_conflict": True,
+        "sms_orb_dedupe_minutes": 15,
+        "a_plus_min_confirmation_score": 70,
+    },
+    "strategy_engine": {
+        "enabled": True,
+        "enable_liquidity_sweep": True,
+        "enable_vwap_reclaim": True,
+        "enable_opening_range": True,
+        "enable_volume_quality": True,
+        "enable_candle_strength": True,
+        "enable_retest_hold": True,
+        "enable_extension_exhaustion": True,
+        "enable_relative_strength": True,
+        "enable_market_regime": True,
+        "enable_pressure_score": False,
+        "min_strategy_score_to_alert": 60,
+        "sweep_reclaim_candles": 3,
+        "volume_confirm_multiplier": 1.5,
+        "max_extension_from_vwap_pct": 0.6,
+        "max_extension_from_ema9_pct": 0.4,
+        "opening_range_minutes_primary": 5,
+        "opening_range_minutes_secondary": 15,
+    },
+    "scenario_engine": {
+        "enabled": True,
+        "shadow_mode": False,
+        "control_dashboard": True,
+        "control_sms": False,
+        "enable_phase3_heads_up_alerts": True,
+        "phase3_heads_up_sms_enabled": True,
+        "phase3_heads_up_min_scenario_score": 80,
+        "phase3_heads_up_min_stock_score": 65,
+        "phase3_heads_up_min_confirmation_score": 55,
+        "phase3_good_position_min_scenario_score": 85,
+        "phase3_good_position_min_stock_score": 70,
+        "phase3_good_position_min_confirmation_score": 60,
+        "phase3_heads_up_dedupe_minutes": 15,
+        "phase3_heads_up_symbols": ["AAPL"],
+        "market_context_symbols": ["SPY", "QQQ"],
+        "phase3_late_warning_phone_enabled": False,
+        "phase3_late_warning_dedupe_minutes": 30,
+        "min_dashboard_score": 55,
+        "min_confirmed_score": 70,
+        "good_position_score": 75,
+        "dedupe_minutes": 10,
+        "option_logic_separate_from_stock_setup": True,
+        "options_do_not_hide_stock_setups": True,
+        "options_block_sms_only": True,
+        "opra_unavailable_allow_stock_dashboard": True,
+        "opra_unavailable_require_stronger_sms": True,
+        "sms_min_stock_setup_score": 70,
+        "sms_min_confirmation_score": 60,
+        "sms_strong_stock_setup_score": 85,
+        "sms_strong_confirmation_score": 70,
+        "sms_block_scenario_conflict": True,
+        "sms_require_good_stage": True,
+    },
+    "confirmation": {
+        "volume_quality": {
+            "enabled": True,
+            "rvol_lookback_candles": 20,
+            "min_rvol_confirmation": 1.5,
+            "strong_rvol_confirmation": 2.0,
+            "climax_rvol_multiplier": 3.5,
+            "volume_exhaustion_candle_count": 3,
+        },
+        "candle_strength": {
+            "enabled": True,
+            "buyer_control_close_top_pct": 25,
+            "seller_control_close_bottom_pct": 25,
+            "min_body_pct_for_control": 45,
+            "large_wick_pct": 40,
+            "indecision_body_pct": 25,
+        },
+        "retest_hold": {
+            "enabled": True,
+            "retest_lookback_candles": 10,
+            "retest_max_distance_from_level_pct": 0.15,
+            "retest_confirm_candles": 2,
+            "retest_pullback_volume_max_multiplier": 1.2,
+        },
+        "extension_exhaustion": {
+            "enabled": True,
+            "max_extension_from_vwap_pct": 0.6,
+            "max_extension_from_ema9_pct": 0.4,
+            "max_extension_from_key_level_pct": 0.3,
+            "consecutive_large_candle_limit": 3,
+            "do_not_chase_extension_score": 80,
+        },
+        "relative_strength": {
+            "enabled": True,
+            "rs_lookback_candles": 5,
+            "rs_strong_diff_pct": 0.20,
+            "rs_weak_diff_pct": -0.20,
+            "market_confirm_symbols": ["SPY", "QQQ"],
+        },
+        "market_regime": {
+            "enabled": True,
+            "market_regime_lookback_candles": 15,
+            "choppy_vwap_cross_count": 3,
+            "trend_min_score": 65,
+        },
+        "pressure_score": {
+            "enabled": False,
+            "pressure_lookback_trades": 50,
+            "large_print_multiplier": 3.0,
+            "min_pressure_score_confirmation": 60,
+            "max_spread_pct": 0.08,
+            "enable_quote_imbalance": True,
+        },
+    },
+    "options": {
+        "enabled": True,
+        "feed": "opra",
+        "allow_indicative_fallback": True,
+        "expiry_mode": "0dte_then_weekly",
+        "delta_min": 0.30,
+        "delta_max": 0.60,
+        "max_spread_pct": 12,
+        "min_option_volume": 100,
+        "min_open_interest": 250,
+        "max_quote_age_seconds": 60,
+        "max_chain_contracts": 1000,
+    },
+}
+
+
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
+@dataclass
+class Bar:
+    t: datetime
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+
+
+@dataclass
+class NewsItem:
+    symbol: str
+    headline: str
+    url: str
+    published_at: datetime
+    source: str = ""
+
+
+@dataclass
+class OptionContractSnapshot:
+    symbol: str
+    underlying_symbol: str
+    option_type: str
+    expiration_date: date
+    strike: float
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    last: Optional[float] = None
+    quote_time: Optional[datetime] = None
+    trade_time: Optional[datetime] = None
+    volume: Optional[int] = None
+    open_interest: Optional[int] = None
+    delta: Optional[float] = None
+    implied_volatility: Optional[float] = None
+    feed: str = ""
+    is_simulated: bool = False
+
+    @property
+    def mid(self) -> Optional[float]:
+        if self.bid is None or self.ask is None or self.bid <= 0 or self.ask <= 0:
+            return None
+        return (self.bid + self.ask) / 2.0
+
+    @property
+    def spread_pct(self) -> Optional[float]:
+        mid = self.mid
+        if mid is None or mid <= 0:
+            return None
+        return ((self.ask or 0) - (self.bid or 0)) / mid * 100.0
+
+
+@dataclass
+class OptionSelection:
+    contract: Optional[OptionContractSnapshot] = None
+    quality: str = "No clean contract"
+    score: int = 0
+    reasons: List[str] = field(default_factory=list)
+
+    def is_tradable(self) -> bool:
+        return self.quality == "Tradable" and self.contract is not None
+
+
+@dataclass
+class SymbolSnapshot:
+    symbol: str
+    latest_bar: Optional[Bar] = None
+    recent_bars: List[Bar] = field(default_factory=list)
+    premarket_high: Optional[float] = None
+    premarket_low: Optional[float] = None
+    opening_range_high: Optional[float] = None
+    opening_range_low: Optional[float] = None
+    opening_range_15_high: Optional[float] = None
+    opening_range_15_low: Optional[float] = None
+    latest_news: Optional[NewsItem] = None
+    best_call: OptionSelection = field(default_factory=OptionSelection)
+    best_put: OptionSelection = field(default_factory=OptionSelection)
+
+
+@dataclass
+class Alert:
+    symbol: str
+    timestamp: datetime
+    category: str
+    price: float
+    fast_move_pct: Optional[float] = None
+    day_move_pct: Optional[float] = None
+    relative_volume: Optional[float] = None
+    premarket_high: Optional[float] = None
+    premarket_low: Optional[float] = None
+    opening_range_high: Optional[float] = None
+    opening_range_low: Optional[float] = None
+    headline: Optional[str] = None
+    url: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+    option_contract: Optional[str] = None
+    option_type: Optional[str] = None
+    option_expiration: Optional[str] = None
+    option_strike: Optional[float] = None
+    option_bid: Optional[float] = None
+    option_ask: Optional[float] = None
+    option_mid: Optional[float] = None
+    option_spread_pct: Optional[float] = None
+    option_delta: Optional[float] = None
+    option_iv: Optional[float] = None
+    option_volume: Optional[int] = None
+    option_open_interest: Optional[int] = None
+    option_quality: Optional[str] = None
+    options_score: Optional[int] = None
+    direction: Optional[str] = None
+    alert_grade: Optional[str] = None
+    alert_score: Optional[int] = None
+    sms_allowed: bool = False
+    watch_allowed: bool = False
+    market_alignment: Optional[str] = None
+    text_alert_reason: Optional[str] = None
+    setup_level: Optional[str] = None
+    trigger_level: Optional[float] = None
+    primary_setup: Optional[str] = None
+    secondary_setups: List[str] = field(default_factory=list)
+    strategy_direction: Optional[str] = None
+    strategy_confidence_score: Optional[int] = None
+    strategy_confidence_label: Optional[str] = None
+    risk_label: Optional[str] = None
+    confirmation_score: Optional[int] = None
+    confirmation_label: Optional[str] = None
+    entry_quality_label: Optional[str] = None
+    volume_label: Optional[str] = None
+    rvol_detail: Optional[float] = None
+    candle_label: Optional[str] = None
+    candle_score: Optional[int] = None
+    extension_label: Optional[str] = None
+    extension_score: Optional[int] = None
+    relative_strength_label: Optional[str] = None
+    relative_strength_score: Optional[int] = None
+    market_regime: Optional[str] = None
+    market_score: Optional[int] = None
+    pressure_label: Optional[str] = None
+    pressure_score: Optional[int] = None
+    scenario_top: Optional[Dict[str, Any]] = None
+    scenario_second: Optional[Dict[str, Any]] = None
+    scenario_score: Optional[int] = None
+    scenario_stage: Optional[str] = None
+    scenario_direction: Optional[str] = None
+    scenario_confidence_label: Optional[str] = None
+    scenario_entry_quality_label: Optional[str] = None
+    scenario_risk_label: Optional[str] = None
+    scenario_reasons: List[str] = field(default_factory=list)
+    scenario_warnings: List[str] = field(default_factory=list)
+    scenario_levels: Dict[str, float] = field(default_factory=dict)
+    bullish_score: Optional[int] = None
+    bearish_score: Optional[int] = None
+    chop_score: Optional[int] = None
+    fakeout_score: Optional[int] = None
+    scenario_conflict: Optional[bool] = None
+    all_scenarios: List[Dict[str, Any]] = field(default_factory=list)
+    stock_setup_score: Optional[int] = None
+    stock_setup_valid: Optional[bool] = None
+    option_tradability_score: Optional[int] = None
+    option_feed_status: Optional[str] = None
+    option_tradable: Optional[bool] = None
+    scenario_alert_eligible: Optional[bool] = None
+    scenario_would_sms: Optional[bool] = None
+    scenario_alert_tier: Optional[str] = None
+    scenario_alert_block_reason: Optional[str] = None
+    scenario_sms_block_reason: Optional[str] = None
+    sms_allowed_by_stock: Optional[bool] = None
+    sms_allowed_by_options: Optional[bool] = None
+    sms_block_reason: Optional[str] = None
+    scenario_sms_allowed: Optional[bool] = None
+    stock_setup_score_reason: Optional[str] = None
+    phase3_heads_up_eligible: Optional[bool] = None
+    phase3_heads_up_sent: Optional[bool] = None
+    phase3_heads_up_block_reason: Optional[str] = None
+    phase3_heads_up_type: Optional[str] = None
+    phase3_heads_up_dedupe_key: Optional[str] = None
+    phase3_heads_up_dedupe_blocked: Optional[bool] = None
+    phase3_heads_up_last_sent_time: Optional[str] = None
+    phase3_heads_up_next_eligible_time: Optional[str] = None
+    phase3_heads_up_dedupe_minutes_remaining: Optional[float] = None
+    market_confirmation_status: Optional[str] = None
+    context_symbols_available: List[str] = field(default_factory=list)
+    phase3_heads_up_message_preview: Optional[str] = None
+    strategy_reasons: List[str] = field(default_factory=list)
+    strategy_warnings: List[str] = field(default_factory=list)
+    strategy_levels: Dict[str, float] = field(default_factory=dict)
+    strategy_results: List[Dict[str, Any]] = field(default_factory=list)
+
+    def dedupe_key(self) -> str:
+        day_key = self.timestamp.astimezone(ET).strftime("%Y-%m-%d")
+        level = self.setup_level or "ALERT"
+        return f"{day_key}:{self.symbol}:{level}:{self.category}"
+
+    def short_summary(self) -> str:
+        extras: List[str] = []
+        if self.fast_move_pct is not None:
+            extras.append(f"{self.fast_move_pct:+.2f}% fast")
+        if self.day_move_pct is not None:
+            extras.append(f"day {self.day_move_pct:+.2f}%")
+        if self.relative_volume is not None:
+            extras.append(f"RVOL {self.relative_volume:.2f}x")
+        if self.alert_grade:
+            extras.append(f"grade {self.alert_grade}")
+        return f"{self.symbol} | ${self.price:.2f} | {self.category} | " + " | ".join(extras)
+
+
+# ------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+def now_et() -> datetime:
+    return now_utc().astimezone(ET)
+
+
+def parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    h, m = hhmm.split(":")
+    return int(h), int(m)
+
+
+def set_today_time_et(hhmm: str) -> datetime:
+    h, m = parse_hhmm(hhmm)
+    t = now_et()
+    return t.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def pct_change(new: float, old: float) -> float:
+    if old == 0:
+        return 0.0
+    return ((new - old) / old) * 100.0
+
+
+def average(values: Iterable[float]) -> Optional[float]:
+    vals = list(values)
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def first_present(item: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        if key in item and item[key] is not None:
+            return item[key]
+    return None
+
+
+def optional_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_optional_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def parse_option_symbol(contract_symbol: str, underlying_symbol: str) -> Optional[Tuple[str, date, float]]:
+    if not contract_symbol.startswith(underlying_symbol):
+        return None
+    tail = contract_symbol[len(underlying_symbol):]
+    if len(tail) < 15:
+        return None
+    yymmdd = tail[:6]
+    option_type = tail[6].upper()
+    strike_raw = tail[7:]
+    if option_type not in {"C", "P"} or not yymmdd.isdigit() or not strike_raw.isdigit():
+        return None
+    try:
+        expiration = datetime.strptime(yymmdd, "%y%m%d").date()
+    except ValueError:
+        return None
+    return option_type, expiration, int(strike_raw) / 1000.0
+
+
+def option_symbol(underlying: str, expiration: date, option_type: str, strike: float) -> str:
+    return f"{underlying}{expiration.strftime('%y%m%d')}{option_type}{int(round(strike * 1000)):08d}"
+
+
+def load_dotenv(path: Path = APP_DIR / ".env") -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def normalize_feed(value: Any, default: str) -> str:
+    feed = str(value or default).strip().lower()
+    return feed or default
+
+
+def stock_feed_from_config(config: Dict[str, Any]) -> str:
+    return normalize_feed(config.get("market_data", {}).get("stock_feed"), "sip")
+
+
+def options_feed_from_config(config: Dict[str, Any]) -> str:
+    return normalize_feed(config.get("options", {}).get("feed"), "opra")
+
+
+def opra_agreement_error(text: str) -> bool:
+    lower = text.lower()
+    return "opra" in lower and ("agreement" in lower or "not signed" in lower or "subscription" in lower)
+
+
+def append_market_data_status(payload: Dict[str, Any]) -> None:
+    MARKET_DATA_STATUS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with MARKET_DATA_STATUS_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def latest_market_data_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config or DEFAULT_CONFIG
+    fallback = bool(config.get("options", {}).get("allow_indicative_fallback", True))
+    base = {
+        "timestamp": None,
+        "stock_feed_requested": stock_feed_from_config(config).upper(),
+        "stock_feed_status": "unknown",
+        "options_feed_requested": options_feed_from_config(config).upper(),
+        "options_feed_status": "unknown",
+        "opra_status": "unknown",
+        "api_rate_limit_mode": config.get("market_data", {}).get("api_rate_limit_mode", "Algo Trader Plus expected"),
+        "websocket_symbol_limit": config.get("market_data", {}).get("websocket_symbol_limit", "paid/unlimited expected"),
+        "allow_indicative_options_fallback": fallback,
+        "last_data_check_time": None,
+        "feed_warning": "",
+    }
+    if not MARKET_DATA_STATUS_LOG.exists():
+        return base
+    try:
+        last_line = ""
+        with MARKET_DATA_STATUS_LOG.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    last_line = line
+        if not last_line:
+            return base
+        loaded = json.loads(last_line)
+        if isinstance(loaded, dict):
+            base.update(loaded)
+    except Exception as exc:
+        base["feed_warning"] = f"Could not read market data status log: {exc}"
+    return base
+
+
+# ------------------------------------------------------------
+# Data provider protocol
+# ------------------------------------------------------------
+class DataProvider(Protocol):
+    def get_latest_bars(self, symbols: List[str]) -> Dict[str, Bar]: ...
+    def get_recent_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]: ...
+    def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]: ...
+    def discover_symbols(self, config: Dict[str, Any]) -> List[str]: ...
+    def get_option_chain(self, symbol: str, config: Dict[str, Any]) -> List[OptionContractSnapshot]: ...
+
+
+# ------------------------------------------------------------
+# Alpaca live provider
+# ------------------------------------------------------------
+class AlpacaProvider:
+    def __init__(self, api_key: str, secret_key: str, feed: str = "sip") -> None:
+        self.feed = normalize_feed(feed, "sip")
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": secret_key,
+            }
+        )
+        self.base_v2 = "https://data.alpaca.markets/v2"
+        self.base_v1beta = "https://data.alpaca.markets/v1beta1"
+        self.asset_bases = [
+            "https://paper-api.alpaca.markets/v2",
+            "https://api.alpaca.markets/v2",
+        ]
+        self._asset_symbol_cache: Optional[List[str]] = None
+
+    def get_latest_bars(self, symbols: List[str]) -> Dict[str, Bar]:
+        resp = self.session.get(
+            f"{self.base_v2}/stocks/bars/latest",
+            params={"symbols": ",".join(symbols), "feed": self.feed},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("bars", {})
+        out: Dict[str, Bar] = {}
+        for symbol, item in raw.items():
+            out[symbol] = self._bar_from_json(item)
+        return out
+
+    def get_recent_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]:
+        resp = self.session.get(
+            f"{self.base_v2}/stocks/bars",
+            params={
+                "symbols": ",".join(symbols),
+                "timeframe": "1Min",
+                "start": start.astimezone(UTC).isoformat(),
+                "end": end.astimezone(UTC).isoformat(),
+                "adjustment": "raw",
+                "feed": self.feed,
+                "limit": 10000,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("bars", {})
+        out: Dict[str, List[Bar]] = {}
+        for symbol, items in raw.items():
+            out[symbol] = [self._bar_from_json(item) for item in items]
+        return out
+
+    def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
+        resp = self.session.get(
+            f"{self.base_v1beta}/news",
+            params={"symbols": ",".join(symbols), "limit": limit, "sort": "desc"},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            logger.warning("News fetch failed: %s %s", resp.status_code, resp.text[:200])
+            return []
+        raw = resp.json().get("news", [])
+        out: List[NewsItem] = []
+        for item in raw:
+            syms = item.get("symbols") or []
+            for sym in syms:
+                if sym in symbols:
+                    out.append(
+                        NewsItem(
+                            symbol=sym,
+                            headline=item.get("headline", ""),
+                            url=item.get("url", ""),
+                            published_at=datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")),
+                            source=item.get("source", ""),
+                        )
+                    )
+        return out
+
+    def discover_symbols(self, config: Dict[str, Any]) -> List[str]:
+        if self._asset_symbol_cache is not None:
+            return list(self._asset_symbol_cache)
+
+        discovery = config.get("discovery", {})
+        include_otc = bool(discovery.get("include_otc", False))
+        max_universe = int(discovery.get("max_universe_symbols", 1200))
+        assets: List[Dict[str, Any]] = []
+        last_error = ""
+
+        for base in self.asset_bases:
+            resp = self.session.get(
+                f"{base}/assets",
+                params={"status": "active", "asset_class": "us_equity"},
+                timeout=30,
+            )
+            if resp.status_code < 400:
+                assets = resp.json()
+                break
+            last_error = f"{resp.status_code} {resp.text[:160]}"
+
+        if not assets:
+            logger.warning("Asset discovery failed: %s", last_error or "no assets returned")
+            return []
+
+        symbols: List[str] = []
+        for asset in assets:
+            symbol = str(asset.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            if asset.get("status") != "active" or not asset.get("tradable", False):
+                continue
+            exchange = str(asset.get("exchange", "")).upper()
+            if not include_otc and exchange == "OTC":
+                continue
+            if "/" in symbol or "." in symbol or " " in symbol:
+                continue
+            symbols.append(symbol)
+            if len(symbols) >= max_universe:
+                break
+
+        self._asset_symbol_cache = symbols
+        return list(symbols)
+
+    def get_option_chain(self, symbol: str, config: Dict[str, Any]) -> List[OptionContractSnapshot]:
+        options_config = config.get("options", {})
+        if not options_config.get("enabled", True):
+            return []
+
+        preferred_feed = options_feed_from_config(config)
+        limit = int(options_config.get("max_chain_contracts", 1000))
+        snapshots: List[OptionContractSnapshot] = []
+        feeds_to_try = [preferred_feed]
+        if preferred_feed == "opra" and bool(options_config.get("allow_indicative_fallback", True)):
+            feeds_to_try.append("indicative")
+
+        for feed in feeds_to_try:
+            token: Optional[str] = None
+            snapshots = []
+            while True:
+                today = now_et().date()
+                params: Dict[str, Any] = {
+                    "feed": feed,
+                    "limit": limit,
+                    "expiration_date_gte": today.isoformat(),
+                    "expiration_date_lte": (today + timedelta(days=7)).isoformat(),
+                }
+                if token:
+                    params["page_token"] = token
+                resp = self.session.get(
+                    f"{self.base_v1beta}/options/snapshots/{symbol}",
+                    params=params,
+                    timeout=30,
+                )
+                if resp.status_code >= 400:
+                    logger.warning("Option chain fetch failed for %s using %s: %s %s", symbol, feed, resp.status_code, resp.text[:200])
+                    if feed == "opra" and opra_agreement_error(resp.text):
+                        logger.warning("OPRA agreement not signed — sign Alpaca OPRA agreement. Options remain indicative.")
+                    break
+
+                body = resp.json()
+                raw_snapshots = body.get("snapshots", body)
+                for contract_symbol, item in raw_snapshots.items():
+                    parsed = parse_option_symbol(contract_symbol, symbol)
+                    if not parsed:
+                        continue
+                    option_type, expiration_date, strike = parsed
+                    quote = item.get("latestQuote") or item.get("latest_quote") or item.get("q") or {}
+                    trade = item.get("latestTrade") or item.get("latest_trade") or item.get("t") or {}
+                    greeks = item.get("greeks") or {}
+                    snapshots.append(
+                        OptionContractSnapshot(
+                            symbol=contract_symbol,
+                            underlying_symbol=symbol,
+                            option_type=option_type,
+                            expiration_date=expiration_date,
+                            strike=strike,
+                            bid=optional_float(first_present(quote, ["bp", "bid_price", "bidPrice", "bid"])),
+                            ask=optional_float(first_present(quote, ["ap", "ask_price", "askPrice", "ask"])),
+                            last=optional_float(first_present(trade, ["p", "price"])),
+                            quote_time=parse_optional_dt(first_present(quote, ["t", "timestamp"])),
+                            trade_time=parse_optional_dt(first_present(trade, ["t", "timestamp"])),
+                            volume=optional_int(first_present(item, ["volume", "day_volume", "dailyVolume"])),
+                            open_interest=optional_int(first_present(item, ["open_interest", "openInterest"])),
+                            delta=optional_float(first_present(greeks, ["delta"])),
+                            implied_volatility=optional_float(first_present(item, ["impliedVolatility", "implied_volatility", "iv"])),
+                            feed=feed,
+                        )
+                    )
+
+                token = body.get("next_page_token") or body.get("nextPageToken")
+                if not token:
+                    break
+
+            if snapshots or feed != preferred_feed:
+                return snapshots
+
+        return []
+
+    def check_market_data_status(self, config: Dict[str, Any], symbol: str = "AAPL") -> Dict[str, Any]:
+        options_config = config.get("options", {})
+        stock_feed = stock_feed_from_config(config)
+        options_feed = options_feed_from_config(config)
+        fallback_enabled = bool(options_config.get("allow_indicative_fallback", True))
+        checked_at = now_utc().isoformat()
+        status: Dict[str, Any] = {
+            "timestamp": checked_at,
+            "last_data_check_time": checked_at,
+            "symbol": symbol,
+            "stock_feed_requested": stock_feed.upper(),
+            "stock_feed_status": "unknown",
+            "options_feed_requested": options_feed.upper(),
+            "options_feed_status": "unknown",
+            "opra_status": "unknown",
+            "api_rate_limit_mode": config.get("market_data", {}).get("api_rate_limit_mode", "Algo Trader Plus expected"),
+            "websocket_symbol_limit": config.get("market_data", {}).get("websocket_symbol_limit", "paid/unlimited expected"),
+            "allow_indicative_options_fallback": fallback_enabled,
+            "feed_warning": "",
+        }
+
+        try:
+            stock = self.session.get(
+                f"{self.base_v2}/stocks/bars/latest",
+                params={"symbols": symbol, "feed": stock_feed},
+                timeout=15,
+            )
+            if stock.status_code < 400:
+                status["stock_feed_status"] = stock_feed.upper()
+            else:
+                status["stock_feed_status"] = "unavailable"
+                status["feed_warning"] = f"Stock {stock_feed.upper()} check failed: {stock.status_code} {stock.text[:160]}"
+        except Exception as exc:
+            status["stock_feed_status"] = "unavailable"
+            status["feed_warning"] = f"Stock {stock_feed.upper()} check failed: {exc}"
+
+        if not options_config.get("enabled", True):
+            status["options_feed_status"] = "disabled"
+            status["opra_status"] = "disabled"
+            return status
+
+        today = now_et().date()
+        opra_error = ""
+        try:
+            opt = self.session.get(
+                f"{self.base_v1beta}/options/snapshots/{symbol}",
+                params={
+                    "feed": options_feed,
+                    "limit": 1,
+                    "expiration_date_gte": today.isoformat(),
+                    "expiration_date_lte": (today + timedelta(days=7)).isoformat(),
+                },
+                timeout=15,
+            )
+            if opt.status_code < 400:
+                status["options_feed_status"] = options_feed.upper()
+                status["opra_status"] = "enabled" if options_feed == "opra" else "not_requested"
+                return status
+            opra_error = f"{opt.status_code} {opt.text[:200]}"
+            if options_feed == "opra" and opra_agreement_error(opt.text):
+                status["opra_status"] = "agreement missing"
+                status["feed_warning"] = "OPRA agreement not signed — sign Alpaca OPRA agreement. Options remain indicative."
+            else:
+                status["opra_status"] = "unavailable" if options_feed == "opra" else "not_requested"
+                status["feed_warning"] = f"Options {options_feed.upper()} check failed: {opra_error}"
+        except Exception as exc:
+            opra_error = str(exc)
+            status["opra_status"] = "unavailable" if options_feed == "opra" else "not_requested"
+            status["feed_warning"] = f"Options {options_feed.upper()} check failed: {exc}"
+
+        if options_feed == "opra" and fallback_enabled:
+            try:
+                indicative = self.session.get(
+                    f"{self.base_v1beta}/options/snapshots/{symbol}",
+                    params={
+                        "feed": "indicative",
+                        "limit": 1,
+                        "expiration_date_gte": today.isoformat(),
+                        "expiration_date_lte": (today + timedelta(days=7)).isoformat(),
+                    },
+                    timeout=15,
+                )
+                if indicative.status_code < 400:
+                    status["options_feed_status"] = "INDICATIVE"
+                    if not status["feed_warning"]:
+                        status["feed_warning"] = "OPRA unavailable — options remain indicative."
+                else:
+                    status["options_feed_status"] = "unavailable"
+                    if not status["feed_warning"]:
+                        status["feed_warning"] = f"Indicative options fallback failed: {indicative.status_code} {indicative.text[:160]}"
+            except Exception as exc:
+                status["options_feed_status"] = "unavailable"
+                if not status["feed_warning"]:
+                    status["feed_warning"] = f"Indicative options fallback failed: {exc}"
+        elif options_feed == "opra":
+            status["options_feed_status"] = "unavailable"
+            if not status["feed_warning"]:
+                status["feed_warning"] = f"OPRA unavailable and indicative fallback disabled: {opra_error}"
+
+        return status
+
+    @staticmethod
+    def _bar_from_json(item: Dict[str, Any]) -> Bar:
+        return Bar(
+            t=datetime.fromisoformat(item["t"].replace("Z", "+00:00")),
+            o=float(item["o"]),
+            h=float(item["h"]),
+            l=float(item["l"]),
+            c=float(item["c"]),
+            v=float(item["v"]),
+        )
+
+
+# ------------------------------------------------------------
+# Mock provider for dry-run / tests
+# ------------------------------------------------------------
+class MockProvider:
+    """Deterministic-enough mock provider so you can test the full system without API keys."""
+    def __init__(self, symbols: List[str]) -> None:
+        self.symbols = symbols
+        self._base_prices = {s: 100.0 + i * 5 for i, s in enumerate(symbols)}
+        self._tick = 0
+
+    def _base_price(self, symbol: str) -> float:
+        if symbol not in self._base_prices:
+            self._base_prices[symbol] = 80.0 + len(self._base_prices) * 4
+        return self._base_prices[symbol]
+
+    def get_latest_bars(self, symbols: List[str]) -> Dict[str, Bar]:
+        self._tick += 1
+        t = now_utc()
+        out: Dict[str, Bar] = {}
+        for idx, s in enumerate(symbols):
+            base = self._base_price(s)
+            drift = mathish_wave(self._tick + idx) + random.uniform(-0.3, 0.3)
+            if s == "ASTS" and self._tick % 4 == 0:
+                drift += 5.0
+            price = max(1.0, base + drift)
+            out[s] = Bar(t=t, o=price - 0.4, h=price + 0.5, l=price - 0.8, c=price, v=100000 + random.randint(0, 500000))
+        return out
+
+    def get_recent_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]:
+        count = max(10, int((end - start).total_seconds() // 60))
+        out: Dict[str, List[Bar]] = {}
+        for idx, s in enumerate(symbols):
+            base = self._base_price(s)
+            bars: List[Bar] = []
+            for i in range(count):
+                t = start + timedelta(minutes=i)
+                drift = mathish_wave(i + idx) + random.uniform(-0.2, 0.2)
+                if s == "ASTS" and i > count - 4:
+                    drift += 4.0
+                price = max(1.0, base + drift)
+                bars.append(Bar(t=t, o=price - 0.2, h=price + 0.3, l=price - 0.4, c=price, v=50000 + random.randint(0, 300000)))
+            out[s] = bars
+        return out
+
+    def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
+        items: List[NewsItem] = []
+        if "ASTS" in symbols:
+            items.append(
+                NewsItem(
+                    symbol="ASTS",
+                    headline="ASTS gains on satellite network catalyst",
+                    url="https://example.com/asts-news",
+                    published_at=now_utc() - timedelta(minutes=30),
+                    source="MockNews",
+                )
+            )
+        return items
+
+    def discover_symbols(self, config: Dict[str, Any]) -> List[str]:
+        symbols = list(dict.fromkeys(self.symbols + ["COIN", "MARA", "RIVN", "SOFI", "HOOD", "IONQ", "BBAI"]))
+        return symbols[: int(config.get("discovery", {}).get("max_universe_symbols", len(symbols)))]
+
+    def get_option_chain(self, symbol: str, config: Dict[str, Any]) -> List[OptionContractSnapshot]:
+        options_config = config.get("options", {})
+        if not options_config.get("enabled", True):
+            return []
+        base = self._base_price(symbol)
+        today = now_et().date()
+        expirations = [today, today + timedelta(days=7)]
+        chain: List[OptionContractSnapshot] = []
+        for expiration in expirations:
+            for offset in range(-3, 4):
+                strike = round(base + offset * 2.5, 2)
+                distance = abs(strike - base)
+                for option_type in ("C", "P"):
+                    delta_seed = max(0.20, min(0.75, 0.55 - distance / max(base, 1) * 2))
+                    delta = delta_seed if option_type == "C" else -delta_seed
+                    mid = max(0.35, 3.0 - distance * 0.25)
+                    spread = mid * 0.06
+                    chain.append(
+                        OptionContractSnapshot(
+                            symbol=option_symbol(symbol, expiration, option_type, strike),
+                            underlying_symbol=symbol,
+                            option_type=option_type,
+                            expiration_date=expiration,
+                            strike=strike,
+                            bid=round(mid - spread / 2, 2),
+                            ask=round(mid + spread / 2, 2),
+                            last=round(mid, 2),
+                            quote_time=now_utc(),
+                            trade_time=now_utc(),
+                            volume=250 + random.randint(0, 500),
+                            open_interest=600 + random.randint(0, 1500),
+                            delta=delta,
+                            implied_volatility=0.45 + random.random() * 0.25,
+                            feed="simulated",
+                            is_simulated=True,
+                        )
+                    )
+        return chain
+
+
+def mathish_wave(x: int) -> float:
+    # cheap wave without importing math; deterministic enough for dry runs
+    return ((x % 13) - 6) * 0.25
+
+
+# ------------------------------------------------------------
+# State persistence
+# ------------------------------------------------------------
+class StateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: Dict[str, Any] = {"last_alert_times": {}}
+        self.load()
+
+    def load(self) -> None:
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text())
+            except Exception as exc:
+                logger.warning("Could not load state file: %s", exc)
+
+    def save(self) -> None:
+        self.path.write_text(json.dumps(self.data, indent=2))
+
+    def get_last_alert_time(self, key: str) -> Optional[datetime]:
+        raw = self.data.get("last_alert_times", {}).get(key)
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw)
+
+    def set_last_alert_time(self, key: str, dt: datetime) -> None:
+        self.data.setdefault("last_alert_times", {})[key] = dt.astimezone(UTC).isoformat()
+
+
+# ------------------------------------------------------------
+# Logging outputs
+# ------------------------------------------------------------
+class AlertWriter:
+    def __init__(self, csv_path: Path, jsonl_path: Path) -> None:
+        self.csv_path = csv_path
+        self.jsonl_path = jsonl_path
+        self.scenario_jsonl_path = LOG_DIR / "scenario_engine.jsonl"
+        self.option_jsonl_path = LOG_DIR / "option_quality_decisions.jsonl"
+        self.phase3_heads_up_jsonl_path = LOG_DIR / "phase3_heads_up.jsonl"
+        self._ensure_csv_header()
+
+    def _ensure_csv_header(self) -> None:
+        if self.csv_path.exists():
+            return
+        with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp",
+                "symbol",
+                "category",
+                "price",
+                "fast_move_pct",
+                "day_move_pct",
+                "relative_volume",
+                "premarket_high",
+                "premarket_low",
+                "opening_range_high",
+                "opening_range_low",
+                "headline",
+                "url",
+                "option_contract",
+                "option_type",
+                "option_expiration",
+                "option_strike",
+                "option_bid",
+                "option_ask",
+                "option_mid",
+                "option_spread_pct",
+                "option_delta",
+                "option_iv",
+                "option_volume",
+                "option_open_interest",
+                "option_quality",
+                "options_score",
+                "direction",
+                "alert_grade",
+                "alert_score",
+                "sms_allowed",
+                "watch_allowed",
+                "market_alignment",
+                "text_alert_reason",
+                "setup_level",
+                "trigger_level",
+                "primary_setup",
+                "secondary_setups",
+                "strategy_confidence_score",
+                "strategy_confidence_label",
+                "risk_label",
+                "confirmation_score",
+                "confirmation_label",
+                "entry_quality_label",
+                "volume_label",
+                "rvol_detail",
+                "candle_label",
+                "candle_score",
+                "extension_label",
+                "extension_score",
+                "relative_strength_label",
+                "relative_strength_score",
+                "market_regime",
+                "market_score",
+                "pressure_label",
+                "pressure_score",
+                "scenario_top",
+                "scenario_second",
+                "scenario_score",
+                "scenario_stage",
+                "scenario_direction",
+                "scenario_confidence_label",
+                "scenario_entry_quality_label",
+                "scenario_risk_label",
+                "scenario_reasons",
+                "scenario_warnings",
+                "scenario_levels",
+                "bullish_score",
+                "bearish_score",
+                "chop_score",
+                "fakeout_score",
+                "scenario_conflict",
+                "all_scenarios",
+                "stock_setup_score",
+                "stock_setup_valid",
+                "option_tradability_score",
+                "option_feed_status",
+                "option_tradable",
+                "scenario_alert_eligible",
+                "scenario_would_sms",
+                "scenario_alert_tier",
+                "scenario_alert_block_reason",
+                "sms_allowed_by_stock",
+                "sms_allowed_by_options",
+                "sms_block_reason",
+                "scenario_sms_allowed",
+                "scenario_sms_block_reason",
+                "stock_setup_score_reason",
+                "phase3_heads_up_eligible",
+                "phase3_heads_up_sent",
+                "phase3_heads_up_block_reason",
+                "phase3_heads_up_type",
+                "phase3_heads_up_dedupe_key",
+                "phase3_heads_up_dedupe_blocked",
+                "phase3_heads_up_last_sent_time",
+                "phase3_heads_up_next_eligible_time",
+                "market_confirmation_status",
+                "context_symbols_available",
+                "strategy_reasons",
+                "strategy_warnings",
+                "strategy_levels",
+                "notes",
+            ])
+
+    def write(self, alert: Alert) -> None:
+        with self.csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                alert.timestamp.isoformat(),
+                alert.symbol,
+                alert.category,
+                alert.price,
+                alert.fast_move_pct,
+                alert.day_move_pct,
+                alert.relative_volume,
+                alert.premarket_high,
+                alert.premarket_low,
+                alert.opening_range_high,
+                alert.opening_range_low,
+                alert.headline,
+                alert.url,
+                alert.option_contract,
+                alert.option_type,
+                alert.option_expiration,
+                alert.option_strike,
+                alert.option_bid,
+                alert.option_ask,
+                alert.option_mid,
+                alert.option_spread_pct,
+                alert.option_delta,
+                alert.option_iv,
+                alert.option_volume,
+                alert.option_open_interest,
+                alert.option_quality,
+                alert.options_score,
+                alert.direction,
+                alert.alert_grade,
+                alert.alert_score,
+                alert.sms_allowed,
+                alert.watch_allowed,
+                alert.market_alignment,
+                alert.text_alert_reason,
+                alert.setup_level,
+                alert.trigger_level,
+                alert.primary_setup,
+                " | ".join(alert.secondary_setups),
+                alert.strategy_confidence_score,
+                alert.strategy_confidence_label,
+                alert.risk_label,
+                alert.confirmation_score,
+                alert.confirmation_label,
+                alert.entry_quality_label,
+                alert.volume_label,
+                alert.rvol_detail,
+                alert.candle_label,
+                alert.candle_score,
+                alert.extension_label,
+                alert.extension_score,
+                alert.relative_strength_label,
+                alert.relative_strength_score,
+                alert.market_regime,
+                alert.market_score,
+                alert.pressure_label,
+                alert.pressure_score,
+                json.dumps(alert.scenario_top, sort_keys=True) if alert.scenario_top else None,
+                json.dumps(alert.scenario_second, sort_keys=True) if alert.scenario_second else None,
+                alert.scenario_score,
+                alert.scenario_stage,
+                alert.scenario_direction,
+                alert.scenario_confidence_label,
+                alert.scenario_entry_quality_label,
+                alert.scenario_risk_label,
+                " | ".join(alert.scenario_reasons),
+                " | ".join(alert.scenario_warnings),
+                json.dumps(alert.scenario_levels, sort_keys=True),
+                alert.bullish_score,
+                alert.bearish_score,
+                alert.chop_score,
+                alert.fakeout_score,
+                alert.scenario_conflict,
+                json.dumps(alert.all_scenarios, sort_keys=True),
+                alert.stock_setup_score,
+                alert.stock_setup_valid,
+                alert.option_tradability_score,
+                alert.option_feed_status,
+                alert.option_tradable,
+                alert.scenario_alert_eligible,
+                alert.scenario_would_sms,
+                alert.scenario_alert_tier,
+                alert.scenario_alert_block_reason,
+                alert.sms_allowed_by_stock,
+                alert.sms_allowed_by_options,
+                alert.sms_block_reason,
+                alert.scenario_sms_allowed,
+                alert.scenario_sms_block_reason,
+                alert.stock_setup_score_reason,
+                alert.phase3_heads_up_eligible,
+                alert.phase3_heads_up_sent,
+                alert.phase3_heads_up_block_reason,
+                alert.phase3_heads_up_type,
+                alert.phase3_heads_up_dedupe_key,
+                alert.phase3_heads_up_dedupe_blocked,
+                alert.phase3_heads_up_last_sent_time,
+                alert.phase3_heads_up_next_eligible_time,
+                alert.market_confirmation_status,
+                " | ".join(alert.context_symbols_available),
+                " | ".join(alert.strategy_reasons),
+                " | ".join(alert.strategy_warnings),
+                json.dumps(alert.strategy_levels, sort_keys=True),
+                " | ".join(alert.notes),
+            ])
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                **asdict(alert),
+                "timestamp": alert.timestamp.isoformat(),
+            }) + "\n")
+        self._append_jsonl(
+            self.scenario_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "price": alert.price,
+                "top_scenario": alert.scenario_top,
+                "second_scenario": alert.scenario_second,
+                "bullish_score": alert.bullish_score,
+                "bearish_score": alert.bearish_score,
+                "chop_score": alert.chop_score,
+                "fakeout_score": alert.fakeout_score,
+                "stage": alert.scenario_stage,
+                "score": alert.scenario_score,
+                "reasons": alert.scenario_reasons,
+                "warnings": alert.scenario_warnings,
+                "invalidation_level": (alert.scenario_top or {}).get("invalidation_level") if alert.scenario_top else None,
+                "invalidation_reason": (alert.scenario_top or {}).get("invalidation_reason") if alert.scenario_top else None,
+                "vwap": alert.scenario_levels.get("vwap") if alert.scenario_levels else None,
+                "ema9": alert.scenario_levels.get("ema9") if alert.scenario_levels else None,
+                "ema20": alert.scenario_levels.get("ema20") if alert.scenario_levels else None,
+                "market_context": alert.market_alignment,
+                "scenario_alert_tier": alert.scenario_alert_tier,
+                "scenario_alert_eligible": alert.scenario_alert_eligible,
+                "scenario_would_sms": alert.scenario_would_sms,
+                "scenario_alert_block_reason": alert.scenario_alert_block_reason,
+                "scenario_sms_block_reason": alert.scenario_sms_block_reason,
+                "stock_setup_score": alert.stock_setup_score,
+                "stock_setup_score_reason": alert.stock_setup_score_reason,
+                "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
+                "phase3_heads_up_sent": alert.phase3_heads_up_sent,
+                "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
+                "phase3_heads_up_type": alert.phase3_heads_up_type,
+                "phase3_heads_up_dedupe_key": alert.phase3_heads_up_dedupe_key,
+                "phase3_heads_up_dedupe_blocked": alert.phase3_heads_up_dedupe_blocked,
+                "phase3_heads_up_last_sent_time": alert.phase3_heads_up_last_sent_time,
+                "phase3_heads_up_next_eligible_time": alert.phase3_heads_up_next_eligible_time,
+                "market_confirmation_status": alert.market_confirmation_status,
+                "context_symbols_available": alert.context_symbols_available,
+            },
+        )
+        self._append_jsonl(
+            self.option_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "alert_score": alert.alert_score,
+                "option_feed_status": alert.option_feed_status,
+                "option_tradability_score": alert.option_tradability_score,
+                "option_warning": alert.sms_block_reason,
+                "stock_setup_valid": alert.stock_setup_valid,
+                "option_tradable": alert.option_tradable,
+                "scenario_alert_eligible": alert.scenario_alert_eligible,
+                "scenario_would_sms": alert.scenario_would_sms,
+                "dashboard_allowed": True,
+                "sms_allowed_by_stock": alert.sms_allowed_by_stock,
+                "sms_allowed_by_options": alert.sms_allowed_by_options,
+                "final_sms_allowed": alert.sms_allowed,
+                "sms_block_reason": alert.sms_block_reason,
+                "stock_setup_score_reason": alert.stock_setup_score_reason,
+            },
+        )
+        self._append_jsonl(
+            self.phase3_heads_up_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "direction": alert.scenario_direction or alert.direction,
+                "top_scenario": alert.scenario_top,
+                "scenario_stage": alert.scenario_stage,
+                "scenario_score": alert.scenario_score,
+                "stock_setup_score": alert.stock_setup_score,
+                "confirmation_score": alert.confirmation_score,
+                "risk_label": alert.risk_label,
+                "entry_quality_label": alert.entry_quality_label,
+                "extension_label": alert.extension_label,
+                "option_feed_status": alert.option_feed_status,
+                "heads_up_type": alert.phase3_heads_up_type,
+                "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
+                "phase3_heads_up_sent": alert.phase3_heads_up_sent,
+                "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
+                "dedupe_key": alert.phase3_heads_up_dedupe_key,
+                "dedupe_blocked": alert.phase3_heads_up_dedupe_blocked,
+                "last_sent_time": alert.phase3_heads_up_last_sent_time,
+                "next_eligible_time": alert.phase3_heads_up_next_eligible_time,
+                "dedupe_minutes_remaining": alert.phase3_heads_up_dedupe_minutes_remaining,
+                "market_confirmation_status": alert.market_confirmation_status,
+                "context_symbols_available": alert.context_symbols_available,
+                "message_preview": alert.phase3_heads_up_message_preview,
+                "scenario_reasons": alert.scenario_reasons,
+                "scenario_warnings": alert.scenario_warnings,
+            },
+        )
+
+    def _append_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+
+
+# ------------------------------------------------------------
+# Discord notifier
+# ------------------------------------------------------------
+def compact_alert_message(alert: Alert) -> str:
+    level = "WATCH" if alert.setup_level == "WATCH" else "ALERT"
+    direction = alert.direction or "MOMENTUM"
+    detected = alert.timestamp.astimezone(ET).strftime("%-I:%M %p ET")
+    parts = [
+        f"{level} {alert.symbol} {direction}",
+        f"${alert.price:.2f}",
+        f"at {detected}",
+    ]
+    if alert.trigger_level is not None:
+        parts.append(f"level {alert.trigger_level:.2f}")
+    elif "OPENING RANGE" in alert.category and alert.opening_range_high is not None and direction == "BULLISH":
+        parts.append(f"OR high {alert.opening_range_high:.2f}")
+    elif "OPENING RANGE" in alert.category and alert.opening_range_low is not None and direction == "BEARISH":
+        parts.append(f"OR low {alert.opening_range_low:.2f}")
+    if alert.fast_move_pct is not None:
+        parts.append(f"fast {alert.fast_move_pct:+.2f}%")
+    if alert.day_move_pct is not None:
+        parts.append(f"day {alert.day_move_pct:+.2f}%")
+    if alert.relative_volume is not None:
+        parts.append(f"RVOL {alert.relative_volume:.2f}x")
+    if alert.primary_setup:
+        parts.append(f"setup {alert.primary_setup}")
+    if alert.scenario_top and (alert.scenario_top.get("scenario_name") or alert.scenario_stage):
+        scenario_name = alert.scenario_top.get("scenario_name") or "scenario"
+        scenario_stage = alert.scenario_stage or alert.scenario_top.get("stage") or ""
+        parts.append(f"scenario {scenario_name} {scenario_stage}".strip())
+    if alert.strategy_confidence_score is not None:
+        parts.append(f"conf {alert.strategy_confidence_score} {alert.strategy_confidence_label or ''}".strip())
+    if alert.confirmation_score is not None:
+        parts.append(f"confirm {alert.confirmation_score} {alert.confirmation_label or ''}".strip())
+    if alert.entry_quality_label and alert.entry_quality_label != "UNKNOWN":
+        parts.append(f"entry {alert.entry_quality_label}")
+    if alert.volume_label:
+        parts.append(f"vol {alert.volume_label}")
+    if alert.candle_label:
+        parts.append(f"candle {alert.candle_label}")
+    if alert.extension_label and alert.extension_label not in {"NORMAL", "UNKNOWN"}:
+        parts.append(f"ext {alert.extension_label}")
+    if alert.relative_strength_label and alert.relative_strength_label not in {"NEUTRAL", "UNKNOWN"}:
+        parts.append(f"RS {alert.relative_strength_label}")
+    if alert.market_regime and alert.market_regime != "UNKNOWN":
+        parts.append(f"market {alert.market_regime}")
+    if alert.pressure_label and alert.pressure_label != "UNKNOWN":
+        parts.append(f"pressure {alert.pressure_label}")
+    if alert.option_feed_status and alert.option_feed_status != "UNAVAILABLE":
+        parts.append(f"feed {alert.option_feed_status}")
+    if alert.risk_label == "DO_NOT_CHASE":
+        parts.append("RISK: DO_NOT_CHASE — valid setup may be late")
+    elif alert.risk_label:
+        parts.append(f"risk {alert.risk_label}")
+    if alert.strategy_warnings:
+        parts.append(alert.strategy_warnings[0])
+    if alert.option_quality:
+        opt = alert.option_quality
+        if alert.option_spread_pct is not None:
+            opt += f" {alert.option_spread_pct:.1f}%spr"
+        parts.append(f"opt {opt}")
+    if alert.alert_grade:
+        parts.append(f"grade {alert.alert_grade}")
+    parts.append("confirm in Webull")
+    return " | ".join(parts)
+
+
+def phase3_heads_up_message(alert: Alert) -> str:
+    scenario = alert.scenario_top or {}
+    scenario_name = scenario.get("scenario_name") or alert.primary_setup or "Scenario"
+    stage = alert.scenario_stage or scenario.get("stage") or ""
+    direction = (alert.scenario_direction or scenario.get("direction") or alert.direction or "").upper()
+    direction_text = "Bullish" if direction == "BULLISH" else "Bearish" if direction == "BEARISH" else "Directional"
+    reasons = list(alert.scenario_reasons or alert.strategy_reasons or [])
+    reason_text = ", ".join(reasons[:3]) if reasons else "Strong Phase 3 scenario read."
+    early = alert.phase3_heads_up_type == "EARLY_WATCH"
+    title = "Phase 3 Early Heads-Up" if early else "Phase 3 Heads-Up"
+    reminder = "Early heads-up only — watch chart, do not enter yet." if early else "Possible setup — confirm manually on chart."
+    watch_text = (
+        "next candle hold / break above recent high"
+        if direction == "BULLISH"
+        else "next candle rejection / break below recent low"
+    )
+    invalidation = scenario.get("invalidation_reason")
+    if not invalidation and scenario.get("invalidation_level") is not None:
+        invalidation = f"loses/recovers {float(scenario['invalidation_level']):.2f}"
+    warnings = ["Heads-up only — confirm on chart."]
+    if any("direction conflict" in warning.lower() for warning in alert.strategy_warnings + alert.scenario_warnings):
+        warnings.append("Legacy/Phase 2 conflict present — confirm manually.")
+    lines = [
+        f"{alert.symbol} {title}",
+        f"{direction_text} {scenario_name} — {stage}".strip(),
+        reminder,
+        f"Score {alert.scenario_score or 0} | Stock {alert.stock_setup_score or 0} | Confirm {alert.confirmation_score or 0}",
+        f"Reason: {reason_text}",
+        f"Watch: {watch_text}.",
+    ]
+    if invalidation:
+        lines.append(f"Invalidation: {invalidation}.")
+    lines.append(f"Reminder: {' '.join(warnings)}")
+    return "\n".join(lines)
+
+
+def format_alert_message(alert: Alert, markdown: bool = True) -> str:
+    if not markdown:
+        return compact_alert_message(alert)
+
+    bold = "**" if markdown else ""
+    body_lines = [
+        f"{bold}{alert.symbol}{bold} @ {bold}${alert.price:.2f}{bold}",
+        f"Category: {bold}{alert.category}{bold}",
+    ]
+    if alert.setup_level:
+        body_lines.append(f"Level: {bold}{alert.setup_level}{bold}")
+    if alert.trigger_level is not None:
+        body_lines.append(f"Trigger level: {bold}{alert.trigger_level:.2f}{bold}")
+    if alert.alert_grade:
+        body_lines.append(f"Grade: {bold}{alert.alert_grade}{bold} ({alert.alert_score or 0}/100)")
+    if alert.direction:
+        body_lines.append(f"Read: {bold}{alert.direction}{bold}")
+    if alert.primary_setup:
+        body_lines.append(f"Primary setup: {bold}{alert.primary_setup}{bold}")
+    if alert.scenario_top:
+        scenario_name = alert.scenario_top.get("scenario_name", "")
+        scenario_stage = alert.scenario_stage or alert.scenario_top.get("stage", "")
+        body_lines.append(f"Scenario: {bold}{scenario_name} {scenario_stage}{bold}".strip())
+    if alert.secondary_setups:
+        body_lines.append(f"Secondary setups: {bold}{', '.join(alert.secondary_setups)}{bold}")
+    if alert.strategy_confidence_score is not None:
+        body_lines.append(
+            f"Strategy confidence: {bold}{alert.strategy_confidence_score} {alert.strategy_confidence_label or ''}{bold}"
+        )
+    if alert.confirmation_score is not None:
+        body_lines.append(
+            f"Confirmation: {bold}{alert.confirmation_score} {alert.confirmation_label or ''}{bold}"
+        )
+    if alert.entry_quality_label and alert.entry_quality_label != "UNKNOWN":
+        body_lines.append(f"Entry quality: {bold}{alert.entry_quality_label}{bold}")
+    if alert.volume_label:
+        rvol_text = f" RVOL {alert.rvol_detail:.2f}x" if alert.rvol_detail is not None else ""
+        body_lines.append(f"Volume quality: {bold}{alert.volume_label}{rvol_text}{bold}")
+    if alert.candle_label:
+        score_text = f" {alert.candle_score}" if alert.candle_score is not None else ""
+        body_lines.append(f"Candle quality: {bold}{alert.candle_label}{score_text}{bold}")
+    if alert.extension_label and alert.extension_label not in {"NORMAL", "UNKNOWN"}:
+        score_text = f" {alert.extension_score}" if alert.extension_score is not None else ""
+        body_lines.append(f"Extension: {bold}{alert.extension_label}{score_text}{bold}")
+    if alert.relative_strength_label and alert.relative_strength_label not in {"NEUTRAL", "UNKNOWN"}:
+        score_text = f" {alert.relative_strength_score}" if alert.relative_strength_score is not None else ""
+        body_lines.append(f"Relative strength: {bold}{alert.relative_strength_label}{score_text}{bold}")
+    if alert.market_regime and alert.market_regime != "UNKNOWN":
+        score_text = f" {alert.market_score}" if alert.market_score is not None else ""
+        body_lines.append(f"Market regime: {bold}{alert.market_regime}{score_text}{bold}")
+    if alert.pressure_label and alert.pressure_label != "UNKNOWN":
+        score_text = f" {alert.pressure_score}" if alert.pressure_score is not None else ""
+        body_lines.append(f"Pressure: {bold}{alert.pressure_label}{score_text}{bold}")
+    if alert.option_feed_status and alert.option_feed_status != "UNAVAILABLE":
+        body_lines.append(f"Option feed: {bold}{alert.option_feed_status}{bold}")
+    if alert.risk_label == "DO_NOT_CHASE":
+        body_lines.append(f"RISK: {bold}DO_NOT_CHASE — valid setup may be late{bold}")
+    elif alert.risk_label:
+        body_lines.append(f"Risk: {bold}{alert.risk_label}{bold}")
+    if alert.strategy_reasons:
+        body_lines.append("Strategy reasons: " + " | ".join(alert.strategy_reasons[:5]))
+    if alert.strategy_warnings:
+        body_lines.append("Strategy warnings: " + " | ".join(alert.strategy_warnings[:4]))
+    if alert.market_alignment:
+        body_lines.append(f"Market alignment: {bold}{alert.market_alignment}{bold}")
+    if alert.fast_move_pct is not None:
+        body_lines.append(f"Fast move: {bold}{alert.fast_move_pct:+.2f}%{bold}")
+    if alert.day_move_pct is not None:
+        body_lines.append(f"Day move: {bold}{alert.day_move_pct:+.2f}%{bold}")
+    if alert.relative_volume is not None:
+        body_lines.append(f"Relative volume: {bold}{alert.relative_volume:.2f}x{bold}")
+    if alert.premarket_high is not None:
+        body_lines.append(f"Premarket high: {bold}{alert.premarket_high:.2f}{bold}")
+    if alert.premarket_low is not None:
+        body_lines.append(f"Premarket low: {bold}{alert.premarket_low:.2f}{bold}")
+    if alert.opening_range_high is not None and alert.opening_range_low is not None:
+        body_lines.append(
+            f"Opening range: {bold}{alert.opening_range_low:.2f} - {alert.opening_range_high:.2f}{bold}"
+        )
+    if alert.option_contract:
+        option_bits = [
+            alert.option_contract,
+            alert.option_quality or "",
+            f"score {alert.options_score}" if alert.options_score is not None else "",
+        ]
+        body_lines.append("Option: " + bold + " | ".join(bit for bit in option_bits if bit) + bold)
+        if alert.option_bid is not None and alert.option_ask is not None:
+            body_lines.append(f"Bid/Ask: {bold}{alert.option_bid:.2f} / {alert.option_ask:.2f}{bold}")
+        if alert.option_delta is not None:
+            body_lines.append(f"Delta: {bold}{alert.option_delta:+.2f}{bold}")
+        if alert.option_iv is not None:
+            body_lines.append(f"IV: {bold}{alert.option_iv:.2%}{bold}")
+    if alert.headline:
+        body_lines.append(f"Headline: {alert.headline}")
+    if alert.url:
+        body_lines.append(alert.url)
+    if alert.notes:
+        body_lines.append("Notes: " + " | ".join(alert.notes))
+    if alert.text_alert_reason:
+        body_lines.append(f"Text alert filter: {alert.text_alert_reason}")
+    body_lines.append("Confirm in Webull before taking action.")
+    return "\n".join(body_lines)
+
+
+class DiscordNotifier:
+    def __init__(self, webhook_url: Optional[str], mention: str = "") -> None:
+        self.webhook_url = webhook_url
+        self.mention = mention.strip()
+
+    def send(self, alert: Alert) -> None:
+        message = format_alert_message(alert, markdown=True)
+        if not self.webhook_url:
+            logger.info("DISCORD DISABLED\n%s", message)
+            return
+
+        payload = {
+            "content": self.mention or None,
+            "embeds": [
+                {
+                    "title": f"{alert.symbol} Momentum Alert",
+                    "description": message,
+                    "color": 5763719,
+                    "timestamp": alert.timestamp.astimezone(UTC).isoformat(),
+                }
+            ],
+        }
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("Discord send failed: %s", exc)
+
+
+def parse_phone_numbers(phone_numbers: Optional[str]) -> List[str]:
+    raw = (phone_numbers or "").replace(";", ",")
+    return [phone.strip() for phone in raw.split(",") if phone.strip()]
+
+
+def normalize_phone_for_messages(phone_number: str) -> str:
+    cleaned = "".join(ch for ch in phone_number if ch.isdigit() or ch == "+")
+    if cleaned.startswith("+"):
+        return cleaned
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    if len(digits) == 10:
+        return "+1" + digits
+    return digits or phone_number.strip()
+
+
+class MessagesNotifier:
+    def __init__(self, phone_numbers: Optional[str], send_watch: bool = False) -> None:
+        self.phone_numbers = [normalize_phone_for_messages(phone) for phone in parse_phone_numbers(phone_numbers)]
+        self.send_watch = send_watch
+
+    def send(self, alert: Alert) -> None:
+        if not self.phone_numbers:
+            return
+        can_send = alert.sms_allowed or (self.send_watch and alert.watch_allowed) or bool(alert.phase3_heads_up_sent)
+        if not can_send:
+            logger.info(
+                "SMS skipped for %s %s grade=%s score=%s reason=%s",
+                alert.symbol,
+                alert.category,
+                alert.alert_grade,
+                alert.alert_score,
+                alert.text_alert_reason,
+            )
+            return
+        message = phase3_heads_up_message(alert) if alert.phase3_heads_up_sent else format_alert_message(alert, markdown=False)
+        script = """
+        on run argv
+          set targetBuddy to item 1 of argv
+          set alertText to item 2 of argv
+          tell application "Messages"
+            set targetService to 1st service whose service type = SMS
+            set targetBuddy to buddy targetBuddy of targetService
+            send alertText to targetBuddy
+          end tell
+        end run
+        """
+        for phone_number in self.phone_numbers:
+            try:
+                subprocess.run(["osascript", "-e", script, phone_number, message], check=True, timeout=20)
+                logger.info("Messages alert sent to %s for %s %s", phone_number, alert.symbol, alert.category)
+            except Exception as exc:
+                logger.warning("Messages send failed for %s: %s", phone_number, exc)
+
+
+class MacDesktopNotifier:
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+
+    def send(self, alert: Alert) -> None:
+        if not self.enabled or not (alert.sms_allowed or alert.watch_allowed):
+            return
+        level = "WATCH" if alert.watch_allowed and not alert.sms_allowed else "ALERT"
+        title = f"{level} {alert.symbol} {alert.direction or 'Momentum'} {alert.alert_grade or ''}".strip()
+        subtitle = f"${alert.price:.2f} | {alert.category}"
+        details = []
+        if alert.trigger_level is not None:
+            details.append(f"Level {alert.trigger_level:.2f}")
+        if alert.fast_move_pct is not None:
+            details.append(f"Fast {alert.fast_move_pct:+.2f}%")
+        if alert.day_move_pct is not None:
+            details.append(f"Day {alert.day_move_pct:+.2f}%")
+        if alert.relative_volume is not None:
+            details.append(f"RVOL {alert.relative_volume:.2f}x")
+        message = " | ".join(details) or "Confirm in Webull before taking action."
+        script = """
+        on run argv
+          display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv) sound name "Glass"
+        end run
+        """
+        try:
+            subprocess.run(["osascript", "-e", script, title, subtitle, message], check=True, timeout=10)
+        except Exception as exc:
+            logger.warning("Mac desktop notification failed: %s", exc)
+
+
+class PushoverNotifier:
+    def __init__(self, app_token: Optional[str], user_key: Optional[str], enabled: bool = True) -> None:
+        self.app_token = (app_token or "").strip()
+        self.user_key = (user_key or "").strip()
+        self.enabled = enabled
+
+    def send(self, alert: Alert) -> None:
+        if not self.enabled or not alert.sms_allowed:
+            return
+        if not self.app_token or not self.user_key:
+            return
+        title = f"{alert.symbol} {alert.direction or 'Momentum'} {alert.alert_grade or ''}".strip()
+        message = format_alert_message(alert, markdown=False)
+        payload = {
+            "token": self.app_token,
+            "user": self.user_key,
+            "title": title,
+            "message": message[:1024],
+            "priority": 1 if alert.alert_grade in {"A", "A+"} else 0,
+            "sound": "cashregister",
+        }
+        try:
+            resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("Pushover send failed: %s", exc)
+
+
+def redact_notification_error(error: Any, secrets: Optional[Iterable[str]] = None) -> str:
+    text = str(error or "")
+    values = [os.getenv("TELEGRAM_BOT_TOKEN", "").strip()]
+    values.extend(str(value).strip() for value in (secrets or []))
+    for value in values:
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    return text[:500]
+
+
+def append_notification_status(
+    channel: str,
+    alert_type: str,
+    symbol: str,
+    sent: bool,
+    error: Any = "",
+    message_preview: str = "",
+) -> None:
+    payload = {
+        "timestamp": now_utc().isoformat(),
+        "channel": channel,
+        "alert_type": alert_type,
+        "symbol": symbol,
+        "sent": bool(sent),
+        "error": redact_notification_error(error),
+        "message_preview": message_preview[:300],
+        "token_redacted": True,
+    }
+    try:
+        with NOTIFICATION_STATUS_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        logger.warning("Notification status log failed: %s", redact_notification_error(exc))
+
+
+def latest_notification_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config or load_config(None)
+    notification_config = config.get("notifications", {})
+    enabled = bool(notification_config.get("telegram_enabled", False))
+    configured = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("TELEGRAM_CHAT_ID", "").strip())
+    latest_telegram: Dict[str, Any] = {}
+    latest_sent: Dict[str, Any] = {}
+    if NOTIFICATION_STATUS_LOG.exists():
+        for line in reversed(NOTIFICATION_STATUS_LOG.read_text(encoding="utf-8", errors="replace").splitlines()):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("channel") == "telegram":
+                if not latest_telegram:
+                    latest_telegram = record
+                if record.get("sent"):
+                    latest_sent = record
+                    break
+    active_channels: List[str] = []
+    if config.get("discord", {}).get("enabled", True) and os.getenv("DISCORD_WEBHOOK_URL"):
+        active_channels.append("Discord")
+    if notification_config.get("mac_desktop_enabled", True):
+        active_channels.append("Desktop")
+    if notification_config.get("pushover_enabled", True) and os.getenv("PUSHOVER_APP_TOKEN") and os.getenv("PUSHOVER_USER_KEY"):
+        active_channels.append("Pushover")
+    if notification_config.get("messages_enabled", False) and os.getenv("ALERT_SMS_PHONE"):
+        active_channels.append("Messages")
+    if enabled and configured:
+        active_channels.append("Telegram")
+    return {
+        "telegram_enabled": enabled,
+        "telegram_configured": configured,
+        "last_telegram_alert_time": latest_sent.get("timestamp"),
+        "last_telegram_error": latest_telegram.get("error") or "",
+        "active_alert_channels": active_channels,
+    }
+
+
+class TelegramNotifier:
+    def __init__(
+        self,
+        bot_token: Optional[str],
+        chat_id: Optional[str],
+        enabled: bool = False,
+        alert_types: Optional[Iterable[str]] = None,
+        aapl_only: bool = True,
+        timeout_seconds: int = 8,
+    ) -> None:
+        self.bot_token = (bot_token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+        self.enabled = enabled
+        self.alert_types = {str(value).strip().upper() for value in (alert_types or []) if str(value).strip()}
+        self.aapl_only = aapl_only
+        self.timeout_seconds = timeout_seconds
+
+    def alert_type_for(self, alert: Alert) -> Optional[str]:
+        if alert.phase3_heads_up_sent:
+            return "PHASE3_HEADS_UP"
+        if alert.sms_allowed:
+            return "NORMAL_SMS"
+        return None
+
+    def send(self, alert: Alert) -> None:
+        if not self.enabled:
+            return
+        alert_type = self.alert_type_for(alert)
+        if not alert_type or alert_type not in self.alert_types:
+            return
+        if self.aapl_only and alert.symbol.upper() != "AAPL":
+            return
+        if not self.bot_token or not self.chat_id:
+            append_notification_status("telegram", alert_type, alert.symbol, False, "Telegram bot token or chat ID is missing")
+            return
+        message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": message, "disable_web_page_preview": True},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            append_notification_status("telegram", alert_type, alert.symbol, True, message_preview=message)
+        except Exception as exc:
+            redacted = redact_notification_error(exc, [self.bot_token])
+            append_notification_status("telegram", alert_type, alert.symbol, False, redacted, message)
+            logger.warning("Telegram send failed for %s: %s", alert.symbol, redacted)
+
+
+def send_telegram_test_message(config: Optional[Dict[str, Any]] = None) -> bool:
+    config = config or load_config(None)
+    notification_config = config.get("notifications", {})
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    message = "Test alert from AAPL scanner — Telegram notifications are working."
+    if not token or not chat_id:
+        append_notification_status("telegram", "TEST", "AAPL", False, "Telegram bot token or chat ID is missing", message)
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            timeout=int(notification_config.get("telegram_timeout_seconds", 8)),
+        )
+        response.raise_for_status()
+        append_notification_status("telegram", "TEST", "AAPL", True, message_preview=message)
+        return True
+    except Exception as exc:
+        redacted = redact_notification_error(exc)
+        append_notification_status("telegram", "TEST", "AAPL", False, redacted, message)
+        logger.warning("Telegram test failed: %s", redacted)
+        return False
+
+
+class CompositeNotifier:
+    def __init__(self, notifiers: List[Any]) -> None:
+        self.notifiers = notifiers
+
+    def send(self, alert: Alert) -> None:
+        for notifier in self.notifiers:
+            notifier.send(alert)
+
+
+def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    phone_number = os.getenv("ALERT_SMS_PHONE")
+    pushover_token = os.getenv("PUSHOVER_APP_TOKEN")
+    pushover_user = os.getenv("PUSHOVER_USER_KEY")
+    notification_config = config.get("notifications", {})
+    telegram_alert_types = notification_config.get("telegram_alert_types", ["PHASE3_HEADS_UP", "NORMAL_SMS"])
+    if isinstance(telegram_alert_types, str):
+        telegram_alert_types = [part.strip() for part in telegram_alert_types.split(",") if part.strip()]
+    return CompositeNotifier([
+        DiscordNotifier(
+            webhook_url=webhook_url if config["discord"]["enabled"] else None,
+            mention=config["discord"].get("mention", ""),
+        ),
+        MacDesktopNotifier(bool(notification_config.get("mac_desktop_enabled", True))),
+        PushoverNotifier(
+            pushover_token,
+            pushover_user,
+            enabled=bool(notification_config.get("pushover_enabled", True)),
+        ),
+        MessagesNotifier(
+            phone_number if notification_config.get("messages_enabled", False) else None,
+            send_watch=bool(notification_config.get("messages_watch_enabled", False)),
+        ),
+        TelegramNotifier(
+            os.getenv("TELEGRAM_BOT_TOKEN"),
+            os.getenv("TELEGRAM_CHAT_ID"),
+            enabled=bool(notification_config.get("telegram_enabled", False)),
+            alert_types=telegram_alert_types,
+            aapl_only=bool(notification_config.get("telegram_aapl_only", True)),
+            timeout_seconds=int(notification_config.get("telegram_timeout_seconds", 8)),
+        ),
+    ])
+
+
+class _LegacyDiscordNotifier:
+    def __init__(self, webhook_url: Optional[str], mention: str = "") -> None:
+        self.webhook_url = webhook_url
+        self.mention = mention.strip()
+
+    def send(self, alert: Alert) -> None:
+        body_lines = [
+            f"**{alert.symbol}** @ **${alert.price:.2f}**",
+            f"Category: **{alert.category}**",
+        ]
+        if alert.fast_move_pct is not None:
+            body_lines.append(f"Fast move: **{alert.fast_move_pct:+.2f}%**")
+        if alert.day_move_pct is not None:
+            body_lines.append(f"Day move: **{alert.day_move_pct:+.2f}%**")
+        if alert.relative_volume is not None:
+            body_lines.append(f"Relative volume: **{alert.relative_volume:.2f}x**")
+        if alert.premarket_high is not None:
+            body_lines.append(f"Premarket high: **{alert.premarket_high:.2f}**")
+        if alert.premarket_low is not None:
+            body_lines.append(f"Premarket low: **{alert.premarket_low:.2f}**")
+        if alert.opening_range_high is not None and alert.opening_range_low is not None:
+            body_lines.append(
+                f"Opening range: **{alert.opening_range_low:.2f} – {alert.opening_range_high:.2f}**"
+            )
+        if alert.option_contract:
+            option_bits = [
+                alert.option_contract,
+                alert.option_quality or "",
+                f"score {alert.options_score}" if alert.options_score is not None else "",
+            ]
+            body_lines.append("Option: **" + " | ".join(bit for bit in option_bits if bit) + "**")
+            if alert.option_bid is not None and alert.option_ask is not None:
+                body_lines.append(
+                    f"Bid/Ask: **{alert.option_bid:.2f} / {alert.option_ask:.2f}**"
+                )
+            if alert.option_delta is not None:
+                body_lines.append(f"Delta: **{alert.option_delta:+.2f}**")
+            if alert.option_iv is not None:
+                body_lines.append(f"IV: **{alert.option_iv:.2%}**")
+        if alert.headline:
+            body_lines.append(f"Headline: {alert.headline}")
+        if alert.url:
+            body_lines.append(alert.url)
+        if alert.notes:
+            body_lines.append("Notes: " + " | ".join(alert.notes))
+        body_lines.append("Watch for continuation or rejection before taking action.")
+
+        message = "\n".join(body_lines)
+        if not self.webhook_url:
+            logger.info("DISCORD DISABLED\n%s", message)
+            return
+
+        payload = {
+            "content": self.mention or None,
+            "embeds": [
+                {
+                    "title": f"{alert.symbol} Momentum Alert",
+                    "description": message,
+                    "color": 5763719,
+                    "timestamp": alert.timestamp.astimezone(UTC).isoformat(),
+                }
+            ],
+        }
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=20)
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("Discord send failed: %s", exc)
+
+
+# ------------------------------------------------------------
+# Session helpers
+# ------------------------------------------------------------
+def in_extended_or_regular_session(config: Dict[str, Any]) -> bool:
+    t = now_et()
+    pre = set_today_time_et(config["premarket_start"])
+    post = set_today_time_et(config["postmarket_end"])
+    return pre <= t <= post
+
+
+def in_regular_session(config: Dict[str, Any]) -> bool:
+    t = now_et()
+    open_t = set_today_time_et(config["market_open"])
+    close_t = set_today_time_et(config["market_close"])
+    return open_t <= t <= close_t
+
+
+def in_premarket(config: Dict[str, Any]) -> bool:
+    t = now_et()
+    pre = set_today_time_et(config["premarket_start"])
+    open_t = set_today_time_et(config["market_open"])
+    return pre <= t < open_t
+
+
+def in_postmarket(config: Dict[str, Any]) -> bool:
+    t = now_et()
+    close_t = set_today_time_et(config["market_close"])
+    post = set_today_time_et(config["postmarket_end"])
+    return close_t < t <= post
+
+
+def is_opening_range_bar(bar_time: datetime, config: Dict[str, Any]) -> bool:
+    return is_opening_range_bar_for_minutes(bar_time, config, int(config["opening_range_minutes"]))
+
+
+def is_opening_range_bar_for_minutes(bar_time: datetime, config: Dict[str, Any], minutes: int) -> bool:
+    bar_et = bar_time.astimezone(ET)
+    start = set_today_time_et(config["market_open"])
+    end = start + timedelta(minutes=int(minutes))
+    return start <= bar_et < end
+
+
+def is_premarket_bar(bar_time: datetime, config: Dict[str, Any]) -> bool:
+    bar_et = bar_time.astimezone(ET)
+    start = set_today_time_et(config["premarket_start"])
+    open_t = set_today_time_et(config["market_open"])
+    return start <= bar_et < open_t
+
+
+def session_history_start(config: Dict[str, Any]) -> datetime:
+    pre = set_today_time_et(config["premarket_start"])
+    return pre.astimezone(UTC)
+
+
+def session_anchor_bar(bars: List[Bar], config: Dict[str, Any]) -> Optional[Bar]:
+    if not bars:
+        return None
+    open_t = set_today_time_et(config["market_open"])
+    for bar in bars:
+        if bar.t.astimezone(ET) >= open_t:
+            return bar
+    return bars[0]
+
+
+def bar_age_minutes(bar: Optional[Bar]) -> Optional[float]:
+    if not bar:
+        return None
+    return max(0.0, (now_utc() - bar.t.astimezone(UTC)).total_seconds() / 60.0)
+
+
+def is_stale_bar(bar: Optional[Bar], config: Dict[str, Any]) -> bool:
+    age = bar_age_minutes(bar)
+    if age is None:
+        return True
+    stale_after = float(config.get("data_quality", {}).get("stale_after_minutes", 20))
+    return age > stale_after
+
+
+def has_min_recent_bars(bars: List[Bar], config: Dict[str, Any]) -> bool:
+    min_bars = int(config.get("data_quality", {}).get("min_recent_bars", 10))
+    lookback_bars = int(config["lookback_minutes_fast_move"]) + 1
+    return len(bars) >= max(min_bars, lookback_bars)
+
+
+def opening_range_complete(bars: List[Bar], config: Dict[str, Any]) -> bool:
+    required = int(config["opening_range_minutes"])
+    return len([b for b in bars if is_opening_range_bar(b.t, config)]) >= required
+
+
+def snapshot_data_quality(snap: SymbolSnapshot, config: Dict[str, Any]) -> str:
+    if not snap.latest_bar:
+        return "Incomplete"
+    if is_stale_bar(snap.latest_bar, config):
+        return "Stale"
+    if not has_min_recent_bars(snap.recent_bars, config):
+        return "Incomplete"
+    day_volume = sum(b.v for b in snap.recent_bars)
+    if day_volume < config["filters"]["min_day_volume"]:
+        return "Low volume"
+    return "Fresh"
+
+
+def option_quote_age_seconds(contract: OptionContractSnapshot) -> Optional[float]:
+    if not contract.quote_time:
+        return None
+    return max(0.0, (now_utc() - contract.quote_time.astimezone(UTC)).total_seconds())
+
+
+def option_expiration_rank(expiration: date, config: Dict[str, Any]) -> Optional[int]:
+    today = now_et().date()
+    if expiration < today:
+        return None
+    mode = config.get("options", {}).get("expiry_mode", "0dte_then_weekly")
+    if mode == "0dte_only" and expiration != today:
+        return None
+    if mode == "up_to_7dte" and (expiration - today).days > 7:
+        return None
+    return 0 if expiration == today else (expiration - today).days
+
+
+def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, Any]) -> Tuple[str, List[str]]:
+    options_config = config.get("options", {})
+    reasons: List[str] = []
+    if contract.bid is None or contract.ask is None or contract.bid <= 0 or contract.ask <= 0 or contract.ask <= contract.bid:
+        return "No clean contract", ["missing or crossed bid/ask"]
+
+    age = option_quote_age_seconds(contract)
+    max_age = float(options_config.get("max_quote_age_seconds", 60))
+    if age is None or age > max_age:
+        return "Stale quote", ["option quote is stale or missing"]
+
+    spread_pct = contract.spread_pct
+    if spread_pct is None or spread_pct > float(options_config.get("max_spread_pct", 12)):
+        return "Wide spread", ["bid/ask spread is too wide"]
+
+    min_volume = int(options_config.get("min_option_volume", 100))
+    min_oi = int(options_config.get("min_open_interest", 250))
+    if contract.volume is not None and contract.volume < min_volume:
+        return "Low liquidity", ["option volume is below minimum"]
+    if contract.open_interest is not None and contract.open_interest < min_oi:
+        return "Low liquidity", ["open interest is below minimum"]
+
+    if contract.delta is None:
+        return "No clean contract", ["delta is missing"]
+    delta_abs = abs(contract.delta)
+    if delta_abs < float(options_config.get("delta_min", 0.30)) or delta_abs > float(options_config.get("delta_max", 0.60)):
+        return "No clean contract", ["delta is outside target range"]
+
+    return "Tradable", reasons
+
+
+def score_option_contract(contract: OptionContractSnapshot, quality: str, config: Dict[str, Any]) -> int:
+    if quality != "Tradable":
+        return 0
+    score = 40.0
+    spread_pct = contract.spread_pct or float(config.get("options", {}).get("max_spread_pct", 12))
+    max_spread = max(float(config.get("options", {}).get("max_spread_pct", 12)), 0.01)
+    score += max(0.0, (1.0 - spread_pct / max_spread)) * 25.0
+    if contract.volume is not None:
+        score += min(15.0, contract.volume / max(int(config.get("options", {}).get("min_option_volume", 100)), 1) * 7.5)
+    if contract.open_interest is not None:
+        score += min(10.0, contract.open_interest / max(int(config.get("options", {}).get("min_open_interest", 250)), 1) * 5.0)
+    if contract.delta is not None:
+        score += max(0.0, 10.0 - abs(abs(contract.delta) - 0.45) * 40.0)
+    return int(round(max(0.0, min(100.0, score))))
+
+
+def choose_best_option_contract(
+    chain: List[OptionContractSnapshot],
+    option_type: str,
+    underlying_price: float,
+    config: Dict[str, Any],
+) -> OptionSelection:
+    candidates = [
+        contract for contract in chain
+        if contract.option_type == option_type and option_expiration_rank(contract.expiration_date, config) is not None
+    ]
+    if not candidates:
+        return OptionSelection(quality="No clean contract", reasons=["no matching expiration"])
+
+    best_any: Optional[OptionSelection] = None
+    best_tradable: Optional[OptionSelection] = None
+    for contract in candidates:
+        quality, reasons = option_contract_quality(contract, config)
+        score = score_option_contract(contract, quality, config)
+        expiry_rank = option_expiration_rank(contract.expiration_date, config) or 0
+        distance_penalty = abs(contract.strike - underlying_price)
+        selection = OptionSelection(contract=contract, quality=quality, score=score, reasons=reasons)
+        sort_key = (-expiry_rank, score, -distance_penalty)
+        if quality == "Tradable":
+            if best_tradable is None:
+                best_tradable = selection
+            else:
+                current = best_tradable.contract
+                assert current is not None
+                current_key = (-(option_expiration_rank(current.expiration_date, config) or 0), best_tradable.score, -abs(current.strike - underlying_price))
+                if sort_key > current_key:
+                    best_tradable = selection
+        if best_any is None:
+            best_any = selection
+        else:
+            current = best_any.contract
+            assert current is not None
+            current_quality_rank = 1 if best_any.quality == "Tradable" else 0
+            quality_rank = 1 if quality == "Tradable" else 0
+            current_key = (current_quality_rank, -(option_expiration_rank(current.expiration_date, config) or 0), best_any.score, -abs(current.strike - underlying_price))
+            any_key = (quality_rank, -expiry_rank, score, -distance_penalty)
+            if any_key > current_key:
+                best_any = selection
+
+    return best_tradable or best_any or OptionSelection(quality="No clean contract")
+
+
+def select_option_contracts(
+    chain: List[OptionContractSnapshot],
+    underlying_price: Optional[float],
+    config: Dict[str, Any],
+) -> Tuple[OptionSelection, OptionSelection]:
+    if underlying_price is None or not config.get("options", {}).get("enabled", True):
+        empty = OptionSelection(quality="No clean contract", reasons=["options disabled or missing underlying price"])
+        return empty, empty
+    return (
+        choose_best_option_contract(chain, "C", underlying_price, config),
+        choose_best_option_contract(chain, "P", underlying_price, config),
+    )
+
+
+# ------------------------------------------------------------
+# Scanner engine
+# ------------------------------------------------------------
+class EliteScanner:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        provider: DataProvider,
+        notifier: Any,
+        writer: AlertWriter,
+        state_store: StateStore,
+    ) -> None:
+        self.config = config
+        self.provider = provider
+        self.notifier = notifier
+        self.writer = writer
+        self.state_store = state_store
+        self.symbols = list(config["symbols"])
+        if config.get("only_symbols_with_options", True):
+            eligible = set(config.get("symbols_with_options", []))
+            self.symbols = [s for s in self.symbols if s in eligible]
+
+    def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
+        end = now_utc()
+        start = session_history_start(self.config)
+        latest = self.provider.get_latest_bars(self.symbols)
+        recent: Dict[str, List[Bar]] = {}
+        minutes_requested = max(1, int((end - start).total_seconds() // 60) + 1)
+        api_safe_batch_size = max(1, 9000 // minutes_requested)
+        configured_batch_size = max(1, int(self.config.get("discovery", {}).get("batch_size", 150)))
+        batch_size = min(configured_batch_size, api_safe_batch_size)
+        for i in range(0, len(self.symbols), batch_size):
+            batch_symbols = self.symbols[i:i + batch_size]
+            recent.update(self.provider.get_recent_bars(batch_symbols, start, end))
+        news = self.provider.get_news(self.symbols)
+
+        latest_news_map: Dict[str, NewsItem] = {}
+        max_age = timedelta(minutes=int(self.config["max_news_age_minutes"]))
+        cutoff = now_utc() - max_age
+        for item in news:
+            if item.published_at >= cutoff and item.symbol not in latest_news_map:
+                latest_news_map[item.symbol] = item
+
+        snapshots: Dict[str, SymbolSnapshot] = {}
+        for symbol in self.symbols:
+            rbars = recent.get(symbol, [])
+            latest_bar = latest.get(symbol)
+            pm_high = None
+            pm_low = None
+            or_high = None
+            or_low = None
+            or_15_high = None
+            or_15_low = None
+
+            pre_bars = [b for b in rbars if is_premarket_bar(b.t, self.config)]
+            if pre_bars:
+                pm_high = max(b.h for b in pre_bars)
+                pm_low = min(b.l for b in pre_bars)
+
+            or_bars = [b for b in rbars if is_opening_range_bar(b.t, self.config)]
+            if or_bars:
+                or_high = max(b.h for b in or_bars)
+                or_low = min(b.l for b in or_bars)
+            secondary_minutes = int(
+                self.config.get("strategy_engine", {}).get(
+                    "opening_range_minutes_secondary",
+                    self.config.get("opening_range_minutes_secondary", 15),
+                )
+            )
+            or_15_bars = [b for b in rbars if is_opening_range_bar_for_minutes(b.t, self.config, secondary_minutes)]
+            if or_15_bars:
+                or_15_high = max(b.h for b in or_15_bars)
+                or_15_low = min(b.l for b in or_15_bars)
+
+            option_chain: List[OptionContractSnapshot] = []
+            if self.config.get("options", {}).get("enabled", True) and latest_bar:
+                try:
+                    option_chain = self.provider.get_option_chain(symbol, self.config)
+                except Exception as exc:
+                    logger.warning("Option chain unavailable for %s: %s", symbol, exc)
+            best_call, best_put = select_option_contracts(
+                option_chain,
+                latest_bar.c if latest_bar else None,
+                self.config,
+            )
+
+            snapshots[symbol] = SymbolSnapshot(
+                symbol=symbol,
+                latest_bar=latest_bar,
+                recent_bars=rbars,
+                premarket_high=pm_high,
+                premarket_low=pm_low,
+                opening_range_high=or_high,
+                opening_range_low=or_low,
+                opening_range_15_high=or_15_high,
+                opening_range_15_low=or_15_low,
+                latest_news=latest_news_map.get(symbol),
+                best_call=best_call,
+                best_put=best_put,
+            )
+        return snapshots
+
+    def compute_relative_volume(self, bars: List[Bar]) -> Optional[float]:
+        if len(bars) < 10:
+            return None
+        recent_vol = bars[-1].v
+        prior_avg = average(b.v for b in bars[:-1])
+        if not prior_avg or prior_avg <= 0:
+            return None
+        return recent_vol / prior_avg
+
+    def passes_basic_filters(self, snap: SymbolSnapshot) -> bool:
+        if not snap.latest_bar or not snap.recent_bars:
+            return False
+        price = snap.latest_bar.c
+        filters = self.config["filters"]
+        if price < filters["min_price"] or price > filters["max_price"]:
+            return False
+        day_volume = sum(b.v for b in snap.recent_bars)
+        if day_volume < filters["min_day_volume"]:
+            return False
+        return True
+
+    def infer_alert_direction(self, alert: Alert) -> str:
+        category = alert.category.upper()
+        bullish_terms = ("BREAK UP", "HIGH BREAK", "REVERSAL UP", "SUSTAINED TREND UP", "SQUEEZE")
+        bearish_terms = ("BREAK DOWN", "LOW BREAK", "REVERSAL DOWN", "FAILED BREAKOUT DOWN", "SUSTAINED TREND DOWN", "FLUSH", "SELL")
+        if any(term in category for term in bullish_terms):
+            return "BULLISH"
+        if any(term in category for term in bearish_terms):
+            return "BEARISH"
+        move = alert.fast_move_pct
+        if move is None or abs(move) < 0.08:
+            move = alert.day_move_pct
+        if move is not None and move > 0:
+            return "BULLISH"
+        if move is not None and move < 0:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def is_watch_alert(self, alert: Alert) -> bool:
+        return (alert.setup_level or "").upper() == "WATCH" or alert.category.upper().startswith("WATCH ")
+
+    def build_market_context(self, snapshots: Dict[str, SymbolSnapshot]) -> Dict[str, str]:
+        context: Dict[str, str] = {}
+        for symbol in self.market_context_symbols():
+            snap = snapshots.get(symbol)
+            if not snap or snapshot_data_quality(snap, self.config) != "Fresh" or not snap.latest_bar or not snap.recent_bars:
+                context[symbol] = "UNKNOWN"
+                continue
+            anchor = session_anchor_bar(snap.recent_bars, self.config)
+            lookback = int(self.config["lookback_minutes_fast_move"])
+            fast = 0.0
+            if len(snap.recent_bars) > lookback:
+                fast = pct_change(snap.latest_bar.c, snap.recent_bars[-(lookback + 1)].c)
+            day = pct_change(snap.latest_bar.c, anchor.o) if anchor else 0.0
+            combined = day if abs(day) >= 0.08 else fast
+            if combined > 0.05:
+                context[symbol] = "BULLISH"
+            elif combined < -0.05:
+                context[symbol] = "BEARISH"
+            else:
+                context[symbol] = "FLAT"
+        return context
+
+    def market_alignment_for(self, direction: str, market_context: Optional[Dict[str, str]]) -> str:
+        if direction not in {"BULLISH", "BEARISH"} or not market_context:
+            return "UNKNOWN"
+        reads = [market_context.get(symbol, "UNKNOWN") for symbol in self.market_context_symbols()]
+        if any(read == "UNKNOWN" for read in reads):
+            return "UNKNOWN"
+        opposed = "BEARISH" if direction == "BULLISH" else "BULLISH"
+        if all(read == direction for read in reads):
+            return "ALIGNED"
+        if all(read == opposed for read in reads):
+            return "OPPOSED"
+        return "MIXED"
+
+    def breakout_hold_ok(self, alert: Alert, snap: SymbolSnapshot) -> bool:
+        category = alert.category.upper()
+        required = int(self.config.get("alert_quality", {}).get("hold_break_bars", 1))
+        if required <= 0:
+            return True
+        if "BREAK" not in category:
+            return True
+        level: Optional[float] = None
+        bullish = False
+        if "OPENING RANGE BREAK UP" in category:
+            level = snap.opening_range_high
+            bullish = True
+        elif "OPENING RANGE BREAK DOWN" in category:
+            level = snap.opening_range_low
+        elif "PREMARKET HIGH BREAK" in category:
+            level = snap.premarket_high
+            bullish = True
+        elif "PREMARKET LOW BREAK" in category:
+            level = snap.premarket_low
+        else:
+            return True
+        if level is None or len(snap.recent_bars) < required + 1:
+            return False
+        check_bars = snap.recent_bars[-(required + 1):]
+        if bullish:
+            return all(bar.c > level for bar in check_bars)
+        return all(bar.c < level for bar in check_bars)
+
+    def breakout_distance_pct(self, alert: Alert, snap: SymbolSnapshot) -> Optional[float]:
+        category = alert.category.upper()
+        level: Optional[float] = None
+        bullish = False
+        if "OPENING RANGE BREAK UP" in category:
+            level = snap.opening_range_high
+            bullish = True
+        elif "OPENING RANGE BREAK DOWN" in category:
+            level = snap.opening_range_low
+        elif "PREMARKET HIGH BREAK" in category:
+            level = snap.premarket_high
+            bullish = True
+        elif "PREMARKET LOW BREAK" in category:
+            level = snap.premarket_low
+        else:
+            return None
+        if level is None or level <= 0:
+            return None
+        raw = pct_change(alert.price, level)
+        return raw if bullish else -raw
+
+    def immediate_break_ok(self, alert: Alert, snap: SymbolSnapshot) -> bool:
+        if "BREAK" not in alert.category.upper():
+            return False
+        quality_config = self.config.get("alert_quality", {})
+        distance = self.breakout_distance_pct(alert, snap)
+        if distance is None:
+            return False
+        min_distance = float(quality_config.get("immediate_break_min_distance_pct", 0.20))
+        min_fast = float(quality_config.get("immediate_break_min_fast_move_pct", 0.20))
+        direction = alert.direction or self.infer_alert_direction(alert)
+        fast_move = alert.fast_move_pct or 0.0
+        fast_aligned = fast_move >= min_fast if direction == "BULLISH" else fast_move <= -min_fast
+        return distance >= min_distance and fast_aligned
+
+    def max_allowed_break_distance_pct(self, alert: Alert) -> float:
+        quality_config = self.config.get("alert_quality", {})
+        if alert.symbol in {"SPY", "QQQ"}:
+            return float(quality_config.get("max_sms_index_break_distance_pct", 0.30))
+        return float(quality_config.get("max_sms_break_distance_pct", 0.75))
+
+    def late_day_threshold_time(self) -> datetime:
+        quality_config = self.config.get("alert_quality", {})
+        raw = str(quality_config.get("late_day_repeat_after", "14:30"))
+        hour, minute = (int(part) for part in raw.split(":", 1))
+        now = now_et()
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def is_late_day_generic_alert(self, alert: Alert) -> bool:
+        if alert.timestamp.astimezone(ET) < self.late_day_threshold_time():
+            return False
+        category = alert.category.upper()
+        return "BREAK" not in category and ("HIGH RELATIVE VOLUME" in category or "CATALYST RUNNER" in category)
+
+    def fast_move_aligned(self, alert: Alert, minimum: float) -> bool:
+        fast = alert.fast_move_pct or 0.0
+        direction = alert.direction or self.infer_alert_direction(alert)
+        if direction == "BULLISH":
+            return fast >= minimum
+        if direction == "BEARISH":
+            return fast <= -minimum
+        return False
+
+    def fast_move_opposes_setup(self, alert: Alert, minimum: float) -> bool:
+        fast = alert.fast_move_pct or 0.0
+        direction = alert.direction or self.infer_alert_direction(alert)
+        if direction == "BULLISH":
+            return fast <= -minimum
+        if direction == "BEARISH":
+            return fast >= minimum
+        return False
+
+    def market_opposed_bearish_watch_allowed(
+        self,
+        alert: Alert,
+        data_quality: str,
+        age: Optional[float],
+        max_age: float,
+        score: int,
+        rvol: float,
+        fast_opposes_setup: bool,
+        break_distance: Optional[float],
+    ) -> bool:
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("opposed_bearish_watch_enabled", True):
+            return False
+        if (alert.direction or self.infer_alert_direction(alert)) != "BEARISH":
+            return False
+        if alert.market_alignment != "OPPOSED":
+            return False
+        if data_quality != "Fresh" or age is None or age > max_age:
+            return False
+        if score < int(quality_config.get("opposed_bearish_watch_min_score", 15)):
+            return False
+        if rvol < float(quality_config.get("opposed_bearish_watch_min_rvol", 0.30)):
+            return False
+        if fast_opposes_setup:
+            return False
+        if alert.option_quality != "Tradable":
+            return False
+        if (alert.options_score or 0) < int(quality_config.get("opposed_bearish_watch_min_options_score", 65)):
+            return False
+        if alert.option_spread_pct is not None and alert.option_spread_pct > float(quality_config.get("max_sms_option_spread_pct", 8.0)):
+            return False
+
+        if break_distance is not None and break_distance > float(quality_config.get("opposed_bearish_watch_max_break_distance_pct", 1.50)):
+            return False
+
+        fast = alert.fast_move_pct or 0.0
+        day = alert.day_move_pct or 0.0
+        min_fast = float(quality_config.get("opposed_bearish_watch_min_fast_move_pct", 0.08))
+        min_day = float(quality_config.get("opposed_bearish_watch_min_day_move_pct", 0.75))
+        max_counter_day = float(quality_config.get("opposed_bearish_watch_max_counter_day_move_pct", 2.5))
+        if day > max_counter_day:
+            return False
+        category = alert.category.upper()
+        bearish_watch_category = any(
+            term in category
+            for term in (
+                "BREAK DOWN",
+                "LOW BREAK",
+                "REVERSAL DOWN",
+                "FAILED BREAKOUT DOWN",
+                "SUSTAINED TREND DOWN",
+                "FAST IMPULSE DOWN",
+            )
+        )
+        stock_move_confirms = fast <= -min_fast or day <= -min_day
+        return bearish_watch_category and stock_move_confirms
+
+    def maybe_fast_impulse_watch(
+        self,
+        snap: SymbolSnapshot,
+        latest: Bar,
+        fast_move: float,
+        day_move: float,
+        rel_vol: Optional[float],
+        notes: List[str],
+    ) -> Optional[Alert]:
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("fast_impulse_watch_enabled", True):
+            return None
+        latest_et = latest.t.astimezone(ET)
+        open_t = set_today_time_et(self.config["market_open"])
+        close_t = set_today_time_et(self.config["market_close"])
+        if not (open_t <= latest_et < close_t):
+            return None
+        min_rvol = float(quality_config.get("fast_impulse_watch_min_rvol", 1.2))
+        if (rel_vol or 0.0) < min_rvol:
+            return None
+
+        lookback = max(2, int(quality_config.get("fast_impulse_watch_lookback_bars", 3)))
+        if len(snap.recent_bars) < lookback + 1:
+            return None
+        window = snap.recent_bars[-(lookback + 1):]
+        impulse_move = pct_change(latest.c, window[0].c)
+        min_move = float(quality_config.get("fast_impulse_watch_min_move_pct", 0.18))
+        if snap.symbol in {"SPY", "QQQ"}:
+            min_move = float(quality_config.get("fast_impulse_watch_min_index_move_pct", min_move))
+
+        if impulse_move >= min_move:
+            direction = "BULLISH"
+        elif impulse_move <= -min_move:
+            direction = "BEARISH"
+        else:
+            return None
+
+        aligned_steps = 0
+        for previous, current in zip(window, window[1:]):
+            if direction == "BULLISH" and current.c >= previous.c:
+                aligned_steps += 1
+            elif direction == "BEARISH" and current.c <= previous.c:
+                aligned_steps += 1
+        min_ratio = float(quality_config.get("fast_impulse_watch_min_aligned_ratio", 0.66))
+        if aligned_steps / lookback < min_ratio:
+            return None
+
+        if direction == "BULLISH" and latest.c < latest.o:
+            return None
+        if direction == "BEARISH" and latest.c > latest.o:
+            return None
+
+        category = "WATCH FAST IMPULSE UP" if direction == "BULLISH" else "WATCH FAST IMPULSE DOWN"
+        return Alert(
+            symbol=snap.symbol,
+            timestamp=now_utc(),
+            category=category,
+            price=latest.c,
+            fast_move_pct=fast_move,
+            day_move_pct=day_move,
+            relative_volume=rel_vol,
+            premarket_high=snap.premarket_high,
+            premarket_low=snap.premarket_low,
+            opening_range_high=snap.opening_range_high,
+            opening_range_low=snap.opening_range_low,
+            headline=snap.latest_news.headline if snap.latest_news else None,
+            url=snap.latest_news.url if snap.latest_news else None,
+            notes=notes + [f"fast {lookback}m impulse move {impulse_move:+.2f}%"],
+            setup_level="WATCH",
+        )
+
+    def late_day_generic_has_fresh_push(self, alert: Alert) -> bool:
+        quality_config = self.config.get("alert_quality", {})
+        min_fast = float(quality_config.get("late_day_generic_min_aligned_fast_move_pct", 0.12))
+        min_rvol = float(quality_config.get("late_day_generic_min_rvol", 3.5))
+        return self.fast_move_aligned(alert, min_fast) and (alert.relative_volume or 0.0) >= min_rvol
+
+    def phase2_active_strategy_directions(self, alert: Alert) -> List[str]:
+        directions: List[str] = []
+        for result in alert.strategy_results:
+            if not result.get("active"):
+                continue
+            direction = str(result.get("direction") or "").upper()
+            if direction in {"BULLISH", "BEARISH"} and direction not in directions:
+                directions.append(direction)
+        return directions
+
+    def has_phase2_context(self, alert: Alert) -> bool:
+        return bool(
+            alert.primary_setup
+            or alert.strategy_results
+            or alert.confirmation_score is not None
+            or alert.candle_label
+            or alert.risk_label
+            or alert.market_regime
+        )
+
+    def phase2_direction_conflict(self, alert: Alert, alert_direction: str) -> bool:
+        if not alert_direction:
+            return False
+        if alert.strategy_direction in {"bullish", "bearish"} and alert.strategy_direction.upper() != alert_direction:
+            return True
+        active_directions = self.phase2_active_strategy_directions(alert)
+        opposite = "BEARISH" if alert_direction == "BULLISH" else "BULLISH"
+        for result in alert.strategy_results:
+            direction = str(result.get("direction") or "").upper()
+            if result.get("active") and direction == opposite and int(result.get("score") or 0) >= 60:
+                return True
+        return bool(active_directions and alert_direction not in active_directions)
+
+    def phase2_candle_aligned(self, alert: Alert, alert_direction: str) -> bool:
+        label = alert.candle_label or "UNKNOWN"
+        if alert_direction == "BULLISH":
+            return label == "BUYER_CONTROL"
+        if alert_direction == "BEARISH":
+            return label == "SELLER_CONTROL"
+        return False
+
+    def phase2_candle_contradicts(self, alert: Alert, alert_direction: str) -> bool:
+        label = alert.candle_label or "UNKNOWN"
+        return (
+            (alert_direction == "BULLISH" and label == "SELLER_CONTROL")
+            or (alert_direction == "BEARISH" and label == "BUYER_CONTROL")
+        )
+
+    def market_regime_supports_direction(self, alert: Alert, alert_direction: str) -> bool:
+        regime = alert.market_regime or "UNKNOWN"
+        if alert_direction == "BULLISH":
+            return regime == "BULL_TREND"
+        if alert_direction == "BEARISH":
+            return regime == "BEAR_TREND"
+        return False
+
+    def phase2_sms_block_reasons(self, alert: Alert, alert_direction: str) -> List[str]:
+        if not self.has_phase2_context(alert):
+            return []
+        quality_config = self.config.get("alert_quality", {})
+        reasons: List[str] = []
+        min_confirmation = int(quality_config.get("sms_min_confirmation_score", 60))
+        strong_confirmation = int(quality_config.get("sms_strong_confirmation_score", 70))
+        direction_conflict = self.phase2_direction_conflict(alert, alert_direction)
+        if bool(quality_config.get("sms_require_no_direction_conflict", True)) and direction_conflict:
+            reasons.append("Direction conflict: setup label does not match alert direction")
+        if alert.risk_label in {"HIGH", "DO_NOT_CHASE"}:
+            reasons.append(f"Phase 2 risk is {alert.risk_label}")
+        if alert.confirmation_score is not None and alert.confirmation_score < min_confirmation:
+            reasons.append("Phase 2 confirmation below SMS threshold")
+        if alert.confirmation_label == "WEAK":
+            reasons.append("Phase 2 confirmation label is WEAK")
+        if bool(quality_config.get("sms_require_candle_alignment", True)):
+            if alert.candle_label in {"INDECISION", "REJECTION"}:
+                reasons.append(f"Candle quality is {alert.candle_label}")
+            elif self.phase2_candle_contradicts(alert, alert_direction):
+                reasons.append("Candle quality contradicts alert direction")
+            elif alert.candle_label and not self.phase2_candle_aligned(alert, alert_direction):
+                reasons.append("Candle quality is not aligned with alert direction")
+        market_regime = alert.market_regime or "UNKNOWN"
+        if bool(quality_config.get("sms_block_choppy_market", True)) and market_regime in {"CHOPPY", "UNKNOWN"}:
+            if not ((alert.strategy_confidence_score or 0) >= 90 and (alert.confirmation_score or 0) >= strong_confirmation):
+                reasons.append(f"Market regime is {market_regime}")
+        if alert.relative_strength_label == "UNKNOWN" and (alert.confirmation_score or 0) < strong_confirmation:
+            reasons.append("Relative strength is UNKNOWN below strong confirmation threshold")
+        return reasons
+
+    def phase2_grade_cap(self, alert: Alert, alert_direction: str) -> int:
+        if not self.has_phase2_context(alert):
+            return 100
+        cap = 100
+        direction_conflict = self.phase2_direction_conflict(alert, alert_direction)
+        candle_aligned = self.phase2_candle_aligned(alert, alert_direction)
+        if direction_conflict:
+            cap = min(cap, 54)
+        if alert.confirmation_score is not None and alert.confirmation_score < int(self.config.get("alert_quality", {}).get("sms_min_confirmation_score", 60)):
+            cap = min(cap, 69)
+        if alert.confirmation_label != "STRONG":
+            cap = min(cap, 69)
+        if alert.risk_label in {"HIGH", "DO_NOT_CHASE"}:
+            cap = min(cap, 69)
+        if (alert.market_regime or "UNKNOWN") in {"CHOPPY", "UNKNOWN"}:
+            cap = min(cap, 69)
+        if not candle_aligned:
+            cap = min(cap, 69)
+        return cap
+
+    def phase2_allows_a_plus(self, alert: Alert, alert_direction: str) -> bool:
+        if not self.has_phase2_context(alert):
+            return True
+        quality_config = self.config.get("alert_quality", {})
+        if self.phase2_direction_conflict(alert, alert_direction):
+            return False
+        if (alert.strategy_confidence_score or 0) < 85:
+            return False
+        if (alert.confirmation_score or 0) < int(quality_config.get("a_plus_min_confirmation_score", 70)):
+            return False
+        if alert.risk_label not in {"LOW", "MEDIUM"}:
+            return False
+        if alert.entry_quality_label not in {"GOOD_POSITION", "EARLY"}:
+            return False
+        if alert.volume_label not in {"STRONG", "CLIMAX"}:
+            return False
+        if not self.phase2_candle_aligned(alert, alert_direction):
+            return False
+        if not self.market_regime_supports_direction(alert, alert_direction):
+            return False
+        if any("direction conflict" in warning.lower() for warning in alert.strategy_warnings):
+            return False
+        return True
+
+    def is_orb_sms_alert(self, alert: Alert) -> bool:
+        text = " ".join([alert.category or "", alert.primary_setup or "", *alert.secondary_setups]).upper()
+        return "ORB" in text or "OPENING RANGE" in text
+
+    def orb_sms_state_key(self, alert: Alert) -> str:
+        direction = alert.direction or self.infer_alert_direction(alert) or "MOMENTUM"
+        day_key = alert.timestamp.astimezone(ET).strftime("%Y-%m-%d")
+        return f"{day_key}:ORB_SMS:{alert.symbol}:{direction}"
+
+    def orb_sms_blocked_by_dedupe(self, alert: Alert) -> bool:
+        if not self.is_orb_sms_alert(alert):
+            return False
+        minutes = int(self.config.get("alert_quality", {}).get("sms_orb_dedupe_minutes", 15))
+        key = self.orb_sms_state_key(alert)
+        last = self.state_store.get_last_alert_time(key)
+        if not last:
+            return False
+        if (now_utc() - last).total_seconds() > minutes * 60:
+            return False
+        previous = int(self.state_store.data.get("orb_sms_confirmation_scores", {}).get(key, -1))
+        return (alert.confirmation_score or 0) <= previous
+
+    def record_orb_sms_state(self, alert: Alert) -> None:
+        if not self.is_orb_sms_alert(alert):
+            return
+        key = self.orb_sms_state_key(alert)
+        self.state_store.set_last_alert_time(key, now_utc())
+        self.state_store.data.setdefault("orb_sms_confirmation_scores", {})[key] = int(alert.confirmation_score or 0)
+
+    def phase3_heads_up_symbols(self) -> set[str]:
+        raw = self.config.get("scenario_engine", {}).get("phase3_heads_up_symbols", ["AAPL"])
+        if isinstance(raw, str):
+            values = [part.strip().upper() for part in raw.split(",")]
+        elif isinstance(raw, list):
+            values = [str(part).strip().upper() for part in raw]
+        else:
+            values = []
+        return {value for value in values if value}
+
+    def market_context_symbols(self) -> List[str]:
+        raw = self.config.get("scenario_engine", {}).get("market_context_symbols", ["SPY", "QQQ"])
+        if isinstance(raw, str):
+            values = [part.strip().upper() for part in raw.split(",")]
+        elif isinstance(raw, list):
+            values = [str(part).strip().upper() for part in raw]
+        else:
+            values = []
+        return [value for value in values if value]
+
+    def phase3_heads_up_state_key(self, alert: Alert) -> str:
+        scenario = alert.scenario_top or {}
+        scenario_name = str(scenario.get("scenario_name") or alert.primary_setup or "SCENARIO").upper()
+        direction = str(alert.scenario_direction or scenario.get("direction") or alert.direction or "MOMENTUM").upper()
+        stage = str(alert.scenario_stage or scenario.get("stage") or "UNKNOWN").upper()
+        day_key = alert.timestamp.astimezone(ET).strftime("%Y-%m-%d")
+        return f"{day_key}:PHASE3_HEADS_UP:{alert.symbol}:{direction}:{scenario_name}:{stage}"
+
+    def evaluate_phase3_heads_up(
+        self,
+        alert: Alert,
+        snap: SymbolSnapshot,
+        data_quality: Optional[str] = None,
+        market_context: Optional[Dict[str, str]] = None,
+    ) -> None:
+        config = self.config.get("scenario_engine", {})
+        alert.phase3_heads_up_eligible = False
+        alert.phase3_heads_up_sent = False
+        alert.phase3_heads_up_block_reason = ""
+        alert.phase3_heads_up_type = "BLOCKED"
+        alert.phase3_heads_up_dedupe_key = None
+        alert.phase3_heads_up_dedupe_blocked = False
+        alert.phase3_heads_up_last_sent_time = None
+        alert.phase3_heads_up_next_eligible_time = None
+        alert.phase3_heads_up_dedupe_minutes_remaining = None
+        context_symbols = self.market_context_symbols()
+        alert.context_symbols_available = [
+            symbol for symbol in context_symbols if (market_context or {}).get(symbol, "UNKNOWN") != "UNKNOWN"
+        ]
+        alert.market_confirmation_status = (
+            "AVAILABLE" if len(alert.context_symbols_available) == len(context_symbols) else "UNAVAILABLE"
+        )
+        if alert.market_confirmation_status == "UNAVAILABLE":
+            warning = "Market confirmation unavailable — SPY/QQQ data missing."
+            if warning not in alert.scenario_warnings:
+                alert.scenario_warnings.append(warning)
+
+        def block(reason: str) -> None:
+            alert.phase3_heads_up_block_reason = reason
+            alert.phase3_heads_up_message_preview = phase3_heads_up_message(alert)
+
+        if not config.get("enable_phase3_heads_up_alerts", True):
+            block("Phase 3 heads-up alerts disabled")
+            return
+        if alert.symbol.upper() not in self.phase3_heads_up_symbols():
+            block("symbol not enabled for Phase 3 heads-up")
+            return
+        if not alert.scenario_top:
+            block("no Phase 3 top scenario")
+            return
+
+        scenario = alert.scenario_top
+        scenario_name = str(scenario.get("scenario_name") or "").strip()
+        allowed_scenarios = {
+            "Pullback Holding",
+            "Pullback Rejecting",
+            "Bullish VWAP/EMA Reclaim Continuation",
+            "Bearish VWAP/EMA Rejection Continuation",
+            "Bullish Trend Continuation",
+            "Bearish Trend Continuation",
+        }
+        if scenario_name not in allowed_scenarios:
+            block(f"scenario {scenario_name or 'unknown'} is not heads-up eligible")
+            return
+
+        scenario_direction = str(alert.scenario_direction or scenario.get("direction") or "").upper()
+        if scenario_direction not in {"BULLISH", "BEARISH"}:
+            block("top scenario has no bullish/bearish direction")
+            return
+
+        stage = str(alert.scenario_stage or scenario.get("stage") or "").upper()
+        if stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}:
+            block(f"Blocked: scenario stage is {stage}")
+            return
+        if stage not in {"FORMING", "CONFIRMED", "GOOD_POSITION"}:
+            block(f"scenario stage is {stage or 'UNKNOWN'}")
+            return
+
+        if (data_quality or snapshot_data_quality(snap, self.config)) != "Fresh":
+            block("Blocked: stale data")
+            return
+
+        min_scenario = int(config.get("phase3_heads_up_min_scenario_score", 80))
+        min_stock = int(config.get("phase3_heads_up_min_stock_score", 65))
+        min_confirmation = int(config.get("phase3_heads_up_min_confirmation_score", 55))
+        if int(alert.scenario_score or scenario.get("score") or 0) < min_scenario:
+            block("scenario score below heads-up threshold")
+            return
+        if int(alert.stock_setup_score or alert.strategy_confidence_score or 0) < min_stock:
+            block("stock setup score below heads-up threshold")
+            return
+        if int(alert.confirmation_score or 0) < min_confirmation:
+            block(f"Blocked: confirmation below {min_confirmation}")
+            return
+        risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
+        if risk in {"HIGH", "DO_NOT_CHASE"}:
+            block(f"Blocked: risk is {risk}")
+            return
+        entry_quality = str(alert.entry_quality_label or "").upper()
+        if entry_quality in {"LATE", "DO_NOT_CHASE"}:
+            block(f"Blocked: entry quality is {entry_quality}")
+            return
+        if alert.scenario_conflict:
+            block("Blocked: scenario conflict")
+            return
+        if alert.extension_label in {"VERY_EXTENDED", "DO_NOT_CHASE"}:
+            block("Blocked: price is extremely extended")
+            return
+
+        direction_conflict = self.phase2_direction_conflict(alert, scenario_direction)
+        alert_direction = str(alert.direction or "").upper()
+        if alert_direction in {"BULLISH", "BEARISH"} and alert_direction != scenario_direction:
+            direction_conflict = True
+        if direction_conflict:
+            warning = "Legacy/Phase 2 conflict present — confirm manually."
+            if warning not in alert.scenario_warnings:
+                alert.scenario_warnings.insert(0, warning)
+            strategy_warning = "Direction conflict: setup label does not match alert direction"
+            if strategy_warning not in alert.strategy_warnings:
+                alert.strategy_warnings.insert(0, strategy_warning)
+
+        good_position = (
+            stage in {"GOOD_POSITION", "CONFIRMED"}
+            and int(alert.scenario_score or scenario.get("score") or 0)
+            >= int(config.get("phase3_good_position_min_scenario_score", 85))
+            and int(alert.stock_setup_score or alert.strategy_confidence_score or 0)
+            >= int(config.get("phase3_good_position_min_stock_score", 70))
+            and int(alert.confirmation_score or 0)
+            >= int(config.get("phase3_good_position_min_confirmation_score", 60))
+            and risk in {"LOW", "MEDIUM"}
+            and entry_quality in {"GOOD_POSITION", "EARLY"}
+            and alert.extension_label not in {"EXTENDED", "VERY_EXTENDED", "DO_NOT_CHASE"}
+        )
+        alert.phase3_heads_up_type = "GOOD_POSITION" if good_position else "EARLY_WATCH"
+        alert.phase3_heads_up_eligible = True
+        if not config.get("phase3_heads_up_sms_enabled", True):
+            block("Phase 3 heads-up SMS disabled")
+            return
+
+        key = self.phase3_heads_up_state_key(alert)
+        alert.phase3_heads_up_dedupe_key = key
+        self.state_store.load()
+        last = self.state_store.get_last_alert_time(key)
+        dedupe_minutes = int(config.get("phase3_heads_up_dedupe_minutes", 15))
+        if last and (now_utc() - last).total_seconds() <= dedupe_minutes * 60:
+            next_eligible = last + timedelta(minutes=dedupe_minutes)
+            alert.phase3_heads_up_dedupe_blocked = True
+            alert.phase3_heads_up_last_sent_time = last.isoformat()
+            alert.phase3_heads_up_next_eligible_time = next_eligible.isoformat()
+            alert.phase3_heads_up_dedupe_minutes_remaining = round(
+                max(0.0, (next_eligible - now_utc()).total_seconds() / 60.0),
+                1,
+            )
+            block("duplicate Phase 3 heads-up blocked by dedupe")
+            return
+
+        alert.phase3_heads_up_sent = True
+        alert.phase3_heads_up_block_reason = ""
+        alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
+        alert.notes.append("Phase 3 heads-up only: confirm on chart")
+        alert.phase3_heads_up_message_preview = phase3_heads_up_message(alert)
+
+    def grade_alert(self, alert: Alert, snap: SymbolSnapshot, market_context: Optional[Dict[str, str]]) -> Alert:
+        quality_config = self.config.get("alert_quality", {})
+        direction = self.infer_alert_direction(alert)
+        alert.direction = direction
+        alert.market_alignment = self.market_alignment_for(direction, market_context)
+
+        score = 0
+        reasons: List[str] = []
+        data_quality = snapshot_data_quality(snap, self.config)
+        age = bar_age_minutes(snap.latest_bar)
+        max_age = float(quality_config.get("max_sms_bar_age_minutes", 2.0))
+        if data_quality == "Fresh" and age is not None and age <= max_age:
+            score += 15
+        else:
+            reasons.append(f"data not fresh enough ({data_quality})")
+
+        fast_abs = abs(alert.fast_move_pct or 0.0)
+        day_abs = abs(alert.day_move_pct or 0.0)
+        rvol = alert.relative_volume or 0.0
+        if fast_abs >= 1.0:
+            score += 20
+        elif fast_abs >= 0.5:
+            score += 12
+        elif fast_abs >= 0.25:
+            score += 6
+        if day_abs >= 3.0:
+            score += 16
+        elif day_abs >= 1.5:
+            score += 10
+        elif day_abs >= 0.75:
+            score += 5
+        if rvol >= 2.0:
+            score += 25
+        elif rvol >= float(quality_config.get("min_sms_rvol", 1.5)):
+            score += 18
+        elif rvol >= 1.0:
+            score += 8
+            reasons.append("RVOL is only moderate")
+        else:
+            score -= 35
+            reasons.append("RVOL below text-alert threshold")
+
+        hold_ok = self.breakout_hold_ok(alert, snap)
+        immediate_ok = self.immediate_break_ok(alert, snap)
+        break_confirmed = hold_ok or immediate_ok
+        is_watch = self.is_watch_alert(alert)
+        fast_opposes_setup = self.fast_move_opposes_setup(
+            alert, float(quality_config.get("block_text_when_fast_move_opposes_setup_pct", 0.08))
+        )
+        if fast_opposes_setup:
+            score -= 20
+            reasons.append("latest fast move opposes setup direction")
+        category_upper = alert.category.upper()
+        generic_day_conflict = False
+        if "BREAK" not in category_upper and not is_watch:
+            min_conflict_day = float(quality_config.get("generic_day_conflict_min_day_pct", 1.0))
+            max_conflict_fast = float(quality_config.get("generic_day_conflict_max_fast_pct", 0.25))
+            day_move_value = alert.day_move_pct or 0.0
+            generic_day_conflict = (
+                (direction == "BULLISH" and day_move_value <= -min_conflict_day)
+                or (direction == "BEARISH" and day_move_value >= min_conflict_day)
+            ) and fast_abs <= max_conflict_fast
+            if generic_day_conflict:
+                score -= 35
+                reasons.append("day trend conflicts with small fast move")
+        break_distance = self.breakout_distance_pct(alert, snap)
+        break_too_extended = False
+        if "BREAK" in alert.category.upper() and break_distance is not None:
+            max_break_distance = self.max_allowed_break_distance_pct(alert)
+            break_too_extended = break_distance > max_break_distance
+            if break_too_extended:
+                reasons.append(f"break already extended {break_distance:.2f}% from level")
+        if "BREAK" in alert.category.upper():
+            score += 12
+            if hold_ok:
+                score += 10
+            elif immediate_ok:
+                score += 8
+                reasons.append("fast clean break before hold confirmation")
+            else:
+                score -= 15
+                reasons.append("breakout/breakdown has not held long enough")
+        if alert.headline:
+            score += 5
+
+        if alert.option_quality == "Tradable":
+            score += 15
+            opt_score = alert.options_score or 0
+            if opt_score >= 80:
+                score += 10
+            elif opt_score >= int(quality_config.get("min_sms_options_score", 65)):
+                score += 6
+            if alert.option_spread_pct is not None and alert.option_spread_pct <= 5.0:
+                score += 8
+            elif alert.option_spread_pct is not None and alert.option_spread_pct <= float(quality_config.get("max_sms_option_spread_pct", 8.0)):
+                score += 4
+        else:
+            score -= 10
+            reasons.append(f"option quality is {alert.option_quality or 'unknown'}")
+
+        if alert.market_alignment == "ALIGNED":
+            score += 15
+        elif alert.market_alignment == "MIXED":
+            score += 3
+            reasons.append("SPY/QQQ market read is mixed")
+        elif alert.market_alignment == "OPPOSED":
+            score -= 25
+            reasons.append("SPY/QQQ are opposing the setup")
+        else:
+            reasons.append("SPY/QQQ alignment unknown")
+
+        strong_fast_break = (
+            "BREAK" in alert.category.upper()
+            and not is_watch
+            and break_confirmed
+            and self.fast_move_aligned(alert, float(quality_config.get("strong_fast_break_min_fast_move_pct", 0.75)))
+            and rvol >= float(quality_config.get("strong_fast_break_min_rvol", 1.25))
+            and not break_too_extended
+            and alert.option_quality == "Tradable"
+            and (alert.options_score or 0) >= int(quality_config.get("min_sms_options_score", 65))
+        )
+        max_score = 100
+        min_sms_rvol = float(quality_config.get("min_sms_rvol", 1.5))
+        if rvol < 1.0:
+            max_score = min(max_score, 39)
+        elif rvol < min_sms_rvol and not strong_fast_break:
+            max_score = min(max_score, 54)
+        if alert.market_alignment == "OPPOSED":
+            max_score = min(max_score, 54)
+        if not break_confirmed:
+            max_score = min(max_score, 54)
+        if break_too_extended:
+            max_score = min(max_score, 54)
+        if fast_opposes_setup:
+            max_score = min(max_score, 54)
+        if generic_day_conflict:
+            max_score = min(max_score, 54)
+        if is_watch:
+            max_score = min(max_score, 54)
+        if alert.option_quality != "Tradable" or (alert.options_score or 0) < int(quality_config.get("min_sms_options_score", 65)):
+            max_score = min(max_score, 54)
+        strategy_warning_text = " | ".join(alert.strategy_warnings).lower()
+        strategy_direction_conflict = self.phase2_direction_conflict(alert, direction)
+        phase2_conflict = any(
+            phrase in strategy_warning_text
+            for phrase in (
+                "contradicting strategies",
+                "candle quality contradicts",
+                "market regime is opposing",
+                "opposing the setup",
+            )
+        )
+        min_confirmation_score = int(quality_config.get("min_sms_confirmation_score", 55))
+        weak_confirmation = (
+            alert.confirmation_score is not None
+            and alert.confirmation_score < min_confirmation_score
+        )
+        high_phase2_risk = alert.risk_label in {"HIGH", "DO_NOT_CHASE"}
+        if strategy_direction_conflict:
+            reasons.append("Phase 2 setup direction conflicts with alert direction")
+        if phase2_conflict:
+            reasons.append("Phase 2 has conflicting confirmation warnings")
+        if weak_confirmation:
+            reasons.append("Phase 2 confirmation below SMS threshold")
+        if high_phase2_risk:
+            reasons.append(f"Phase 2 risk is {alert.risk_label}")
+        max_score = min(max_score, self.phase2_grade_cap(alert, direction))
+
+        score = min(score, max_score)
+        score = int(max(0, min(100, score)))
+        alert.alert_score = score
+        if score >= 85:
+            alert.alert_grade = "A+"
+        elif score >= 70:
+            alert.alert_grade = "A"
+        elif score >= 55:
+            alert.alert_grade = "B"
+        elif score >= 40:
+            alert.alert_grade = "C"
+        else:
+            alert.alert_grade = "Avoid"
+        if alert.alert_grade == "A+" and not self.phase2_allows_a_plus(alert, direction):
+            alert.alert_grade = "A"
+
+        grade_rank = {"Avoid": 0, "C": 1, "B": 2, "A": 3, "A+": 4}
+        min_grade = quality_config.get("sms_min_grade", "B")
+        sms_allowed = grade_rank.get(alert.alert_grade, 0) >= grade_rank.get(min_grade, 2)
+        sms_allowed = sms_allowed and score >= int(quality_config.get("min_sms_score", 55))
+        sms_allowed = sms_allowed and not is_watch
+        sms_allowed = sms_allowed and (rvol >= float(quality_config.get("min_sms_rvol", 1.5)) or strong_fast_break)
+        sms_allowed = sms_allowed and break_confirmed
+        sms_allowed = sms_allowed and not break_too_extended
+        sms_allowed = sms_allowed and not fast_opposes_setup
+        sms_allowed = sms_allowed and alert.option_quality == "Tradable"
+        sms_allowed = sms_allowed and (alert.options_score or 0) >= int(quality_config.get("min_sms_options_score", 65))
+        if alert.option_spread_pct is not None:
+            sms_allowed = sms_allowed and alert.option_spread_pct <= float(quality_config.get("max_sms_option_spread_pct", 8.0))
+        if alert.option_contract and "Indicative" in " | ".join(alert.notes):
+            sms_allowed = sms_allowed and bool(quality_config.get("allow_indicative_sms", True))
+        if quality_config.get("market_alignment_required", True):
+            if strong_fast_break and quality_config.get("allow_unknown_market_for_strong_fast_break", True):
+                sms_allowed = sms_allowed and alert.market_alignment in {"ALIGNED", "MIXED", "UNKNOWN"}
+            else:
+                sms_allowed = sms_allowed and alert.market_alignment in {"ALIGNED", "MIXED"}
+        strategy_config = self.config.get("strategy_engine", {})
+        min_strategy_score = int(strategy_config.get("min_strategy_score_to_alert", 60))
+        if (
+            strategy_config.get("enabled", True)
+            and alert.primary_setup
+            and (alert.strategy_confidence_score or 0) < min_strategy_score
+        ):
+            sms_allowed = False
+            reasons.append("strategy confidence below alert threshold")
+        if strategy_direction_conflict:
+            sms_allowed = False
+        if phase2_conflict:
+            sms_allowed = False
+        if weak_confirmation:
+            sms_allowed = False
+        if high_phase2_risk:
+            sms_allowed = False
+        phase2_sms_blocks = self.phase2_sms_block_reasons(alert, direction)
+        if phase2_sms_blocks:
+            sms_allowed = False
+            for reason in phase2_sms_blocks:
+                if reason not in reasons:
+                    reasons.append(reason)
+                warning = reason
+                if reason.startswith("Direction conflict"):
+                    warning = "Direction conflict: setup label does not match alert direction"
+                if warning not in alert.strategy_warnings:
+                    alert.strategy_warnings.insert(0, warning)
+        scenario_config = self.config.get("scenario_engine", {})
+        if scenario_config.get("control_sms", False) and alert.scenario_top:
+            scenario_stage = (alert.scenario_stage or alert.scenario_top.get("stage") or "WATCHING").upper()
+            scenario_score = int(alert.scenario_score or alert.scenario_top.get("score") or 0)
+            stock_setup_score = int(alert.stock_setup_score or alert.strategy_confidence_score or 0)
+            min_stock_setup = int(scenario_config.get("sms_min_stock_setup_score", 70))
+            min_confirmation = int(scenario_config.get("sms_min_confirmation_score", 60))
+            strong_stock = int(scenario_config.get("sms_strong_stock_setup_score", 85))
+            strong_confirmation = int(scenario_config.get("sms_strong_confirmation_score", 70))
+            if scenario_config.get("sms_require_good_stage", True) and scenario_stage not in {"CONFIRMED", "GOOD_POSITION"}:
+                sms_allowed = False
+                reasons.append(f"Scenario stage is {scenario_stage}")
+            if scenario_config.get("sms_block_scenario_conflict", True) and alert.scenario_conflict:
+                sms_allowed = False
+                reasons.append("Scenario conflict")
+            if stock_setup_score < min_stock_setup or (alert.confirmation_score or 0) < min_confirmation:
+                sms_allowed = False
+            if alert.option_feed_status in {"INDICATIVE", "UNAVAILABLE"} and scenario_config.get("opra_unavailable_require_stronger_sms", True):
+                if stock_setup_score < strong_stock or (alert.confirmation_score or 0) < strong_confirmation:
+                    sms_allowed = False
+                    reasons.append("Option feed is indicative; stronger stock confirmation required")
+            if scenario_score < int(scenario_config.get("min_dashboard_score", 55)):
+                alert.notes.append("scenario score below dashboard threshold")
+        if alert.risk_label == "DO_NOT_CHASE":
+            sms_allowed = False
+            reasons.append("strategy risk is DO_NOT_CHASE")
+        if sms_allowed and self.orb_sms_blocked_by_dedupe(alert):
+            sms_allowed = False
+            reasons.append("repeated ORB SMS blocked until confirmation improves")
+        if sms_allowed and self.is_late_day_generic_alert(alert) and not self.late_day_generic_has_fresh_push(alert):
+            sms_allowed = False
+            reasons.append("late-day repeat needs stronger fresh push")
+
+        alert.sms_allowed = bool(sms_allowed)
+        watch_allowed = False
+        opposed_bearish_watch_allowed = False
+        if is_watch:
+            watch_rvol_min = float(quality_config.get("watch_text_min_rvol", quality_config.get("watch_min_rvol", 0.8)))
+            watch_min_score = int(quality_config.get("watch_text_min_score", quality_config.get("watch_min_score", 35)))
+            watch_min_options_score = int(
+                quality_config.get("watch_text_min_options_score", quality_config.get("min_sms_options_score", 65))
+            )
+            watch_allowed = data_quality == "Fresh"
+            watch_allowed = watch_allowed and age is not None and age <= max_age
+            watch_allowed = watch_allowed and score >= watch_min_score
+            watch_allowed = watch_allowed and rvol >= watch_rvol_min
+            watch_allowed = watch_allowed and alert.option_quality == "Tradable"
+            watch_allowed = watch_allowed and (alert.options_score or 0) >= watch_min_options_score
+            if alert.option_spread_pct is not None:
+                watch_allowed = watch_allowed and alert.option_spread_pct <= float(
+                    quality_config.get("max_sms_option_spread_pct", 8.0)
+                )
+            if quality_config.get("watch_market_alignment_required", quality_config.get("market_alignment_required", True)):
+                watch_allowed = watch_allowed and alert.market_alignment in {"ALIGNED", "MIXED"}
+            elif quality_config.get("watch_block_opposed_market", True):
+                watch_allowed = watch_allowed and alert.market_alignment != "OPPOSED"
+            watch_allowed = watch_allowed and not fast_opposes_setup
+            if not watch_allowed:
+                opposed_bearish_watch_allowed = self.market_opposed_bearish_watch_allowed(
+                    alert,
+                    data_quality,
+                    age,
+                    max_age,
+                    score,
+                    rvol,
+                    fast_opposes_setup,
+                    break_distance,
+                )
+                watch_allowed = opposed_bearish_watch_allowed
+        if not watch_allowed and not alert.sms_allowed:
+            opposed_bearish_watch_allowed = self.market_opposed_bearish_watch_allowed(
+                alert,
+                data_quality,
+                age,
+                max_age,
+                score,
+                rvol,
+                fast_opposes_setup,
+                break_distance,
+            )
+            watch_allowed = opposed_bearish_watch_allowed
+        alert.watch_allowed = bool(watch_allowed)
+        self.evaluate_phase3_heads_up(alert, snap, data_quality, market_context)
+        if alert.sms_allowed:
+            if immediate_ok and not hold_ok:
+                alert.text_alert_reason = "passed fast clean-break, freshness, volume, market, and option-quality checks"
+            else:
+                alert.text_alert_reason = "passed freshness, volume, market, breakout-hold, and option-quality checks"
+        elif alert.watch_allowed:
+            if opposed_bearish_watch_allowed:
+                alert.text_alert_reason = "watch only: bearish stock-specific move, but SPY/QQQ are not confirming yet"
+            elif "FAST IMPULSE" in alert.category.upper():
+                alert.text_alert_reason = "watch only: fast impulse, waiting for continuation or hold"
+            else:
+                alert.text_alert_reason = "watch only: near key level, waiting for confirmation"
+        elif alert.phase3_heads_up_sent:
+            alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
+        else:
+            alert.text_alert_reason = "; ".join(reasons[:4]) or "below text-alert threshold"
+        alert.notes.append(f"alert grade: {alert.alert_grade} ({alert.alert_score}/100)")
+        alert.notes.append(f"market alignment: {alert.market_alignment}")
+        if alert.watch_allowed:
+            alert.notes.append("watch only: waiting for clean break/hold confirmation")
+        if not alert.sms_allowed and not alert.phase3_heads_up_sent:
+            alert.notes.append(f"text alert skipped: {alert.text_alert_reason}")
+        return alert
+
+    def keep_best_text_alert_per_direction(self, alerts: List[Alert]) -> None:
+        best_by_key: Dict[Tuple[str, str, str], Alert] = {}
+        text_alerts = [alert for alert in alerts if alert.sms_allowed or alert.watch_allowed or alert.phase3_heads_up_sent]
+        for alert in text_alerts:
+            direction = alert.direction or self.infer_alert_direction(alert)
+            level = "SMS" if alert.sms_allowed else "WATCH" if alert.watch_allowed else "PHASE3_HEADS_UP"
+            key = (alert.symbol, direction, level)
+            current = best_by_key.get(key)
+            if current is None or self.alert_priority(alert) < self.alert_priority(current) or (
+                self.alert_priority(alert) == self.alert_priority(current)
+                and (alert.alert_score or 0) > (current.alert_score or 0)
+            ):
+                best_by_key[key] = alert
+        for alert in text_alerts:
+            direction = alert.direction or self.infer_alert_direction(alert)
+            level = "SMS" if alert.sms_allowed else "WATCH" if alert.watch_allowed else "PHASE3_HEADS_UP"
+            if best_by_key.get((alert.symbol, direction, level)) is alert:
+                continue
+            if alert.sms_allowed:
+                alert.sms_allowed = False
+                alert.text_alert_reason = "weaker duplicate text in same scan"
+                alert.notes.append("text alert skipped: weaker duplicate text in same scan")
+            elif alert.watch_allowed:
+                alert.watch_allowed = False
+                alert.text_alert_reason = "weaker duplicate watch in same scan"
+                alert.notes.append("watch text skipped: weaker duplicate watch in same scan")
+            elif alert.phase3_heads_up_sent:
+                alert.phase3_heads_up_sent = False
+                alert.phase3_heads_up_block_reason = "weaker duplicate Phase 3 heads-up in same scan"
+                alert.phase3_heads_up_dedupe_blocked = True
+                alert.notes.append("Phase 3 heads-up skipped: weaker duplicate in same scan")
+
+    def latest_move_direction(self, alert: Alert) -> str:
+        move = alert.fast_move_pct
+        if move is None or abs(move) < 0.08:
+            move = alert.day_move_pct
+        if move is not None and move > 0:
+            return "BULLISH"
+        if move is not None and move < 0:
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def keep_watch_alerts_aligned_with_latest_move(self, alerts: List[Alert]) -> None:
+        watch_by_symbol: Dict[str, List[Alert]] = {}
+        for alert in alerts:
+            if alert.watch_allowed:
+                watch_by_symbol.setdefault(alert.symbol, []).append(alert)
+        for symbol_alerts in watch_by_symbol.values():
+            directions = {alert.direction or self.infer_alert_direction(alert) for alert in symbol_alerts}
+            if not {"BULLISH", "BEARISH"}.issubset(directions):
+                continue
+            preferred = self.latest_move_direction(symbol_alerts[0])
+            if preferred not in {"BULLISH", "BEARISH"}:
+                continue
+            for alert in symbol_alerts:
+                direction = alert.direction or self.infer_alert_direction(alert)
+                if direction == preferred:
+                    alert.notes.append(f"watch text kept: latest move favors {preferred.lower()}")
+                    continue
+                alert.watch_allowed = False
+                alert.text_alert_reason = f"opposite same-scan watch suppressed; latest move favors {preferred.lower()}"
+                alert.notes.append(f"watch text skipped: latest move favors {preferred.lower()}")
+
+    def maybe_reversal_watch_after_opposite_watch(
+        self,
+        snap: SymbolSnapshot,
+        latest: Bar,
+        fast_move: float,
+        day_move: float,
+        rel_vol: Optional[float],
+        notes: List[str],
+    ) -> Optional[Alert]:
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("trend_flip_after_watch_enabled", True):
+            return None
+        min_fast = float(quality_config.get("trend_flip_after_watch_min_fast_move_pct", 0.12))
+        direction = "BULLISH" if fast_move >= min_fast else "BEARISH" if fast_move <= -min_fast else "NEUTRAL"
+        if direction == "NEUTRAL":
+            return None
+        lookback = int(quality_config.get("trend_flip_after_watch_lookback_seconds", 900))
+        if not self.opposite_text_seen_recently(snap.symbol, direction, "WATCH", lookback):
+            return None
+        min_rvol = float(quality_config.get("trend_flip_after_watch_min_rvol", 1.0))
+        if (rel_vol or 0.0) < min_rvol:
+            return None
+        selection = snap.best_call if direction == "BULLISH" else snap.best_put
+        min_options_score = int(quality_config.get("watch_text_min_options_score", quality_config.get("min_sms_options_score", 65)))
+        if selection.quality != "Tradable" or selection.score < min_options_score:
+            return None
+        return Alert(
+            symbol=snap.symbol,
+            timestamp=now_utc(),
+            category="WATCH REVERSAL UP" if direction == "BULLISH" else "WATCH REVERSAL DOWN",
+            price=latest.c,
+            fast_move_pct=fast_move,
+            day_move_pct=day_move,
+            relative_volume=rel_vol,
+            premarket_high=snap.premarket_high,
+            premarket_low=snap.premarket_low,
+            opening_range_high=snap.opening_range_high,
+            opening_range_low=snap.opening_range_low,
+            headline=snap.latest_news.headline if snap.latest_news else None,
+            url=snap.latest_news.url if snap.latest_news else None,
+            notes=notes + ["reversal after recent opposite watch"],
+            setup_level="WATCH",
+            trigger_level=latest.c,
+        )
+
+    def maybe_failed_breakout_watch(
+        self,
+        snap: SymbolSnapshot,
+        latest: Bar,
+        fast_move: float,
+        day_move: float,
+        rel_vol: Optional[float],
+        notes: List[str],
+    ) -> Optional[Alert]:
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("failed_breakout_watch_enabled", True):
+            return None
+
+        min_fast = float(quality_config.get("failed_breakout_watch_min_fast_move_pct", 0.12))
+        lookback = max(2, int(quality_config.get("failed_breakout_watch_lookback_bars", 8)))
+        recent = snap.recent_bars[-lookback:]
+        if len(recent) < 2:
+            return None
+
+        buf_pct = self.config.get("opening_range_break_buffer_pct", 0.03) / 100.0
+        max_distance = float(quality_config.get("failed_breakout_watch_max_distance_pct", 0.60))
+        level: Optional[float] = None
+        direction = "NEUTRAL"
+        category = ""
+
+        if snap.opening_range_high is not None and fast_move <= -min_fast:
+            broke_above = any(bar.h > snap.opening_range_high * (1 + buf_pct) for bar in recent[:-1])
+            slipped_under = latest.c < snap.opening_range_high
+            distance = pct_change(snap.opening_range_high, latest.c) if latest.c > 0 else max_distance + 1
+            if broke_above and slipped_under and distance <= max_distance:
+                level = snap.opening_range_high
+                direction = "BEARISH"
+                category = "WATCH FAILED BREAKOUT DOWN"
+
+        if (
+            direction == "NEUTRAL"
+            and snap.opening_range_low is not None
+            and fast_move >= min_fast
+        ):
+            broke_below = any(bar.l < snap.opening_range_low * (1 - buf_pct) for bar in recent[:-1])
+            reclaimed = latest.c > snap.opening_range_low
+            distance = pct_change(latest.c, snap.opening_range_low) if snap.opening_range_low > 0 else max_distance + 1
+            if broke_below and reclaimed and distance <= max_distance:
+                level = snap.opening_range_low
+                direction = "BULLISH"
+                category = "WATCH FAILED BREAKDOWN UP"
+
+        if direction == "NEUTRAL" or level is None:
+            return None
+
+        return Alert(
+            symbol=snap.symbol,
+            timestamp=now_utc(),
+            category=category,
+            price=latest.c,
+            fast_move_pct=fast_move,
+            day_move_pct=day_move,
+            relative_volume=rel_vol,
+            premarket_high=snap.premarket_high,
+            premarket_low=snap.premarket_low,
+            opening_range_high=snap.opening_range_high,
+            opening_range_low=snap.opening_range_low,
+            headline=snap.latest_news.headline if snap.latest_news else None,
+            url=snap.latest_news.url if snap.latest_news else None,
+            notes=notes + ["failed opening-range breakout reversal"],
+            setup_level="WATCH",
+            trigger_level=level,
+        )
+
+    def maybe_sustained_trend_watch(
+        self,
+        snap: SymbolSnapshot,
+        latest: Bar,
+        fast_move: float,
+        day_move: float,
+        rel_vol: Optional[float],
+        notes: List[str],
+    ) -> Optional[Alert]:
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("sustained_trend_watch_enabled", True):
+            return None
+        min_rvol = float(quality_config.get("sustained_trend_watch_min_rvol", 0.45))
+        if (rel_vol or 0.0) < min_rvol:
+            return None
+
+        lookback = max(4, int(quality_config.get("sustained_trend_watch_lookback_bars", 12)))
+        if len(snap.recent_bars) < lookback + 1:
+            return None
+        window = snap.recent_bars[-(lookback + 1):]
+        anchor = window[0]
+        trend_move = pct_change(latest.c, anchor.c)
+        min_move = float(quality_config.get("sustained_trend_watch_min_move_pct", 0.12))
+        if snap.symbol in {"SPY", "QQQ"}:
+            min_move = float(quality_config.get("sustained_trend_watch_min_index_move_pct", min_move))
+
+        up_bars = sum(1 for previous, current in zip(window, window[1:]) if current.c >= previous.c)
+        down_bars = lookback - up_bars
+        min_ratio = float(quality_config.get("sustained_trend_watch_min_green_ratio", 0.58))
+        up_ratio = up_bars / lookback
+        down_ratio = down_bars / lookback
+
+        direction = "NEUTRAL"
+        trigger_level: Optional[float] = None
+        if trend_move >= min_move and up_ratio >= min_ratio:
+            above_or_high = snap.opening_range_high is None or latest.c >= snap.opening_range_high
+            above_pm_high = snap.premarket_high is None or latest.c >= snap.premarket_high
+            if above_or_high or above_pm_high:
+                direction = "BULLISH"
+                trigger_level = snap.opening_range_high or snap.premarket_high
+        elif trend_move <= -min_move and down_ratio >= min_ratio:
+            below_or_low = snap.opening_range_low is None or latest.c <= snap.opening_range_low
+            below_pm_low = snap.premarket_low is None or latest.c <= snap.premarket_low
+            if below_or_low or below_pm_low:
+                direction = "BEARISH"
+                trigger_level = snap.opening_range_low or snap.premarket_low
+
+        if direction == "NEUTRAL":
+            return None
+        return Alert(
+            symbol=snap.symbol,
+            timestamp=now_utc(),
+            category="WATCH SUSTAINED TREND UP" if direction == "BULLISH" else "WATCH SUSTAINED TREND DOWN",
+            price=latest.c,
+            fast_move_pct=fast_move,
+            day_move_pct=day_move,
+            relative_volume=rel_vol,
+            premarket_high=snap.premarket_high,
+            premarket_low=snap.premarket_low,
+            opening_range_high=snap.opening_range_high,
+            opening_range_low=snap.opening_range_low,
+            headline=snap.latest_news.headline if snap.latest_news else None,
+            url=snap.latest_news.url if snap.latest_news else None,
+            notes=notes + [f"sustained {lookback}m trend move {trend_move:+.2f}%"],
+            setup_level="WATCH",
+            trigger_level=trigger_level,
+        )
+
+    def alert_sort_key(self, alert: Alert) -> tuple[int, int, int]:
+        priority = self.alert_priority(alert)
+        direction = alert.direction or self.infer_alert_direction(alert)
+        latest_direction = self.latest_move_direction(alert)
+        if self.is_watch_alert(alert) and latest_direction in {"BULLISH", "BEARISH"}:
+            direction_bias = 0 if direction == latest_direction else 1
+        else:
+            direction_bias = 0
+        return (priority, direction_bias, -(alert.alert_score or 0))
+
+    def preferred_option_selection(self, alert: Alert, snap: SymbolSnapshot) -> OptionSelection:
+        direction = alert.direction or self.infer_alert_direction(alert)
+        return snap.best_put if direction == "BEARISH" else snap.best_call
+
+    def strategy_levels_for_snapshot(self, snap: SymbolSnapshot) -> Dict[str, Optional[float]]:
+        return {
+            "pmh": snap.premarket_high,
+            "pml": snap.premarket_low,
+            "pdh": None,
+            "pdl": None,
+            "opening_range_high": snap.opening_range_high,
+            "opening_range_low": snap.opening_range_low,
+            "opening_range_15_high": snap.opening_range_15_high,
+            "opening_range_15_low": snap.opening_range_15_low,
+        }
+
+    def apply_aapl_bearish_continuation_label(
+        self,
+        alert: Alert,
+        snap: SymbolSnapshot,
+        market_context: Optional[Dict[str, str]],
+    ) -> None:
+        if snap.symbol != "AAPL" or not snap.latest_bar or len(snap.recent_bars) < 10:
+            return
+        direction = alert.direction or self.infer_alert_direction(alert)
+        if direction != "BEARISH":
+            return
+        latest = snap.latest_bar
+        current_vwap = strategy_vwap(snap.recent_bars)
+        current_ema9 = strategy_ema([bar.c for bar in snap.recent_bars], 9)
+        if not current_vwap or not current_ema9:
+            return
+        below_vwap_ema = latest.c < current_vwap and latest.c < current_ema9
+        key_lows = [
+            level
+            for level in (snap.opening_range_low, snap.opening_range_15_low, snap.premarket_low)
+            if isinstance(level, (int, float)) and level > 0
+        ]
+        below_key_low = bool(key_lows and latest.c < min(key_lows))
+        market_alignment = self.market_alignment_for("BEARISH", market_context)
+        market_not_opposing = market_alignment in {"ALIGNED", "MIXED", "UNKNOWN"}
+        underside_levels = [current_ema9, current_vwap, *key_lows]
+        retested_underside = any(latest.h >= level * 0.998 and latest.c < level for level in underside_levels)
+        candle_rejects = latest.c < latest.o and latest.c <= latest.l + (latest.h - latest.l) * 0.35
+        volume_ok = (alert.volume_label in {"NORMAL", "STRONG", "CLIMAX"}) or (alert.relative_volume or 0.0) >= 0.8
+        not_extended = alert.extension_label in {None, "UNKNOWN", "NORMAL"}
+        if not all([below_vwap_ema, below_key_low, market_not_opposing, retested_underside, candle_rejects, volume_ok, not_extended]):
+            return
+
+        previous = alert.primary_setup
+        alert.primary_setup = "Bearish Trend Continuation - Pullback Rejecting"
+        if previous and previous != alert.primary_setup and previous not in alert.secondary_setups:
+            alert.secondary_setups.insert(0, previous)
+        alert.strategy_direction = "bearish"
+        alert.strategy_confidence_score = max(alert.strategy_confidence_score or 0, 82)
+        alert.strategy_confidence_label = "HIGH" if (alert.strategy_confidence_score or 0) >= 80 else "MEDIUM"
+        alert.confirmation_score = max(alert.confirmation_score or 0, 65)
+        alert.confirmation_label = "STRONG" if (alert.confirmation_score or 0) >= 70 else "NORMAL"
+        if alert.risk_label == "HIGH":
+            alert.risk_label = "MEDIUM"
+        if alert.entry_quality_label not in {"GOOD_POSITION", "EARLY"}:
+            alert.entry_quality_label = "GOOD_POSITION"
+        for reason in (
+            "AAPL below VWAP and EMA9",
+            "AAPL below opening range/premarket low",
+            "Pullback rejected underside of EMA9/VWAP or breakdown level",
+            "Candle closed weak after retest",
+        ):
+            if reason not in alert.strategy_reasons:
+                alert.strategy_reasons.append(reason)
+        alert.notes.append("AAPL bearish continuation: pullback rejected")
+
+    def attach_strategy_context(
+        self,
+        alert: Alert,
+        snap: SymbolSnapshot,
+        market_context: Optional[Dict[str, str]],
+        market_bars: Optional[Dict[str, List[Bar]]] = None,
+    ) -> Alert:
+        strategy_config = self.config.get("strategy_engine", {})
+        if not strategy_config.get("enabled", True) or not snap.latest_bar or not snap.recent_bars:
+            return alert
+        direction = alert.direction or self.infer_alert_direction(alert)
+        market_alignment = self.market_alignment_for(direction, market_context)
+        summary = evaluate_strategy_suite(
+            snap.symbol,
+            snap.recent_bars,
+            snap.latest_bar,
+            self.config,
+            self.strategy_levels_for_snapshot(snap),
+            alert.relative_volume,
+            market_alignment,
+            market_bars,
+            option_context={
+                "option_feed_status": alert.option_feed_status,
+                "option_tradability_score": alert.option_tradability_score,
+                "option_tradable": alert.option_tradable,
+            },
+        )
+        alert.primary_setup = summary.get("primary_setup")
+        alert.secondary_setups = list(summary.get("secondary_setups") or [])
+        alert.strategy_direction = summary.get("direction")
+        alert.strategy_confidence_score = summary.get("confidence_score")
+        alert.strategy_confidence_label = summary.get("confidence_label")
+        alert.risk_label = summary.get("risk_label")
+        alert.confirmation_score = summary.get("confirmation_score")
+        alert.confirmation_label = summary.get("confirmation_label")
+        alert.entry_quality_label = summary.get("entry_quality_label")
+        alert.volume_label = summary.get("volume_label")
+        alert.rvol_detail = summary.get("rvol")
+        alert.candle_label = summary.get("candle_label")
+        alert.candle_score = summary.get("candle_score")
+        alert.extension_label = summary.get("extension_label")
+        alert.extension_score = summary.get("extension_score")
+        alert.relative_strength_label = summary.get("relative_strength_label")
+        alert.relative_strength_score = summary.get("relative_strength_score")
+        alert.market_regime = summary.get("market_regime")
+        alert.market_score = summary.get("market_score")
+        alert.pressure_label = summary.get("pressure_label")
+        alert.pressure_score = summary.get("pressure_score")
+        alert.scenario_top = summary.get("scenario_top")
+        alert.scenario_second = summary.get("scenario_second")
+        alert.scenario_score = summary.get("scenario_score")
+        alert.scenario_stage = summary.get("scenario_stage")
+        alert.scenario_direction = summary.get("scenario_direction")
+        alert.scenario_confidence_label = summary.get("scenario_confidence_label")
+        alert.scenario_entry_quality_label = summary.get("scenario_entry_quality_label")
+        alert.scenario_risk_label = summary.get("scenario_risk_label")
+        alert.scenario_reasons = list(summary.get("scenario_reasons") or [])
+        alert.scenario_warnings = list(summary.get("scenario_warnings") or [])
+        alert.scenario_levels = dict(summary.get("scenario_levels") or {})
+        alert.bullish_score = summary.get("bullish_score")
+        alert.bearish_score = summary.get("bearish_score")
+        alert.chop_score = summary.get("chop_score")
+        alert.fakeout_score = summary.get("fakeout_score")
+        alert.scenario_conflict = summary.get("scenario_conflict")
+        alert.all_scenarios = list(summary.get("all_scenarios") or [])
+        alert.stock_setup_score = summary.get("stock_setup_score")
+        alert.stock_setup_valid = summary.get("stock_setup_valid")
+        alert.option_tradability_score = summary.get("option_tradability_score")
+        alert.option_feed_status = summary.get("option_feed_status")
+        alert.option_tradable = summary.get("option_tradable")
+        alert.scenario_alert_eligible = summary.get("scenario_alert_eligible")
+        alert.scenario_would_sms = summary.get("scenario_would_sms")
+        alert.scenario_alert_tier = summary.get("scenario_alert_tier")
+        alert.scenario_alert_block_reason = summary.get("scenario_alert_block_reason")
+        alert.sms_allowed_by_stock = summary.get("sms_allowed_by_stock")
+        alert.sms_allowed_by_options = summary.get("sms_allowed_by_options")
+        alert.sms_block_reason = summary.get("sms_block_reason")
+        alert.scenario_sms_block_reason = summary.get("scenario_sms_block_reason")
+        alert.scenario_sms_allowed = summary.get("scenario_sms_allowed")
+        alert.stock_setup_score_reason = summary.get("stock_setup_score_reason")
+        alert.strategy_reasons = list(summary.get("reasons") or [])
+        alert.strategy_warnings = list(summary.get("warnings") or [])
+        alert.strategy_levels = dict(summary.get("levels") or {})
+        alert.strategy_results = list(summary.get("strategy_results") or [])
+        self.apply_aapl_bearish_continuation_label(alert, snap, market_context)
+        if alert.primary_setup:
+            alert.notes.append(
+                f"primary setup: {alert.primary_setup} ({alert.strategy_confidence_score} {alert.strategy_confidence_label})"
+            )
+        if alert.scenario_top:
+            top_name = alert.scenario_top.get("scenario_name", "")
+            top_stage = alert.scenario_top.get("stage", "")
+            if top_name or top_stage:
+                alert.notes.append(f"scenario: {top_name} {top_stage}".strip())
+        if alert.risk_label:
+            alert.notes.append(f"strategy risk: {alert.risk_label}")
+        if alert.volume_label:
+            alert.notes.append(f"volume quality: {alert.volume_label}")
+        if alert.candle_label:
+            alert.notes.append(f"candle quality: {alert.candle_label}")
+        if alert.entry_quality_label and alert.entry_quality_label != "UNKNOWN":
+            alert.notes.append(f"entry quality: {alert.entry_quality_label}")
+        if alert.extension_label and alert.extension_label not in {"NORMAL", "UNKNOWN"}:
+            alert.notes.append(f"extension: {alert.extension_label}")
+        if alert.relative_strength_label and alert.relative_strength_label not in {"NEUTRAL", "UNKNOWN"}:
+            alert.notes.append(f"relative strength: {alert.relative_strength_label}")
+        if alert.market_regime and alert.market_regime != "UNKNOWN":
+            alert.notes.append(f"market regime: {alert.market_regime}")
+        if alert.pressure_label and alert.pressure_label != "UNKNOWN":
+            alert.notes.append(f"pressure: {alert.pressure_label}")
+        if alert.strategy_warnings:
+            alert.notes.append(f"strategy warning: {alert.strategy_warnings[0]}")
+        return alert
+
+    def attach_option_context(self, alert: Alert, snap: SymbolSnapshot) -> Alert:
+        selection = self.preferred_option_selection(alert, snap)
+        contract = selection.contract
+        alert.option_quality = selection.quality
+        alert.options_score = selection.score
+        alert.option_tradable = selection.is_tradable()
+        if contract:
+            if contract.is_simulated:
+                alert.option_feed_status = "SIMULATED"
+            elif contract.feed == "opra":
+                alert.option_feed_status = "OPRA"
+            elif contract.feed == "indicative":
+                alert.option_feed_status = "INDICATIVE"
+            else:
+                alert.option_feed_status = "UNAVAILABLE"
+        else:
+            alert.option_feed_status = "UNAVAILABLE"
+        alert.option_tradability_score = selection.score
+        if contract:
+            alert.option_contract = contract.symbol
+            alert.option_type = "PUT" if contract.option_type == "P" else "CALL"
+            alert.option_expiration = contract.expiration_date.isoformat()
+            alert.option_strike = contract.strike
+            alert.option_bid = contract.bid
+            alert.option_ask = contract.ask
+            alert.option_mid = contract.mid
+            alert.option_spread_pct = contract.spread_pct
+            alert.option_delta = contract.delta
+            alert.option_iv = contract.implied_volatility
+            alert.option_volume = contract.volume
+            alert.option_open_interest = contract.open_interest
+            alert.notes.append(
+                f"suggested option: {contract.symbol} ({selection.quality}, score {selection.score})"
+            )
+            if contract.is_simulated:
+                alert.notes.append("option data is simulated dry-run data")
+            elif contract.feed == "indicative":
+                alert.notes.append("option feed: Indicative, not official OPRA quotes")
+            elif contract.feed == "opra":
+                alert.notes.append("option feed: OPRA")
+        else:
+            alert.notes.append(f"option warning: {selection.quality}")
+
+        if selection.is_tradable():
+            alert.notes.append("high confidence requires stock momentum + tradable option")
+        else:
+            reason = "; ".join(selection.reasons) if selection.reasons else selection.quality
+            alert.notes.append(f"option warning: no liquid contract found ({reason})")
+        return alert
+
+    def evaluate_symbol(
+        self,
+        snap: SymbolSnapshot,
+        market_context: Optional[Dict[str, str]] = None,
+        market_bars: Optional[Dict[str, List[Bar]]] = None,
+    ) -> List[Alert]:
+        alerts: List[Alert] = []
+        quality = snapshot_data_quality(snap, self.config)
+        if quality in {"Stale", "Incomplete"}:
+            return alerts
+        if not self.passes_basic_filters(snap):
+            return alerts
+
+        latest = snap.latest_bar
+        assert latest is not None
+        bars = snap.recent_bars
+        if not has_min_recent_bars(bars, self.config):
+            return alerts
+
+        anchor = bars[-(self.config["lookback_minutes_fast_move"] + 1)]
+        fast_move = pct_change(latest.c, anchor.c)
+        anchor_bar = session_anchor_bar(bars, self.config)
+        if not anchor_bar:
+            return alerts
+        day_move = pct_change(latest.c, anchor_bar.o)
+        rel_vol = self.compute_relative_volume(bars)
+        notes: List[str] = []
+        notes.append(f"data quality: {quality}")
+        notes.append("RVOL is recent 1-minute relative volume")
+
+        if snap.latest_news:
+            notes.append("news catalyst detected")
+
+        # 1) Fast move with volume
+        if self.config["alert_rules"].get("fast_move", True):
+            if abs(fast_move) >= self.config["fast_move_pct_threshold"] and (rel_vol or 0) >= self.config["relative_volume_threshold"]:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="FAST MOVE",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + [f"{self.config['lookback_minutes_fast_move']}m momentum spike"],
+                    )
+                )
+
+        # 2) Standalone relative-volume surge
+        if self.config["alert_rules"].get("high_relative_volume", True):
+            if (rel_vol or 0) >= self.config["relative_volume_threshold"]:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="HIGH RELATIVE VOLUME",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["unusual volume vs recent 1-minute bars"],
+                    )
+                )
+
+        # 3) Premarket high break
+        if self.config["alert_rules"].get("premarket_high_break", True) and snap.premarket_high is not None:
+            pm_watch_pct = self.config.get("premarket_watch_proximity_pct", 0.15) / 100.0
+            pm_high_watch_start = snap.premarket_high * (1 - pm_watch_pct)
+            if pm_high_watch_start <= latest.c <= snap.premarket_high:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="WATCH PREMARKET HIGH BREAK",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["near premarket high; wait for break/hold"],
+                        setup_level="WATCH",
+                        trigger_level=snap.premarket_high,
+                    )
+                )
+            if latest.c > snap.premarket_high:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="PREMARKET HIGH BREAK",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["watch for continuation or rejection"],
+                        setup_level="ALERT",
+                        trigger_level=snap.premarket_high,
+                    )
+                )
+
+        # 4) Premarket low break / flush
+        if self.config["alert_rules"].get("premarket_low_break", True) and snap.premarket_low is not None:
+            pm_watch_pct = self.config.get("premarket_watch_proximity_pct", 0.15) / 100.0
+            pm_low_watch_start = snap.premarket_low * (1 + pm_watch_pct)
+            if snap.premarket_low <= latest.c <= pm_low_watch_start:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="WATCH PREMARKET LOW BREAK",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["near premarket low; wait for break/hold"],
+                        setup_level="WATCH",
+                        trigger_level=snap.premarket_low,
+                    )
+                )
+            if latest.c < snap.premarket_low:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="PREMARKET LOW BREAK",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["potential flush / trend down"],
+                        setup_level="ALERT",
+                        trigger_level=snap.premarket_low,
+                    )
+                )
+
+        # 5) Opening range break
+        if self.config["alert_rules"].get("opening_range_break", True) and opening_range_complete(bars, self.config):
+            buf_pct = self.config["opening_range_break_buffer_pct"] / 100.0
+            watch_pct = self.config.get("opening_range_watch_proximity_pct", 0.12) / 100.0
+            if snap.opening_range_high is not None:
+                high_watch_start = snap.opening_range_high * (1 - watch_pct)
+                high_break_level = snap.opening_range_high * (1 + buf_pct)
+                if high_watch_start <= latest.c <= high_break_level:
+                    alerts.append(
+                        Alert(
+                            symbol=snap.symbol,
+                            timestamp=now_utc(),
+                            category="WATCH OPENING RANGE BREAK UP",
+                            price=latest.c,
+                            fast_move_pct=fast_move,
+                            day_move_pct=day_move,
+                            relative_volume=rel_vol,
+                            premarket_high=snap.premarket_high,
+                            premarket_low=snap.premarket_low,
+                            opening_range_high=snap.opening_range_high,
+                            opening_range_low=snap.opening_range_low,
+                            headline=snap.latest_news.headline if snap.latest_news else None,
+                            url=snap.latest_news.url if snap.latest_news else None,
+                            notes=notes + ["near opening range high; wait for break/hold"],
+                            setup_level="WATCH",
+                            trigger_level=snap.opening_range_high,
+                        )
+                    )
+            if snap.opening_range_high is not None and latest.c > snap.opening_range_high * (1 + buf_pct):
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="OPENING RANGE BREAK UP",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["opening range breakout"],
+                        setup_level="ALERT",
+                        trigger_level=snap.opening_range_high,
+                    )
+                )
+            if snap.opening_range_low is not None:
+                low_watch_start = snap.opening_range_low * (1 + watch_pct)
+                low_break_level = snap.opening_range_low * (1 - buf_pct)
+                if low_break_level <= latest.c <= low_watch_start:
+                    alerts.append(
+                        Alert(
+                            symbol=snap.symbol,
+                            timestamp=now_utc(),
+                            category="WATCH OPENING RANGE BREAK DOWN",
+                            price=latest.c,
+                            fast_move_pct=fast_move,
+                            day_move_pct=day_move,
+                            relative_volume=rel_vol,
+                            premarket_high=snap.premarket_high,
+                            premarket_low=snap.premarket_low,
+                            opening_range_high=snap.opening_range_high,
+                            opening_range_low=snap.opening_range_low,
+                            headline=snap.latest_news.headline if snap.latest_news else None,
+                            url=snap.latest_news.url if snap.latest_news else None,
+                            notes=notes + ["near opening range low; wait for break/hold"],
+                            setup_level="WATCH",
+                            trigger_level=snap.opening_range_low,
+                        )
+                    )
+            if snap.opening_range_low is not None and latest.c < snap.opening_range_low * (1 - buf_pct):
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="OPENING RANGE BREAK DOWN",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline if snap.latest_news else None,
+                        url=snap.latest_news.url if snap.latest_news else None,
+                        notes=notes + ["opening range breakdown"],
+                        setup_level="ALERT",
+                        trigger_level=snap.opening_range_low,
+                    )
+                )
+
+        # 6) Big day mover with volume + news
+        if self.config["alert_rules"].get("news_catalyst", True):
+            if abs(day_move) >= self.config["day_move_pct_threshold"] and (rel_vol or 0) >= self.config["relative_volume_threshold"] and snap.latest_news:
+                alerts.append(
+                    Alert(
+                        symbol=snap.symbol,
+                        timestamp=now_utc(),
+                        category="CATALYST RUNNER",
+                        price=latest.c,
+                        fast_move_pct=fast_move,
+                        day_move_pct=day_move,
+                        relative_volume=rel_vol,
+                        premarket_high=snap.premarket_high,
+                        premarket_low=snap.premarket_low,
+                        opening_range_high=snap.opening_range_high,
+                        opening_range_low=snap.opening_range_low,
+                        headline=snap.latest_news.headline,
+                        url=snap.latest_news.url,
+                        notes=notes + ["large move with news + volume"],
+                    )
+                )
+
+        fast_impulse_watch = self.maybe_fast_impulse_watch(snap, latest, fast_move, day_move, rel_vol, notes)
+        if fast_impulse_watch:
+            alerts.append(fast_impulse_watch)
+        reversal_watch = self.maybe_reversal_watch_after_opposite_watch(snap, latest, fast_move, day_move, rel_vol, notes)
+        if reversal_watch:
+            alerts.append(reversal_watch)
+        failed_breakout_watch = self.maybe_failed_breakout_watch(snap, latest, fast_move, day_move, rel_vol, notes)
+        if failed_breakout_watch:
+            alerts.append(failed_breakout_watch)
+        sustained_trend_watch = self.maybe_sustained_trend_watch(snap, latest, fast_move, day_move, rel_vol, notes)
+        if sustained_trend_watch:
+            alerts.append(sustained_trend_watch)
+
+        enriched: List[Alert] = []
+        for alert in alerts:
+            with_options = self.attach_option_context(alert, snap)
+            with_strategy = self.attach_strategy_context(with_options, snap, market_context, market_bars)
+            enriched.append(self.grade_alert(with_strategy, snap, market_context))
+        self.keep_watch_alerts_aligned_with_latest_move(enriched)
+        enriched.sort(key=self.alert_sort_key)
+        self.keep_best_text_alert_per_direction(enriched)
+        return enriched
+
+    def alert_priority(self, alert: Alert) -> int:
+        category = alert.category.upper()
+        is_watch = self.is_watch_alert(alert)
+        if "BREAK" in category and not is_watch:
+            return 0
+        if is_watch:
+            return 1
+        if "FAST MOVE" in category or "HIGH RELATIVE VOLUME" in category:
+            return 2
+        return 3
+
+    def cooldown_allows(self, alert: Alert) -> bool:
+        last = self.state_store.get_last_alert_time(alert.dedupe_key())
+        if not last:
+            return True
+        elapsed = (now_utc() - last).total_seconds()
+        return elapsed >= self.config["alert_cooldown_seconds"]
+
+    def text_cooldown_key(self, alert: Alert, prefix: str) -> str:
+        direction = alert.direction or self.infer_alert_direction(alert) or "MOMENTUM"
+        day_key = alert.timestamp.astimezone(ET).strftime("%Y-%m-%d")
+        return f"{day_key}:{prefix}:{alert.symbol}:{direction}"
+
+    def opposite_text_seen_recently(self, symbol: str, direction: str, prefix: str, lookback_seconds: int) -> bool:
+        opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
+        day_key = now_et().strftime("%Y-%m-%d")
+        key = f"{day_key}:{prefix}:{symbol}:{opposite}"
+        last = self.state_store.get_last_alert_time(key)
+        if not last:
+            return False
+        return (now_utc() - last).total_seconds() <= lookback_seconds
+
+    def opposite_sms_seen_recently(self, alert: Alert, lookback_seconds: int) -> bool:
+        direction = alert.direction or self.infer_alert_direction(alert)
+        return self.opposite_text_seen_recently(alert.symbol, direction, "SMS", lookback_seconds)
+
+    def maybe_allow_trend_flip_watch(self, alert: Alert) -> None:
+        if alert.sms_allowed or alert.watch_allowed:
+            return
+        quality_config = self.config.get("alert_quality", {})
+        if not quality_config.get("trend_flip_watch_enabled", True):
+            return
+        lookback = int(quality_config.get("trend_flip_lookback_seconds", 3600))
+        if not self.opposite_sms_seen_recently(alert, lookback):
+            return
+        min_rvol = float(quality_config.get("trend_flip_min_rvol", 1.0))
+        min_options_score = int(quality_config.get("trend_flip_min_options_score", 60))
+        if (alert.relative_volume or 0.0) < min_rvol:
+            return
+        if alert.option_quality != "Tradable" or (alert.options_score or 0) < min_options_score:
+            return
+        if alert.option_spread_pct is not None and alert.option_spread_pct > float(
+            quality_config.get("max_sms_option_spread_pct", 8.0)
+        ):
+            return
+        if "BREAK" not in alert.category.upper() and not self.fast_move_aligned(alert, 0.08):
+            return
+        alert.watch_allowed = True
+        alert.setup_level = "WATCH"
+        alert.text_alert_reason = "possible trend flip after prior opposite alert"
+        alert.notes.append("watch only: possible trend flip after prior opposite alert")
+
+    def text_cooldown_allows(self, key: str, cooldown_seconds: int) -> bool:
+        last = self.state_store.get_last_alert_time(key)
+        if not last:
+            return True
+        elapsed = (now_utc() - last).total_seconds()
+        return elapsed >= cooldown_seconds
+
+    def process_alert(self, alert: Alert) -> bool:
+        quality_config = self.config.get("alert_quality", {})
+        text_key: Optional[str] = None
+        category_cooldown_allowed = self.cooldown_allows(alert)
+        self.maybe_allow_trend_flip_watch(alert)
+        if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
+            return False
+        if alert.sms_allowed:
+            cooldown_seconds = int(quality_config.get("sms_symbol_cooldown_seconds", 180))
+            text_key = self.text_cooldown_key(alert, "SMS")
+            if not self.text_cooldown_allows(text_key, cooldown_seconds):
+                alert.sms_allowed = False
+                alert.text_alert_reason = "symbol/direction text cooldown"
+                alert.notes.append("text alert skipped: symbol/direction text cooldown")
+                text_key = None
+            elif not category_cooldown_allowed:
+                alert.notes.append("text alert upgrade: prior same setup did not send SMS")
+        elif alert.watch_allowed:
+            cooldown_seconds = int(quality_config.get("watch_symbol_cooldown_seconds", 180))
+            text_key = self.text_cooldown_key(alert, "WATCH")
+            if not self.text_cooldown_allows(text_key, cooldown_seconds):
+                alert.watch_allowed = False
+                alert.text_alert_reason = "watch text cooldown"
+                alert.notes.append("watch text skipped: symbol/direction cooldown")
+                text_key = None
+        elif alert.phase3_heads_up_sent:
+            text_key = self.phase3_heads_up_state_key(alert)
+        if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
+            return False
+        logger.info(alert.short_summary())
+        self.writer.write(alert)
+        self.notifier.send(alert)
+        self.state_store.set_last_alert_time(alert.dedupe_key(), now_utc())
+        if text_key:
+            self.state_store.set_last_alert_time(text_key, now_utc())
+            if alert.sms_allowed:
+                self.record_orb_sms_state(alert)
+        self.state_store.save()
+        return True
+
+    def run_once(self) -> int:
+        if not in_extended_or_regular_session(self.config):
+            logger.info("Outside scan window. No scan performed.")
+            return 0
+        snapshots = self.build_snapshots()
+        market_context = self.build_market_context(snapshots)
+        market_bars = {
+            symbol: snap.recent_bars
+            for symbol, snap in snapshots.items()
+            if symbol in {"SPY", "QQQ"} and snap.recent_bars
+        }
+        count = 0
+        for snap in snapshots.values():
+            for alert in self.evaluate_symbol(snap, market_context, market_bars):
+                if self.process_alert(alert):
+                    count += 1
+        return count
+
+    def run_forever(self) -> None:
+        logger.info("Scanner started for %s", ", ".join(self.symbols))
+        while True:
+            try:
+                self.run_once()
+            except KeyboardInterrupt:
+                logger.info("Stopped by user.")
+                raise
+            except Exception as exc:
+                logger.exception("Loop error: %s", exc)
+            time.sleep(int(self.config["scan_interval_seconds"]))
+
+
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
+def load_config(path: Optional[Path]) -> Dict[str, Any]:
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    if path and path.exists():
+        user = json.loads(path.read_text())
+        deep_update(config, user)
+    apply_strategy_env_config(config)
+    return config
+
+
+def deep_update(base: Dict[str, Any], new: Dict[str, Any]) -> None:
+    for k, v in new.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_update(base[k], v)
+        else:
+            base[k] = v
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def apply_strategy_env_config(config: Dict[str, Any]) -> None:
+    notifications = config.setdefault("notifications", {})
+    notifications["telegram_enabled"] = env_bool(
+        "ENABLE_TELEGRAM_ALERTS",
+        bool(notifications.get("telegram_enabled", False)),
+    )
+    raw_telegram_alert_types = os.getenv("TELEGRAM_ALERT_TYPES")
+    if raw_telegram_alert_types is not None:
+        notifications["telegram_alert_types"] = [
+            part.strip().upper()
+            for part in raw_telegram_alert_types.split(",")
+            if part.strip()
+        ]
+    notifications["telegram_aapl_only"] = env_bool(
+        "TELEGRAM_AAPL_ONLY",
+        bool(notifications.get("telegram_aapl_only", True)),
+    )
+    notifications["telegram_send_test_on_start"] = env_bool(
+        "TELEGRAM_SEND_TEST_ON_START",
+        bool(notifications.get("telegram_send_test_on_start", False)),
+    )
+    notifications["telegram_timeout_seconds"] = env_int(
+        "TELEGRAM_TIMEOUT_SECONDS",
+        int(notifications.get("telegram_timeout_seconds", 8)),
+    )
+
+    market_data = config.setdefault("market_data", {})
+    market_data["stock_feed"] = normalize_feed(
+        os.getenv("ALPACA_STOCK_FEED", market_data.get("stock_feed", "sip")),
+        "sip",
+    )
+
+    options = config.setdefault("options", {})
+    options["feed"] = normalize_feed(
+        os.getenv("ALPACA_OPTIONS_FEED", options.get("feed", "opra")),
+        "opra",
+    )
+    options["allow_indicative_fallback"] = env_bool(
+        "ALPACA_ALLOW_INDICATIVE_OPTIONS_FALLBACK",
+        bool(options.get("allow_indicative_fallback", True)),
+    )
+
+    quality = config.setdefault("alert_quality", {})
+    quality["sms_min_confirmation_score"] = env_int(
+        "SMS_MIN_CONFIRMATION_SCORE",
+        int(quality.get("sms_min_confirmation_score", 60)),
+    )
+    quality["sms_strong_confirmation_score"] = env_int(
+        "SMS_STRONG_CONFIRMATION_SCORE",
+        int(quality.get("sms_strong_confirmation_score", 70)),
+    )
+    quality["sms_block_choppy_market"] = env_bool(
+        "SMS_BLOCK_CHOPPY_MARKET",
+        bool(quality.get("sms_block_choppy_market", True)),
+    )
+    quality["sms_require_candle_alignment"] = env_bool(
+        "SMS_REQUIRE_CANDLE_ALIGNMENT",
+        bool(quality.get("sms_require_candle_alignment", True)),
+    )
+    quality["sms_require_no_direction_conflict"] = env_bool(
+        "SMS_REQUIRE_NO_DIRECTION_CONFLICT",
+        bool(quality.get("sms_require_no_direction_conflict", True)),
+    )
+    quality["sms_orb_dedupe_minutes"] = env_int(
+        "SMS_ORB_DEDUPE_MINUTES",
+        int(quality.get("sms_orb_dedupe_minutes", 15)),
+    )
+    quality["a_plus_min_confirmation_score"] = env_int(
+        "A_PLUS_MIN_CONFIRMATION_SCORE",
+        int(quality.get("a_plus_min_confirmation_score", 70)),
+    )
+
+    strategy = config.setdefault("strategy_engine", {})
+    bool_map = {
+        "ENABLE_STRATEGY_ENGINE": "enabled",
+        "ENABLE_LIQUIDITY_SWEEP": "enable_liquidity_sweep",
+        "ENABLE_VWAP_RECLAIM": "enable_vwap_reclaim",
+        "ENABLE_OPENING_RANGE": "enable_opening_range",
+        "ENABLE_VOLUME_QUALITY": "enable_volume_quality",
+        "ENABLE_CANDLE_STRENGTH": "enable_candle_strength",
+        "ENABLE_RETEST_HOLD": "enable_retest_hold",
+        "ENABLE_EXTENSION_EXHAUSTION": "enable_extension_exhaustion",
+        "ENABLE_RELATIVE_STRENGTH": "enable_relative_strength",
+        "ENABLE_MARKET_REGIME": "enable_market_regime",
+        "ENABLE_PRESSURE_SCORE": "enable_pressure_score",
+    }
+    int_map = {
+        "MIN_STRATEGY_SCORE_TO_ALERT": "min_strategy_score_to_alert",
+        "SWEEP_RECLAIM_CANDLES": "sweep_reclaim_candles",
+        "OPENING_RANGE_MINUTES_PRIMARY": "opening_range_minutes_primary",
+        "OPENING_RANGE_MINUTES_SECONDARY": "opening_range_minutes_secondary",
+    }
+    float_map = {
+        "VOLUME_CONFIRM_MULTIPLIER": "volume_confirm_multiplier",
+        "MAX_EXTENSION_FROM_VWAP_PCT": "max_extension_from_vwap_pct",
+        "MAX_EXTENSION_FROM_EMA9_PCT": "max_extension_from_ema9_pct",
+    }
+    for env_name, key in bool_map.items():
+        strategy[key] = env_bool(env_name, bool(strategy.get(key, True)))
+    for env_name, key in int_map.items():
+        strategy[key] = env_int(env_name, int(strategy.get(key, 0)))
+    for env_name, key in float_map.items():
+        strategy[key] = env_float(env_name, float(strategy.get(key, 0.0)))
+
+    scenario = config.setdefault("scenario_engine", {})
+    scenario["enabled"] = env_bool("ENABLE_SCENARIO_ENGINE", bool(scenario.get("enabled", True)))
+    scenario["shadow_mode"] = env_bool("SCENARIO_ENGINE_SHADOW_MODE", bool(scenario.get("shadow_mode", False)))
+    scenario["control_dashboard"] = env_bool(
+        "SCENARIO_ENGINE_CONTROL_DASHBOARD",
+        bool(scenario.get("control_dashboard", True)),
+    )
+    scenario["control_sms"] = env_bool("SCENARIO_ENGINE_CONTROL_SMS", bool(scenario.get("control_sms", False)))
+    scenario["enable_phase3_heads_up_alerts"] = env_bool(
+        "ENABLE_PHASE3_HEADS_UP_ALERTS",
+        bool(scenario.get("enable_phase3_heads_up_alerts", True)),
+    )
+    scenario["phase3_heads_up_sms_enabled"] = env_bool(
+        "PHASE3_HEADS_UP_SMS_ENABLED",
+        bool(scenario.get("phase3_heads_up_sms_enabled", True)),
+    )
+    scenario["phase3_heads_up_min_scenario_score"] = env_int(
+        "PHASE3_HEADS_UP_MIN_SCENARIO_SCORE",
+        int(scenario.get("phase3_heads_up_min_scenario_score", 80)),
+    )
+    scenario["phase3_heads_up_min_stock_score"] = env_int(
+        "PHASE3_HEADS_UP_MIN_STOCK_SCORE",
+        int(scenario.get("phase3_heads_up_min_stock_score", 65)),
+    )
+    scenario["phase3_heads_up_min_confirmation_score"] = env_int(
+        "PHASE3_HEADS_UP_MIN_CONFIRMATION_SCORE",
+        int(scenario.get("phase3_heads_up_min_confirmation_score", 55)),
+    )
+    scenario["phase3_good_position_min_scenario_score"] = env_int(
+        "PHASE3_GOOD_POSITION_MIN_SCENARIO_SCORE",
+        int(scenario.get("phase3_good_position_min_scenario_score", 85)),
+    )
+    scenario["phase3_good_position_min_stock_score"] = env_int(
+        "PHASE3_GOOD_POSITION_MIN_STOCK_SCORE",
+        int(scenario.get("phase3_good_position_min_stock_score", 70)),
+    )
+    scenario["phase3_good_position_min_confirmation_score"] = env_int(
+        "PHASE3_GOOD_POSITION_MIN_CONFIRMATION_SCORE",
+        int(scenario.get("phase3_good_position_min_confirmation_score", 60)),
+    )
+    scenario["phase3_heads_up_dedupe_minutes"] = env_int(
+        "PHASE3_HEADS_UP_DEDUPE_MINUTES",
+        int(scenario.get("phase3_heads_up_dedupe_minutes", 15)),
+    )
+    raw_heads_up_symbols = os.getenv("PHASE3_HEADS_UP_SYMBOLS")
+    if raw_heads_up_symbols is not None:
+        scenario["phase3_heads_up_symbols"] = [
+            part.strip().upper()
+            for part in raw_heads_up_symbols.split(",")
+            if part.strip()
+        ]
+    raw_market_context_symbols = os.getenv("MARKET_CONTEXT_SYMBOLS")
+    if raw_market_context_symbols is not None:
+        scenario["market_context_symbols"] = [
+            part.strip().upper()
+            for part in raw_market_context_symbols.split(",")
+            if part.strip()
+        ]
+    scenario["phase3_late_warning_phone_enabled"] = env_bool(
+        "PHASE3_LATE_WARNING_PHONE_ENABLED",
+        bool(scenario.get("phase3_late_warning_phone_enabled", False)),
+    )
+    scenario["phase3_late_warning_dedupe_minutes"] = env_int(
+        "PHASE3_LATE_WARNING_DEDUPE_MINUTES",
+        int(scenario.get("phase3_late_warning_dedupe_minutes", 30)),
+    )
+    scenario["min_dashboard_score"] = env_int("SCENARIO_MIN_DASHBOARD_SCORE", int(scenario.get("min_dashboard_score", 55)))
+    scenario["min_confirmed_score"] = env_int("SCENARIO_MIN_CONFIRMED_SCORE", int(scenario.get("min_confirmed_score", 70)))
+    scenario["good_position_score"] = env_int("SCENARIO_GOOD_POSITION_SCORE", int(scenario.get("good_position_score", 75)))
+    scenario["dedupe_minutes"] = env_int("SCENARIO_DEDUPE_MINUTES", int(scenario.get("dedupe_minutes", 10)))
+    scenario["option_logic_separate_from_stock_setup"] = env_bool(
+        "OPTION_LOGIC_SEPARATE_FROM_STOCK_SETUP",
+        bool(scenario.get("option_logic_separate_from_stock_setup", True)),
+    )
+    scenario["options_do_not_hide_stock_setups"] = env_bool(
+        "OPTIONS_DO_NOT_HIDE_STOCK_SETUPS",
+        bool(scenario.get("options_do_not_hide_stock_setups", True)),
+    )
+    scenario["options_block_sms_only"] = env_bool(
+        "OPTIONS_BLOCK_SMS_ONLY",
+        bool(scenario.get("options_block_sms_only", True)),
+    )
+    scenario["opra_unavailable_allow_stock_dashboard"] = env_bool(
+        "OPRA_UNAVAILABLE_ALLOW_STOCK_DASHBOARD",
+        bool(scenario.get("opra_unavailable_allow_stock_dashboard", True)),
+    )
+    scenario["opra_unavailable_require_stronger_sms"] = env_bool(
+        "OPRA_UNAVAILABLE_REQUIRE_STRONGER_SMS",
+        bool(scenario.get("opra_unavailable_require_stronger_sms", True)),
+    )
+    scenario["sms_min_stock_setup_score"] = env_int(
+        "SMS_MIN_STOCK_SETUP_SCORE",
+        int(scenario.get("sms_min_stock_setup_score", 70)),
+    )
+    scenario["sms_min_confirmation_score"] = env_int(
+        "SMS_MIN_CONFIRMATION_SCORE",
+        int(scenario.get("sms_min_confirmation_score", 60)),
+    )
+    scenario["sms_strong_stock_setup_score"] = env_int(
+        "SMS_STRONG_STOCK_SETUP_SCORE",
+        int(scenario.get("sms_strong_stock_setup_score", 85)),
+    )
+    scenario["sms_strong_confirmation_score"] = env_int(
+        "SMS_STRONG_CONFIRMATION_SCORE",
+        int(scenario.get("sms_strong_confirmation_score", 70)),
+    )
+    scenario["sms_block_scenario_conflict"] = env_bool(
+        "SMS_BLOCK_SCENARIO_CONFLICT",
+        bool(scenario.get("sms_block_scenario_conflict", True)),
+    )
+    scenario["sms_require_good_stage"] = env_bool(
+        "SMS_REQUIRE_GOOD_STAGE",
+        bool(scenario.get("sms_require_good_stage", True)),
+    )
+
+    volume_quality = config.setdefault("confirmation", {}).setdefault("volume_quality", {})
+    volume_quality["enabled"] = env_bool("ENABLE_VOLUME_QUALITY", bool(volume_quality.get("enabled", True)))
+    volume_quality["rvol_lookback_candles"] = env_int(
+        "RVOL_LOOKBACK_CANDLES",
+        int(volume_quality.get("rvol_lookback_candles", 20)),
+    )
+    volume_quality["min_rvol_confirmation"] = env_float(
+        "MIN_RVOL_CONFIRMATION",
+        float(volume_quality.get("min_rvol_confirmation", 1.5)),
+    )
+    volume_quality["strong_rvol_confirmation"] = env_float(
+        "STRONG_RVOL_CONFIRMATION",
+        float(volume_quality.get("strong_rvol_confirmation", 2.0)),
+    )
+    volume_quality["climax_rvol_multiplier"] = env_float(
+        "CLIMAX_RVOL_MULTIPLIER",
+        float(volume_quality.get("climax_rvol_multiplier", 3.5)),
+    )
+    volume_quality["volume_exhaustion_candle_count"] = env_int(
+        "VOLUME_EXHAUSTION_CANDLE_COUNT",
+        int(volume_quality.get("volume_exhaustion_candle_count", 3)),
+    )
+    candle_strength = config.setdefault("confirmation", {}).setdefault("candle_strength", {})
+    candle_strength["enabled"] = env_bool("ENABLE_CANDLE_STRENGTH", bool(candle_strength.get("enabled", True)))
+    candle_strength["buyer_control_close_top_pct"] = env_float(
+        "BUYER_CONTROL_CLOSE_TOP_PCT",
+        float(candle_strength.get("buyer_control_close_top_pct", 25)),
+    )
+    candle_strength["seller_control_close_bottom_pct"] = env_float(
+        "SELLER_CONTROL_CLOSE_BOTTOM_PCT",
+        float(candle_strength.get("seller_control_close_bottom_pct", 25)),
+    )
+    candle_strength["min_body_pct_for_control"] = env_float(
+        "MIN_BODY_PCT_FOR_CONTROL",
+        float(candle_strength.get("min_body_pct_for_control", 45)),
+    )
+    candle_strength["large_wick_pct"] = env_float(
+        "LARGE_WICK_PCT",
+        float(candle_strength.get("large_wick_pct", 40)),
+    )
+    candle_strength["indecision_body_pct"] = env_float(
+        "INDECISION_BODY_PCT",
+        float(candle_strength.get("indecision_body_pct", 25)),
+    )
+    retest_hold = config.setdefault("confirmation", {}).setdefault("retest_hold", {})
+    retest_hold["enabled"] = env_bool("ENABLE_RETEST_HOLD", bool(retest_hold.get("enabled", True)))
+    retest_hold["retest_lookback_candles"] = env_int(
+        "RETEST_LOOKBACK_CANDLES",
+        int(retest_hold.get("retest_lookback_candles", 10)),
+    )
+    retest_hold["retest_max_distance_from_level_pct"] = env_float(
+        "RETEST_MAX_DISTANCE_FROM_LEVEL_PCT",
+        float(retest_hold.get("retest_max_distance_from_level_pct", 0.15)),
+    )
+    retest_hold["retest_confirm_candles"] = env_int(
+        "RETEST_CONFIRM_CANDLES",
+        int(retest_hold.get("retest_confirm_candles", 2)),
+    )
+    retest_hold["retest_pullback_volume_max_multiplier"] = env_float(
+        "RETEST_PULLBACK_VOLUME_MAX_MULTIPLIER",
+        float(retest_hold.get("retest_pullback_volume_max_multiplier", 1.2)),
+    )
+    extension = config.setdefault("confirmation", {}).setdefault("extension_exhaustion", {})
+    extension["enabled"] = env_bool("ENABLE_EXTENSION_EXHAUSTION", bool(extension.get("enabled", True)))
+    extension["max_extension_from_vwap_pct"] = env_float(
+        "MAX_EXTENSION_FROM_VWAP_PCT",
+        float(extension.get("max_extension_from_vwap_pct", strategy.get("max_extension_from_vwap_pct", 0.6))),
+    )
+    extension["max_extension_from_ema9_pct"] = env_float(
+        "MAX_EXTENSION_FROM_EMA9_PCT",
+        float(extension.get("max_extension_from_ema9_pct", strategy.get("max_extension_from_ema9_pct", 0.4))),
+    )
+    extension["max_extension_from_key_level_pct"] = env_float(
+        "MAX_EXTENSION_FROM_KEY_LEVEL_PCT",
+        float(extension.get("max_extension_from_key_level_pct", 0.3)),
+    )
+    extension["consecutive_large_candle_limit"] = env_int(
+        "CONSECUTIVE_LARGE_CANDLE_LIMIT",
+        int(extension.get("consecutive_large_candle_limit", 3)),
+    )
+    extension["do_not_chase_extension_score"] = env_int(
+        "DO_NOT_CHASE_EXTENSION_SCORE",
+        int(extension.get("do_not_chase_extension_score", 80)),
+    )
+    relative_strength = config.setdefault("confirmation", {}).setdefault("relative_strength", {})
+    relative_strength["enabled"] = env_bool("ENABLE_RELATIVE_STRENGTH", bool(relative_strength.get("enabled", True)))
+    relative_strength["rs_lookback_candles"] = env_int(
+        "RS_LOOKBACK_CANDLES",
+        int(relative_strength.get("rs_lookback_candles", 5)),
+    )
+    relative_strength["rs_strong_diff_pct"] = env_float(
+        "RS_STRONG_DIFF_PCT",
+        float(relative_strength.get("rs_strong_diff_pct", 0.20)),
+    )
+    relative_strength["rs_weak_diff_pct"] = env_float(
+        "RS_WEAK_DIFF_PCT",
+        float(relative_strength.get("rs_weak_diff_pct", -0.20)),
+    )
+    market_regime = config.setdefault("confirmation", {}).setdefault("market_regime", {})
+    market_regime["enabled"] = env_bool("ENABLE_MARKET_REGIME", bool(market_regime.get("enabled", True)))
+    market_regime["market_regime_lookback_candles"] = env_int(
+        "MARKET_REGIME_LOOKBACK_CANDLES",
+        int(market_regime.get("market_regime_lookback_candles", 15)),
+    )
+    market_regime["choppy_vwap_cross_count"] = env_int(
+        "CHOPPY_VWAP_CROSS_COUNT",
+        int(market_regime.get("choppy_vwap_cross_count", 3)),
+    )
+    market_regime["trend_min_score"] = env_int(
+        "TREND_MIN_SCORE",
+        int(market_regime.get("trend_min_score", 65)),
+    )
+    pressure = config.setdefault("confirmation", {}).setdefault("pressure_score", {})
+    pressure["enabled"] = env_bool("ENABLE_PRESSURE_SCORE", bool(pressure.get("enabled", False)))
+    pressure["pressure_lookback_trades"] = env_int(
+        "PRESSURE_LOOKBACK_TRADES",
+        int(pressure.get("pressure_lookback_trades", 50)),
+    )
+    pressure["large_print_multiplier"] = env_float(
+        "LARGE_PRINT_MULTIPLIER",
+        float(pressure.get("large_print_multiplier", 3.0)),
+    )
+    pressure["min_pressure_score_confirmation"] = env_int(
+        "MIN_PRESSURE_SCORE_CONFIRMATION",
+        int(pressure.get("min_pressure_score_confirmation", 60)),
+    )
+    pressure["max_spread_pct"] = env_float(
+        "MAX_SPREAD_PCT",
+        float(pressure.get("max_spread_pct", 0.08)),
+    )
+    pressure["enable_quote_imbalance"] = env_bool(
+        "ENABLE_QUOTE_IMBALANCE",
+        bool(pressure.get("enable_quote_imbalance", True)),
+    )
+
+
+# ------------------------------------------------------------
+# CLI / tests
+# ------------------------------------------------------------
+def run_tests() -> int:
+    import unittest
+
+    class ScannerTests(unittest.TestCase):
+        def make_strategy_bars(self, closes: List[float], highs: Optional[List[float]] = None, lows: Optional[List[float]] = None, volumes: Optional[List[float]] = None) -> List[Bar]:
+            open_t = set_today_time_et(DEFAULT_CONFIG["market_open"]).astimezone(UTC)
+            bars: List[Bar] = []
+            for i, close in enumerate(closes):
+                high = highs[i] if highs else close + 0.15
+                low = lows[i] if lows else close - 0.15
+                volume = volumes[i] if volumes else 1000
+                bars.append(Bar(t=open_t + timedelta(minutes=i), o=closes[i - 1] if i else close, h=high, l=low, c=close, v=volume))
+            return bars
+
+        def strategy_summary(
+            self,
+            bars: List[Bar],
+            levels: Optional[Dict[str, Optional[float]]] = None,
+            rel_vol: float = 2.0,
+            alignment: str = "ALIGNED",
+            market_bars: Optional[Dict[str, List[Bar]]] = None,
+            option_context: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            config = load_config(None)
+            config["strategy_engine"]["volume_confirm_multiplier"] = 1.2
+            return evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                config,
+                levels or {},
+                rel_vol,
+                alignment,
+                market_bars,
+                option_context=option_context,
+            )
+
+        def make_phase3_heads_up_scanner(self) -> EliteScanner:
+            config = load_config(None)
+            config["symbols"] = ["AAPL"]
+            config["symbols_with_options"] = ["AAPL"]
+            temp_dir = Path(tempfile.mkdtemp())
+            return EliteScanner(
+                config,
+                MockProvider(["AAPL"]),
+                DiscordNotifier(None),
+                AlertWriter(temp_dir / "heads_up.csv", temp_dir / "heads_up.jsonl"),
+                StateStore(temp_dir / "heads_up_state.json"),
+            )
+
+        def make_phase3_heads_up_alert(self, **overrides: Any) -> Alert:
+            scenario_top = overrides.pop(
+                "scenario_top",
+                {
+                    "scenario_name": "Pullback Holding",
+                    "direction": "bullish",
+                    "stage": "CONFIRMED",
+                    "score": 87,
+                },
+            )
+            alert = Alert(
+                symbol=overrides.pop("symbol", "AAPL"),
+                timestamp=now_utc(),
+                category=overrides.pop("category", "WATCH SUSTAINED TREND UP"),
+                price=overrides.pop("price", 101.0),
+                fast_move_pct=overrides.pop("fast_move_pct", 0.1),
+                day_move_pct=overrides.pop("day_move_pct", 0.8),
+                relative_volume=overrides.pop("relative_volume", 1.2),
+                direction=overrides.pop("direction", "BULLISH"),
+                alert_grade=overrides.pop("alert_grade", "C"),
+                alert_score=overrides.pop("alert_score", 54),
+                primary_setup=overrides.pop("primary_setup", "VWAP Reclaim"),
+                strategy_direction=overrides.pop("strategy_direction", "bullish"),
+                strategy_confidence_score=overrides.pop("strategy_confidence_score", 64),
+                risk_label=overrides.pop("risk_label", "MEDIUM"),
+                confirmation_score=overrides.pop("confirmation_score", 63),
+                entry_quality_label=overrides.pop("entry_quality_label", "GOOD_POSITION"),
+                volume_label=overrides.pop("volume_label", "NORMAL"),
+                candle_label=overrides.pop("candle_label", "BUYER_CONTROL"),
+                extension_label=overrides.pop("extension_label", "NORMAL"),
+                scenario_top=scenario_top,
+                scenario_score=overrides.pop("scenario_score", 87),
+                scenario_stage=overrides.pop("scenario_stage", "CONFIRMED"),
+                scenario_direction=overrides.pop("scenario_direction", "bullish"),
+                scenario_reasons=overrides.pop(
+                    "scenario_reasons",
+                    [
+                        "Price above VWAP",
+                        "Price above EMA9",
+                        "EMA9 rising",
+                        "Higher low forming",
+                        "Pullback held logical support",
+                    ],
+                ),
+                scenario_warnings=overrides.pop("scenario_warnings", []),
+                stock_setup_score=overrides.pop("stock_setup_score", 70),
+                option_feed_status=overrides.pop("option_feed_status", "INDICATIVE"),
+            )
+            for key, value in overrides.items():
+                setattr(alert, key, value)
+            return alert
+
+        def make_phase3_heads_up_snapshot(self, stale: bool = False) -> SymbolSnapshot:
+            base_time = now_utc() - timedelta(minutes=60 if stale else 1)
+            bars = [
+                Bar(
+                    t=base_time - timedelta(minutes=11 - i),
+                    o=100.0 + i * 0.05,
+                    h=100.2 + i * 0.05,
+                    l=99.9 + i * 0.05,
+                    c=100.1 + i * 0.05,
+                    v=200000,
+                )
+                for i in range(12)
+            ]
+            return SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)
+
+        def with_env(self, values: Dict[str, str]) -> Dict[str, Optional[str]]:
+            old = {key: os.environ.get(key) for key in values}
+            for key, value in values.items():
+                os.environ[key] = value
+            return old
+
+        def restore_env(self, old: Dict[str, Optional[str]]) -> None:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        def strategy_result(self, summary: Dict[str, Any], strategy: str, label: Optional[str] = None) -> Dict[str, Any]:
+            matches = [item for item in summary["strategy_results"] if item["strategy"] == strategy]
+            if label is not None:
+                matches = [item for item in matches if item["label"] == label]
+            self.assertTrue(matches, f"missing {strategy} {label or ''}")
+            return matches[0]
+
+        def test_pct_change(self) -> None:
+            self.assertAlmostEqual(pct_change(110, 100), 10.0)
+            self.assertAlmostEqual(pct_change(90, 100), -10.0)
+
+        def test_alpaca_stock_feed_env_selects_sip(self) -> None:
+            old = self.with_env({"ALPACA_STOCK_FEED": "sip"})
+            try:
+                config = load_config(None)
+            finally:
+                self.restore_env(old)
+            self.assertEqual(stock_feed_from_config(config), "sip")
+            provider = AlpacaProvider("key", "secret", feed=stock_feed_from_config(config))
+            self.assertEqual(provider.feed, "sip")
+
+        def test_alpaca_options_feed_env_selects_opra(self) -> None:
+            old = self.with_env({"ALPACA_OPTIONS_FEED": "opra"})
+            try:
+                config = load_config(None)
+            finally:
+                self.restore_env(old)
+            self.assertEqual(options_feed_from_config(config), "opra")
+
+        def test_opra_agreement_error_falls_back_to_indicative_when_enabled(self) -> None:
+            class FakeResponse:
+                def __init__(self, status_code: int, body: Dict[str, Any], text: str = "") -> None:
+                    self.status_code = status_code
+                    self._body = body
+                    self.text = text
+
+                def json(self) -> Dict[str, Any]:
+                    return self._body
+
+            class FakeSession:
+                def __init__(self) -> None:
+                    self.calls: List[Dict[str, Any]] = []
+                    self.headers: Dict[str, str] = {}
+
+                def get(self, url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 0) -> FakeResponse:
+                    self.calls.append({"url": url, "params": params or {}, "timeout": timeout})
+                    if "/stocks/bars/latest" in url:
+                        return FakeResponse(200, {"bars": {"AAPL": {"t": now_utc().isoformat(), "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}}})
+                    feed = (params or {}).get("feed")
+                    if feed == "opra":
+                        return FakeResponse(403, {}, '{"message":"OPRA agreement is not signed"}')
+                    return FakeResponse(200, {"snapshots": {}})
+
+            config = load_config(None)
+            config["options"]["feed"] = "opra"
+            config["options"]["allow_indicative_fallback"] = True
+            provider = AlpacaProvider("key", "secret", feed="sip")
+            fake = FakeSession()
+            provider.session = fake  # type: ignore[assignment]
+            status = provider.check_market_data_status(config, symbol="AAPL")
+            self.assertEqual(status["stock_feed_status"], "SIP")
+            self.assertEqual(status["opra_status"], "agreement missing")
+            self.assertEqual(status["options_feed_status"], "INDICATIVE")
+            self.assertIn("OPRA agreement not signed", status["feed_warning"])
+            self.assertEqual([call["params"].get("feed") for call in fake.calls if "/options/" in call["url"]], ["opra", "indicative"])
+
+        def test_strategy_clean_bullish_breakout(self) -> None:
+            bars = self.make_strategy_bars([99.2, 99.5, 99.8, 100.1, 100.4, 101.2], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars, {"pmh": 101.0})
+            result = self.strategy_result(summary, "breakout")
+            self.assertTrue(result["active"])
+            self.assertEqual(result["direction"], "bullish")
+            self.assertIn(result["label"], {"Clean Breakout", "Do Not Chase"})
+
+        def test_strategy_clean_bearish_breakdown(self) -> None:
+            bars = self.make_strategy_bars([101.2, 100.8, 100.4, 100.0, 99.6, 98.8], volumes=[1000, 1000, 1000, 1100, 1200, 3500])
+            summary = self.strategy_summary(bars, {"pml": 99.0})
+            result = self.strategy_result(summary, "breakout")
+            self.assertTrue(result["active"])
+            self.assertEqual(result["direction"], "bearish")
+
+        def test_strategy_weak_breakout_with_no_volume(self) -> None:
+            bars = self.make_strategy_bars([99.5, 99.8, 100.0, 100.2, 100.4, 100.7], volumes=[2000, 2000, 2000, 2000, 2000, 600])
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=0.3)
+            result = self.strategy_result(summary, "breakout")
+            self.assertTrue(result["active"])
+            self.assertIn("volume", " ".join(result["warnings"]).lower())
+            self.assertLess(result["score"], 60)
+
+        def test_strategy_breakout_do_not_chase_condition(self) -> None:
+            bars = self.make_strategy_bars([99.0, 99.2, 99.4, 99.7, 100.0, 104.0], volumes=[1000, 1000, 1000, 1000, 1200, 4000])
+            summary = self.strategy_summary(bars, {"pmh": 100.5})
+            self.assertEqual(summary["risk_label"], "DO_NOT_CHASE")
+
+        def test_strategy_bullish_liquidity_sweep_reclaim(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.2, 99.8, 99.4, 98.9, 99.2, 99.7],
+                lows=[100.0, 99.6, 99.2, 98.5, 98.8, 99.1],
+                volumes=[1000, 1000, 1000, 2200, 2500, 3600],
+            )
+            summary = self.strategy_summary(bars, {"pml": 99.0})
+            result = self.strategy_result(summary, "liquidity_sweep")
+            self.assertEqual(result["label"], "Bullish Liquidity Sweep Reclaim")
+
+        def test_strategy_bearish_liquidity_sweep_rejection(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.8, 100.2, 100.6, 101.2, 100.8, 100.3],
+                highs=[100.0, 100.4, 100.8, 101.6, 101.2, 100.7],
+                volumes=[1000, 1000, 1000, 2300, 2600, 3600],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 101.0})
+            result = self.strategy_result(summary, "liquidity_sweep")
+            self.assertEqual(result["label"], "Bearish Liquidity Sweep Rejection")
+
+        def test_strategy_sweep_without_reclaim_should_not_alert(self) -> None:
+            bars = self.make_strategy_bars([100.0, 99.6, 99.2, 98.8, 98.7, 98.6], lows=[99.8, 99.4, 99.0, 98.5, 98.4, 98.3])
+            summary = self.strategy_summary(bars, {"pml": 99.0})
+            result = self.strategy_result(summary, "liquidity_sweep")
+            self.assertFalse(result["active"])
+
+        def test_strategy_reclaim_weak_volume_lowers_score(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.2, 99.8, 99.4, 98.9, 99.2, 99.7],
+                lows=[100.0, 99.6, 99.2, 98.5, 98.8, 99.1],
+                volumes=[2000, 2000, 2000, 2000, 2000, 600],
+            )
+            summary = self.strategy_summary(bars, {"pml": 99.0}, rel_vol=0.3)
+            result = self.strategy_result(summary, "liquidity_sweep")
+            self.assertTrue(result["active"])
+            self.assertLess(result["score"], 70)
+
+        def test_strategy_vwap_reclaim(self) -> None:
+            bars = self.make_strategy_bars([100.0, 99.8, 99.6, 99.4, 99.2, 100.4], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "vwap")
+            self.assertEqual(result["label"], "VWAP Reclaim")
+
+        def test_strategy_vwap_loss(self) -> None:
+            bars = self.make_strategy_bars([100.0, 100.3, 100.5, 100.7, 100.9, 99.6], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "vwap")
+            self.assertEqual(result["label"], "VWAP Loss")
+
+        def test_strategy_vwap_rejection(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.0, 99.7, 99.5, 99.4, 99.45, 99.2],
+                highs=[100.1, 99.8, 99.7, 99.6, 100.0, 99.8],
+                volumes=[1000, 1000, 1000, 1000, 1600, 2600],
+            )
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "vwap")
+            self.assertEqual(result["label"], "VWAP Rejection")
+
+        def test_strategy_price_near_vwap_without_confirmation_should_not_alert(self) -> None:
+            bars = self.make_strategy_bars([100.0, 100.1, 100.0, 100.1, 100.0, 100.05], volumes=[1000, 1000, 1000, 1000, 1000, 1000])
+            summary = self.strategy_summary(bars, rel_vol=1.0)
+            result = self.strategy_result(summary, "vwap")
+            self.assertFalse(result["active"])
+
+        def test_strategy_five_minute_orb_long(self) -> None:
+            bars = self.make_strategy_bars([100.0, 100.2, 100.4, 100.3, 100.5, 101.2], highs=[100.2, 100.4, 100.6, 100.5, 100.7, 101.4], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "opening_range", "5-Min ORB Long")
+            self.assertTrue(result["active"])
+
+        def test_strategy_fifteen_minute_orb_forms_correctly(self) -> None:
+            closes = [100 + i * 0.03 for i in range(15)] + [101.2]
+            highs = [100.6 for _ in range(15)] + [101.4]
+            lows = [99.5 for _ in range(15)] + [100.9]
+            bars = self.make_strategy_bars(closes, highs=highs, lows=lows, volumes=[1000] * 15 + [3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "opening_range", "15-Min ORB Long")
+            self.assertTrue(result["active"])
+
+        def test_strategy_orb_does_not_alert_before_range_completes(self) -> None:
+            bars = self.make_strategy_bars([100.0, 100.2, 101.0], highs=[100.1, 100.3, 101.2])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "opening_range", "5-Min OR Not Formed")
+            self.assertFalse(result["active"])
+
+        def test_strategy_orb_short_with_volume_confirmation(self) -> None:
+            bars = self.make_strategy_bars([100.5, 100.3, 100.2, 100.1, 100.0, 98.9], lows=[100.2, 100.1, 99.9, 99.8, 99.7, 98.7], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "opening_range", "5-Min ORB Short")
+            self.assertTrue(result["active"])
+            self.assertGreaterEqual(result["score"], 60)
+
+        def test_strategy_orb_fakeout_warning(self) -> None:
+            bars = self.make_strategy_bars([100.0, 100.2, 100.4, 100.3, 100.5, 103.0], highs=[100.2, 100.4, 100.6, 100.5, 100.7, 103.2], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars)
+            result = self.strategy_result(summary, "opening_range", "5-Min ORB Long")
+            self.assertTrue(any("Fakeout" in warning for warning in result["warnings"]))
+
+        def test_strategy_multiple_active_increases_confidence(self) -> None:
+            bars = self.make_strategy_bars([100.0, 99.8, 99.6, 99.4, 99.2, 101.2], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars, {"pmh": 100.8})
+            active = [item for item in summary["strategy_results"] if item["active"]]
+            self.assertGreaterEqual(len(active), 2)
+            self.assertGreaterEqual(summary["confidence_score"], max(item["score"] for item in active))
+
+        def test_strategy_contradicting_strategies_lower_confidence(self) -> None:
+            bars = self.make_strategy_bars([100.0, 99.8, 99.6, 99.4, 99.2, 100.4], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars, {"pmh": 101.0, "pml": 99.0})
+            manual_active = [
+                {"score": 80, "direction": "bullish", "label": "VWAP Reclaim"},
+                {"score": 75, "direction": "bearish", "label": "Bearish Liquidity Sweep Rejection"},
+            ]
+            warnings: List[str] = []
+            from strategies.scoring import _combined_score
+            score = _combined_score(manual_active, warnings)
+            self.assertLess(score, 95)
+            self.assertIn("Contradicting strategies are active", warnings)
+
+        def test_phase3_bullish_trend_continuation_scenario(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.0, 100.2, 100.4, 100.6, 100.85, 101.2],
+                highs=[100.15, 100.35, 100.55, 100.75, 100.95, 101.35],
+                lows=[99.9, 100.05, 100.2, 100.35, 100.55, 100.9],
+                volumes=[1200, 1300, 1400, 1500, 1600, 2600],
+            )
+            summary = self.strategy_summary(bars, {"vwap": 100.25}, rel_vol=2.1, alignment="ALIGNED")
+            self.assertIn(
+                summary["scenario_top"]["scenario_name"],
+                {"Bullish Trend Continuation", "Breakout Continuation", "Bullish VWAP/EMA Reclaim Continuation"},
+            )
+            self.assertEqual(summary["scenario_top"]["direction"], "bullish")
+            self.assertIn(summary["scenario_top"]["stage"], {"CONFIRMED", "GOOD_POSITION", "FORMING"})
+
+        def test_phase3_bearish_trend_continuation_scenario(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.8, 100.6, 100.4, 100.2, 99.95, 99.7],
+                highs=[100.95, 100.75, 100.55, 100.35, 100.1, 99.85],
+                lows=[100.7, 100.45, 100.25, 100.05, 99.8, 99.55],
+                volumes=[1200, 1300, 1400, 1500, 1600, 2600],
+            )
+            summary = self.strategy_summary(bars, {"vwap": 100.5}, rel_vol=2.1, alignment="ALIGNED")
+            self.assertIn(
+                summary["scenario_top"]["scenario_name"],
+                {"Bearish Trend Continuation", "Breakdown Continuation", "Bearish VWAP/EMA Rejection Continuation"},
+            )
+            self.assertEqual(summary["scenario_top"]["direction"], "bearish")
+            self.assertIn(summary["scenario_top"]["stage"], {"CONFIRMED", "GOOD_POSITION", "FORMING"})
+
+        def test_phase3_scenario_alert_eligibility_and_would_sms(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.0, 100.05, 100.1, 100.15, 100.2, 100.28],
+                highs=[100.08, 100.14, 100.19, 100.24, 100.3, 100.36],
+                lows=[99.95, 100.0, 100.05, 100.1, 100.15, 100.22],
+                volumes=[1200, 1300, 1400, 1500, 1700, 2600],
+            )
+            summary = evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                load_config(None),
+                {"vwap": 100.05, "ema9": 100.02, "pmh": 100.25},
+                2.2,
+                "ALIGNED",
+                option_context={"option_feed_status": "OPRA", "option_tradable": True, "option_tradability_score": 90},
+                phase1_summary={"confidence_score": 84, "direction": "bullish"},
+                phase2_summary={
+                    "confirmation_score": 72,
+                    "candle_label": "BUYER_CONTROL",
+                    "volume_label": "STRONG",
+                    "market_regime": "BULL_TREND",
+                    "entry_quality_label": "GOOD_POSITION",
+                },
+            )
+            self.assertTrue(summary["scenario_alert_eligible"])
+            self.assertTrue(summary["scenario_would_sms"])
+            self.assertEqual(summary["scenario_alert_tier"], "WOULD_SMS")
+            self.assertEqual(summary["scenario_sms_block_reason"], "")
+            self.assertEqual(summary["scenario_alert_block_reason"], "")
+
+        def test_phase3_scenario_sms_blocks_without_option_support(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.0, 100.05, 100.1, 100.15, 100.2, 100.28],
+                highs=[100.08, 100.14, 100.19, 100.24, 100.3, 100.36],
+                lows=[99.95, 100.0, 100.05, 100.1, 100.15, 100.22],
+                volumes=[1200, 1300, 1400, 1500, 1700, 2600],
+            )
+            summary = evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                load_config(None),
+                {"vwap": 100.05, "ema9": 100.02, "pmh": 100.25},
+                2.2,
+                "ALIGNED",
+                option_context={"option_feed_status": "UNAVAILABLE", "option_tradable": False, "option_tradability_score": 40},
+                phase1_summary={"confidence_score": 84, "direction": "bullish"},
+                phase2_summary={
+                    "confirmation_score": 72,
+                    "candle_label": "BUYER_CONTROL",
+                    "volume_label": "STRONG",
+                    "market_regime": "BULL_TREND",
+                    "entry_quality_label": "GOOD_POSITION",
+                },
+            )
+            self.assertTrue(summary["scenario_alert_eligible"])
+            self.assertFalse(summary["scenario_would_sms"])
+            self.assertEqual(summary["scenario_alert_tier"], "DASHBOARD_ALERT")
+            self.assertIn("option", summary["scenario_sms_block_reason"].lower())
+            self.assertIn("option", summary["scenario_alert_block_reason"].lower())
+
+        def test_phase3_late_phase2_downgrades_good_position(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.1, 100.4, 100.7, 101.1],
+                highs=[99.7, 100.0, 100.3, 100.6, 100.9, 101.3],
+                lows=[99.3, 99.6, 99.9, 100.2, 100.5, 100.9],
+                volumes=[1000, 1000, 1400, 1600, 1800, 2600],
+            )
+            summary = evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                load_config(None),
+                {"vwap": 100.0, "ema9": 99.95, "pmh": 100.9},
+                2.0,
+                "ALIGNED",
+                phase1_summary={"confidence_score": 86, "direction": "bullish"},
+                phase2_summary={
+                    "confirmation_score": 74,
+                    "candle_label": "BUYER_CONTROL",
+                    "volume_label": "STRONG",
+                    "market_regime": "BULL_TREND",
+                    "entry_quality_label": "LATE",
+                },
+            )
+            self.assertNotEqual(summary["scenario_stage"], "GOOD_POSITION")
+            self.assertIn("Stage downgraded because Phase 2 entry quality is LATE", summary["scenario_warnings"])
+            self.assertIn(summary["scenario_stage"], {"LATE", "CONFIRMED", "FORMING"})
+            self.assertFalse(summary["scenario_would_sms"])
+
+        def test_phase3_do_not_chase_forces_blocked_stage(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.1, 100.4, 100.7, 101.1],
+                highs=[99.7, 100.0, 100.3, 100.6, 100.9, 101.3],
+                lows=[99.3, 99.6, 99.9, 100.2, 100.5, 100.9],
+                volumes=[1000, 1000, 1400, 1600, 1800, 2600],
+            )
+            summary = evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                load_config(None),
+                {"vwap": 100.0, "ema9": 99.95, "pmh": 100.9},
+                2.0,
+                "ALIGNED",
+                phase1_summary={"confidence_score": 86, "direction": "bullish"},
+                phase2_summary={
+                    "confirmation_score": 78,
+                    "candle_label": "BUYER_CONTROL",
+                    "volume_label": "STRONG",
+                    "market_regime": "BULL_TREND",
+                    "entry_quality_label": "DO_NOT_CHASE",
+                },
+            )
+            self.assertEqual(summary["scenario_stage"], "DO_NOT_CHASE")
+            self.assertEqual(summary["scenario_alert_tier"], "BLOCKED")
+            self.assertFalse(summary["scenario_would_sms"])
+            self.assertIn("DO_NOT_CHASE", summary["scenario_sms_block_reason"])
+
+        def test_phase3_failed_reclaim_is_labeled_as_failed_not_bullish_continuation(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.2, 99.9, 99.6, 99.2, 99.5, 99.4],
+                highs=[100.3, 100.0, 99.8, 99.6, 100.1, 100.0],
+                lows=[100.0, 99.7, 99.3, 98.9, 99.1, 99.0],
+                volumes=[1200, 1200, 1200, 2600, 1800, 1600],
+            )
+            summary = evaluate_strategy_suite(
+                "TEST",
+                bars,
+                bars[-1],
+                load_config(None),
+                {"vwap": 99.5, "ema9": 99.55, "recent_high": 100.0},
+                0.9,
+                "OPPOSED",
+                phase1_summary={"confidence_score": 82, "direction": "bullish"},
+                phase2_summary={
+                    "confirmation_score": 54,
+                    "candle_label": "REJECTION",
+                    "volume_label": "WEAK",
+                    "market_regime": "CHOPPY",
+                    "entry_quality_label": "EARLY",
+                },
+            )
+            self.assertEqual(summary["scenario_top"]["scenario_name"], "Failed VWAP/EMA Reclaim")
+            self.assertNotEqual(summary["scenario_top"]["scenario_name"], "Bullish VWAP/EMA Reclaim Continuation")
+            self.assertFalse(summary["scenario_would_sms"])
+            self.assertIn("Bullish reclaim rejected", summary["scenario_alert_block_reason"])
+            self.assertIn("current direction does not match top scenario", summary["scenario_alert_block_reason"].lower())
+            self.assertIn(summary["scenario_top"]["stage"], {"WATCHING", "FORMING"})
+
+        def test_phase3_alert_tier_helper_covers_watch_and_blocked(self) -> None:
+            from strategies.scenario.scenario_engine import _phase3_alert_tier, _phase3_alert_block_reason
+            from strategies.scenario.scenario_types import ScenarioResult
+
+            watch = ScenarioResult(scenario_name="Watch", direction="bullish", stage="FORMING", score=45, entry_quality_label="EARLY")
+            blocked = ScenarioResult(scenario_name="Blocked", direction="bearish", stage="LATE", score=90, entry_quality_label="LATE", risk_label="HIGH")
+            self.assertEqual(
+                _phase3_alert_tier(
+                    top=watch,
+                    scenario_conflict=False,
+                    direction_conflict=False,
+                    phase2_candle_label="BUYER_CONTROL",
+                    phase2_confirmation_score=55,
+                    phase2_entry_quality="EARLY",
+                    extended_from_vwap=False,
+                    extended_from_ema=False,
+                    would_sms=False,
+                ),
+                "WATCH_ONLY",
+            )
+            self.assertEqual(
+                _phase3_alert_tier(
+                    top=blocked,
+                    scenario_conflict=True,
+                    direction_conflict=True,
+                    phase2_candle_label="SELLER_CONTROL",
+                    phase2_confirmation_score=55,
+                    phase2_entry_quality="LATE",
+                    extended_from_vwap=True,
+                    extended_from_ema=False,
+                    would_sms=False,
+                ),
+                "BLOCKED",
+            )
+            self.assertIn(
+                "current direction does not match top scenario",
+                _phase3_alert_block_reason(
+                    tier="BLOCKED",
+                    top=blocked,
+                    scenario_conflict=True,
+                    direction_conflict=True,
+                    phase2_candle_label="SELLER_CONTROL",
+                    phase2_confirmation_score=55,
+                    phase2_entry_quality="LATE",
+                    extended_from_vwap=True,
+                    extended_from_ema=False,
+                    stage_downgrade_reason="Stage downgraded because Phase 2 entry quality is LATE",
+                ).lower(),
+            )
+
+        def test_phase3_stock_setup_reason_explains_low_score(self) -> None:
+            from strategies.scenario.scenario_engine import _stock_setup_score_reason
+            from strategies.scenario.scenario_types import ScenarioResult
+
+            active = [
+                ScenarioResult(
+                    scenario_name="Bullish Trend Continuation",
+                    direction="bullish",
+                    score=28,
+                    reasons=["Price is below VWAP"],
+                    warnings=["Volume confirmation is weak"],
+                )
+            ]
+            reason = _stock_setup_score_reason(active[0], active, 16, "GOOD_POSITION", active[0].warnings)
+            self.assertIn("below vwap", reason.lower())
+            self.assertIn("good_position", reason.lower())
+
+        def test_phase3_heads_up_aapl_pullback_holding_confirmed_is_eligible(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert()
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
+            self.assertTrue(alert.phase3_heads_up_eligible)
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertFalse(alert.sms_allowed)
+            self.assertEqual(alert.alert_grade, "C")
+            self.assertEqual(alert.phase3_heads_up_type, "GOOD_POSITION")
+            message = phase3_heads_up_message(alert)
+            self.assertIn("AAPL Phase 3 Heads-Up", message)
+            self.assertIn("Bullish Pullback Holding — CONFIRMED", message)
+            self.assertIn("Heads-up only — confirm on chart", message)
+
+        def test_phase3_heads_up_forming_is_early_watch(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                scenario_stage="FORMING",
+                scenario_score=84,
+                stock_setup_score=70,
+                confirmation_score=58,
+                entry_quality_label="EARLY",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "FORMING", "score": 84},
+            )
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_type, "EARLY_WATCH")
+            self.assertIn("watch chart, do not enter yet", phase3_heads_up_message(alert))
+
+        def test_phase3_heads_up_legacy_conflict_warns_but_does_not_block(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(direction="BEARISH", strategy_direction="bearish")
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertIn("Legacy/Phase 2 conflict present — confirm manually.", alert.scenario_warnings)
+            self.assertIn("Legacy/Phase 2 conflict present", phase3_heads_up_message(alert))
+
+        def test_phase3_heads_up_do_not_chase_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(risk_label="DO_NOT_CHASE")
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertIn("DO_NOT_CHASE", alert.phase3_heads_up_block_reason)
+
+        def test_phase3_heads_up_high_risk_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(risk_label="HIGH")
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: risk is HIGH")
+
+        def test_phase3_heads_up_low_confirmation_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(confirmation_score=54)
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: confirmation below 55")
+
+        def test_phase3_heads_up_late_entry_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(entry_quality_label="LATE")
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: entry quality is LATE")
+
+        def test_phase3_heads_up_scenario_conflict_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(scenario_conflict=True)
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: scenario conflict")
+
+        def test_phase3_heads_up_only_configured_symbol_sends(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(symbol="SPY")
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertIn("symbol not enabled", alert.phase3_heads_up_block_reason)
+
+        def test_phase3_heads_up_late_stage_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                scenario_stage="LATE",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 87},
+            )
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertIn("scenario stage is LATE", alert.phase3_heads_up_block_reason)
+
+        def test_phase3_heads_up_stale_data_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert()
+            snap = self.make_phase3_heads_up_snapshot(stale=True)
+            scanner.evaluate_phase3_heads_up(alert, snap, snapshot_data_quality(snap, scanner.config))
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertIn("stale", alert.phase3_heads_up_block_reason.lower())
+
+        def test_phase3_heads_up_duplicate_within_dedupe_window_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert()
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(first, snap, "Fresh")
+            self.assertTrue(first.phase3_heads_up_sent)
+            scanner.state_store.set_last_alert_time(scanner.phase3_heads_up_state_key(first), now_utc())
+            second = self.make_phase3_heads_up_alert()
+            scanner.evaluate_phase3_heads_up(second, snap, "Fresh")
+            self.assertTrue(second.phase3_heads_up_eligible)
+            self.assertFalse(second.phase3_heads_up_sent)
+            self.assertTrue(second.phase3_heads_up_dedupe_blocked)
+            self.assertIsNotNone(second.phase3_heads_up_next_eligible_time)
+            self.assertIn("duplicate", second.phase3_heads_up_block_reason.lower())
+
+        def test_phase3_heads_up_dedupe_key_includes_stage(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            confirmed = self.make_phase3_heads_up_alert()
+            forming = self.make_phase3_heads_up_alert(
+                scenario_stage="FORMING",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "FORMING", "score": 87},
+            )
+            self.assertNotEqual(scanner.phase3_heads_up_state_key(confirmed), scanner.phase3_heads_up_state_key(forming))
+
+        def test_phase3_heads_up_same_scan_duplicate_is_blocked(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert(alert_score=70)
+            second = self.make_phase3_heads_up_alert(alert_score=50)
+            first.phase3_heads_up_sent = True
+            second.phase3_heads_up_sent = True
+            scanner.keep_best_text_alert_per_direction([first, second])
+            self.assertTrue(first.phase3_heads_up_sent)
+            self.assertFalse(second.phase3_heads_up_sent)
+            self.assertTrue(second.phase3_heads_up_dedupe_blocked)
+
+        def test_phase3_heads_up_missing_market_context_warns(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert()
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh", {})
+            self.assertEqual(alert.market_confirmation_status, "UNAVAILABLE")
+            self.assertIn("Market confirmation unavailable — SPY/QQQ data missing.", alert.scenario_warnings)
+
+        def test_phase3_heads_up_indicative_options_do_not_block(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(option_feed_status="INDICATIVE")
+            snap = self.make_phase3_heads_up_snapshot()
+            scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
+            self.assertTrue(alert.phase3_heads_up_sent)
+
+        def test_phase3_heads_up_does_not_change_normal_sms_rules(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert()
+            snap = self.make_phase3_heads_up_snapshot()
+            graded = scanner.grade_alert(alert, snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertTrue(graded.phase3_heads_up_sent)
+            self.assertFalse(graded.sms_allowed)
+            self.assertNotEqual(graded.alert_grade, "A+")
+
+        def test_telegram_disabled_sends_nothing(self) -> None:
+            from unittest.mock import patch
+            notifier = TelegramNotifier("secret-token", "123", enabled=False, alert_types=["NORMAL_SMS"])
+            alert = self.make_phase3_heads_up_alert()
+            alert.sms_allowed = True
+            with patch("requests.post") as post:
+                notifier.send(alert)
+            post.assert_not_called()
+
+        def test_telegram_missing_credentials_does_not_crash(self) -> None:
+            notifier = TelegramNotifier("", "", enabled=True, alert_types=["NORMAL_SMS"])
+            alert = self.make_phase3_heads_up_alert()
+            alert.sms_allowed = True
+            notifier.send(alert)
+
+        def test_telegram_success_and_failure_are_logged_without_token(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            token = "secret-telegram-token"
+            notifier = TelegramNotifier(token, "123", enabled=True, alert_types=["NORMAL_SMS"])
+            alert = self.make_phase3_heads_up_alert()
+            alert.sms_allowed = True
+            response = Mock()
+            response.raise_for_status.return_value = None
+            try:
+                with patch("requests.post", return_value=response):
+                    notifier.send(alert)
+                with patch("requests.post", side_effect=RuntimeError(f"failed {token}")):
+                    notifier.send(alert)
+                text = NOTIFICATION_STATUS_LOG.read_text(encoding="utf-8")
+                self.assertIn('"sent": true', text)
+                self.assertIn('"sent": false', text)
+                self.assertIn("[REDACTED]", text)
+                self.assertNotIn(token, text)
+            finally:
+                NOTIFICATION_STATUS_LOG = original_log
+
+        def test_telegram_only_sends_approved_phase3_or_normal_sms(self) -> None:
+            from unittest.mock import patch
+            notifier = TelegramNotifier(
+                "secret-token",
+                "123",
+                enabled=True,
+                alert_types=["PHASE3_HEADS_UP", "NORMAL_SMS"],
+            )
+            blocked = self.make_phase3_heads_up_alert(risk_label="HIGH", entry_quality_label="LATE")
+            blocked.phase3_heads_up_sent = False
+            blocked.sms_allowed = False
+            with patch("requests.post") as post:
+                notifier.send(blocked)
+            post.assert_not_called()
+
+        def test_telegram_phase3_uses_existing_dedupe_decision(self) -> None:
+            from unittest.mock import patch
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert()
+            scanner.state_store.set_last_alert_time(scanner.phase3_heads_up_state_key(alert), now_utc())
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(alert.phase3_heads_up_sent)
+            notifier = TelegramNotifier("secret-token", "123", enabled=True, alert_types=["PHASE3_HEADS_UP"])
+            with patch("requests.post") as post:
+                notifier.send(alert)
+            post.assert_not_called()
+
+        def test_telegram_env_config(self) -> None:
+            previous = self.with_env(
+                {
+                    "ENABLE_TELEGRAM_ALERTS": "true",
+                    "TELEGRAM_ALERT_TYPES": "PHASE3_HEADS_UP,NORMAL_SMS",
+                    "TELEGRAM_AAPL_ONLY": "true",
+                    "TELEGRAM_SEND_TEST_ON_START": "false",
+                    "TELEGRAM_TIMEOUT_SECONDS": "8",
+                }
+            )
+            try:
+                notifications = load_config(None)["notifications"]
+                self.assertTrue(notifications["telegram_enabled"])
+                self.assertEqual(notifications["telegram_alert_types"], ["PHASE3_HEADS_UP", "NORMAL_SMS"])
+                self.assertTrue(notifications["telegram_aapl_only"])
+                self.assertEqual(notifications["telegram_timeout_seconds"], 8)
+            finally:
+                self.restore_env(previous)
+
+        def test_strategy_below_threshold_does_not_send_sms(self) -> None:
+            config = load_config(None)
+            bars = self.make_strategy_bars([100.0 + i * 0.1 for i in range(12)])
+            snap = SymbolSnapshot(symbol="TEST", latest_bar=bars[-1], recent_bars=bars, opening_range_high=100.5, opening_range_low=99.5)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_strategy_threshold.csv", LOG_DIR / "test_strategy_threshold.jsonl"),
+                StateStore(STATE_DIR / "test_strategy_threshold_state.json"),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=101.1,
+                fast_move_pct=1.0,
+                day_move_pct=1.0,
+                relative_volume=2.0,
+                opening_range_high=100.5,
+                option_quality="Tradable",
+                options_score=90,
+                primary_setup="Weak Breakout",
+                strategy_confidence_score=45,
+                strategy_confidence_label="LOW",
+            )
+            graded = scanner.grade_alert(alert, snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+
+        def test_phase2a_strong_breakout_volume_increases_confidence(self) -> None:
+            bars = self.make_strategy_bars([99.2, 99.5, 99.8, 100.1, 100.4, 101.2], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            strong = self.strategy_summary(bars, {"pmh": 101.0}, rel_vol=2.5)
+            weak = self.strategy_summary(bars, {"pmh": 101.0}, rel_vol=0.8)
+            self.assertGreater(strong["confidence_score"], weak["confidence_score"])
+            self.assertEqual(strong["volume_label"], "STRONG")
+
+        def test_phase2a_weak_breakout_volume_lowers_confidence(self) -> None:
+            bars = self.make_strategy_bars([99.2, 99.5, 99.8, 100.1, 100.4, 101.2], volumes=[2000, 2000, 2000, 2000, 2000, 500])
+            summary = self.strategy_summary(bars, {"pmh": 101.0}, rel_vol=0.6)
+            self.assertEqual(summary["volume_label"], "WEAK")
+            self.assertTrue(any("low volume" in warning.lower() or "weak" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2a_sweep_reclaim_strong_volume_increases_confidence(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.2, 99.8, 99.4, 98.9, 99.2, 99.7],
+                lows=[100.0, 99.6, 99.2, 98.5, 98.8, 99.1],
+                volumes=[1000, 1000, 1000, 2200, 2500, 3600],
+            )
+            summary = self.strategy_summary(bars, {"pml": 99.0}, rel_vol=2.2)
+            self.assertEqual(summary["volume_label"], "STRONG")
+            self.assertTrue(any("Sweep/reclaim" in reason for reason in summary["volume_quality"]["reasons"]))
+
+        def test_phase2a_low_volume_reclaim_produces_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.2, 99.8, 99.4, 98.9, 99.2, 99.7],
+                lows=[100.0, 99.6, 99.2, 98.5, 98.8, 99.1],
+                volumes=[2000, 2000, 2000, 2000, 2000, 600],
+            )
+            summary = self.strategy_summary(bars, {"pml": 99.0}, rel_vol=0.5)
+            self.assertEqual(summary["volume_label"], "WEAK")
+            self.assertTrue(summary["warnings"])
+
+        def test_phase2a_climax_after_multiple_large_candles_warns_exhaustion(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.0, 99.4, 99.9, 100.6, 101.5, 102.6],
+                highs=[99.2, 99.6, 100.1, 100.8, 101.7, 102.8],
+                lows=[98.9, 99.2, 99.7, 100.2, 101.1, 102.0],
+                volumes=[1000, 1000, 1300, 2800, 3600, 6000],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.0}, rel_vol=4.0)
+            self.assertEqual(summary["volume_label"], "CLIMAX")
+            self.assertTrue(any("exhaustion" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2a_pullback_volume_on_retest_hold_not_automatically_bearish(self) -> None:
+            from strategies.confirmation.volume_quality import evaluate_volume_quality
+            bars = self.make_strategy_bars(
+                [99.5, 99.9, 100.4, 100.8, 100.3, 100.6],
+                lows=[99.3, 99.7, 100.1, 100.5, 100.0, 100.2],
+                volumes=[1000, 1200, 3000, 2800, 1600, 1000],
+            )
+            result = evaluate_volume_quality(
+                bars,
+                load_config(None),
+                relative_volume=1.0,
+                direction="bullish",
+                setup_label="Breakout Retest Holding",
+            )
+            self.assertTrue(any("Pullback/retest volume is lighter" in reason or "Retest/pullback volume is controlled" in reason for reason in result["reasons"]))
+            self.assertFalse(result["is_volume_exhausted"])
+
+        def test_phase2b_bullish_candle_near_high_scores_buyer_control(self) -> None:
+            from strategies.confirmation.candle_strength import evaluate_candle_strength
+            bars = self.make_strategy_bars(
+                [100.0, 100.0, 100.0, 100.0, 100.0, 101.0],
+                highs=[100.2, 100.2, 100.2, 100.2, 100.2, 101.1],
+                lows=[99.8, 99.8, 99.8, 99.8, 99.8, 100.0],
+            )
+            result = evaluate_candle_strength(bars, load_config(None), direction="bullish")
+            self.assertEqual(result["candle_label"], "BUYER_CONTROL")
+            self.assertGreaterEqual(result["close_position_pct"], 75)
+
+        def test_phase2b_bearish_candle_near_low_scores_seller_control(self) -> None:
+            from strategies.confirmation.candle_strength import evaluate_candle_strength
+            bars = self.make_strategy_bars(
+                [100.0, 100.0, 100.0, 100.0, 100.0, 99.0],
+                highs=[100.2, 100.2, 100.2, 100.2, 100.2, 100.0],
+                lows=[99.8, 99.8, 99.8, 99.8, 99.8, 98.9],
+            )
+            result = evaluate_candle_strength(bars, load_config(None), direction="bearish")
+            self.assertEqual(result["candle_label"], "SELLER_CONTROL")
+            self.assertLessEqual(result["close_position_pct"], 25)
+
+        def test_phase2b_breakout_large_upper_wick_gets_fakeout_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.1, 100.2, 100.0, 100.6],
+                highs=[100.0, 100.2, 100.3, 100.4, 100.2, 102.0],
+                lows=[99.6, 99.8, 99.9, 100.0, 99.8, 99.8],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0)
+            self.assertEqual(summary["candle_label"], "REJECTION")
+            self.assertTrue(any("upper wick rejection" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2b_breakdown_large_lower_wick_gets_reclaim_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.4, 100.2, 100.1, 99.9, 100.0, 99.4],
+                highs=[100.6, 100.4, 100.3, 100.1, 100.2, 100.2],
+                lows=[100.2, 100.0, 99.9, 99.7, 99.8, 98.0],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            summary = self.strategy_summary(bars, {"pml": 99.5}, rel_vol=2.0)
+            self.assertEqual(summary["candle_label"], "REJECTION")
+            self.assertTrue(any("lower wick" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2b_small_body_high_volume_gets_indecision_warning(self) -> None:
+            from strategies.confirmation.candle_strength import evaluate_candle_strength
+            bars = self.make_strategy_bars(
+                [100.0, 100.0, 100.0, 100.0, 100.0, 100.05],
+                highs=[100.2, 100.2, 100.2, 100.2, 100.2, 100.5],
+                lows=[99.8, 99.8, 99.8, 99.8, 99.8, 99.5],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            result = evaluate_candle_strength(
+                bars,
+                load_config(None),
+                direction="bullish",
+                volume_quality={"volume_label": "STRONG"},
+            )
+            self.assertEqual(result["candle_label"], "INDECISION")
+            self.assertTrue(any("churn" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2b_candle_strength_integrates_with_strategy_scoring(self) -> None:
+            buyer_bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.1, 100.2, 100.0, 101.0],
+                highs=[100.0, 100.2, 100.3, 100.4, 100.2, 101.1],
+                lows=[99.6, 99.8, 99.9, 100.0, 99.8, 100.0],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            rejection_bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.1, 100.2, 100.0, 100.6],
+                highs=[100.0, 100.2, 100.3, 100.4, 100.2, 102.0],
+                lows=[99.6, 99.8, 99.9, 100.0, 99.8, 99.8],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            buyer = self.strategy_summary(buyer_bars, {"pmh": 100.5}, rel_vol=2.0)
+            rejection = self.strategy_summary(rejection_bars, {"pmh": 100.5}, rel_vol=2.0)
+            self.assertEqual(buyer["candle_label"], "BUYER_CONTROL")
+            self.assertGreater(buyer["confidence_score"], rejection["confidence_score"])
+            self.assertGreater(buyer["confirmation_score"], rejection["confirmation_score"])
+
+        def test_phase2c_breakout_above_pmh_then_retest_holds(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.08, 100.12],
+                highs=[99.7, 100.0, 100.4, 100.8, 100.25, 100.22],
+                lows=[99.3, 99.6, 100.05, 100.3, 100.0, 100.02],
+                volumes=[1000, 1000, 2500, 2800, 1500, 1600],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.0}, rel_vol=1.6)
+            self.assertTrue(summary["retest_hold"]["retest_active"])
+            self.assertEqual(summary["retest_hold"]["retest_type"], "BREAKOUT_RETEST_HOLD")
+            self.assertEqual(summary["entry_quality_label"], "GOOD_POSITION")
+            self.assertIn("Breakout Retest Holding", summary["secondary_setups"])
+
+        def test_phase2c_breakout_without_retest_has_no_retest_alert(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.8, 101.0],
+                highs=[99.7, 100.0, 100.4, 100.8, 101.0, 101.2],
+                lows=[99.3, 99.6, 100.15, 100.35, 100.65, 100.85],
+                volumes=[1000, 1000, 2500, 2800, 2200, 2300],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.0}, rel_vol=1.7)
+            self.assertFalse(summary["retest_hold"]["retest_active"])
+            self.assertNotIn("Breakout Retest Holding", summary["secondary_setups"])
+
+        def test_phase2c_price_breaks_and_loses_level_gets_fakeout_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.3, 100.5, 99.95, 99.9],
+                highs=[99.7, 100.0, 100.5, 100.7, 100.2, 100.05],
+                lows=[99.3, 99.6, 100.1, 100.2, 99.8, 99.75],
+                volumes=[1000, 1000, 2500, 2800, 2600, 2400],
+            )
+            from strategies.confirmation.retest_hold import evaluate_retest_hold
+            result = evaluate_retest_hold(bars, load_config(None), {"pmh": 100.0}, direction="bullish")
+            self.assertFalse(result["retest_active"])
+            self.assertTrue(any("fakeout" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2c_breakdown_below_pml_then_underside_rejects(self) -> None:
+            bars = self.make_strategy_bars(
+                [100.5, 100.2, 99.8, 99.4, 99.92, 99.88],
+                highs=[100.7, 100.4, 99.95, 99.6, 99.98, 99.97],
+                lows=[100.3, 100.0, 99.6, 99.2, 99.7, 99.65],
+                volumes=[1000, 1000, 2500, 2800, 1500, 1700],
+            )
+            summary = self.strategy_summary(bars, {"pml": 100.0}, rel_vol=1.7)
+            self.assertTrue(summary["retest_hold"]["retest_active"])
+            self.assertEqual(summary["retest_hold"]["retest_type"], "BREAKDOWN_RETEST_REJECT")
+            self.assertIn("Breakdown Retest Rejecting", summary["secondary_setups"])
+
+        def test_phase2c_retest_too_far_from_level_is_late(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.8, 101.0],
+                highs=[99.7, 100.0, 100.4, 100.8, 101.0, 101.2],
+                lows=[99.3, 99.6, 100.0, 100.3, 100.6, 100.8],
+                volumes=[1000, 1000, 2500, 2800, 2200, 2300],
+            )
+            from strategies.confirmation.retest_hold import evaluate_retest_hold
+            result = evaluate_retest_hold(bars, load_config(None), {"pmh": 100.0}, direction="bullish")
+            self.assertFalse(result["retest_active"])
+            self.assertEqual(result["entry_quality_label"], "LATE")
+            self.assertTrue(any("late entry" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2c_high_selling_volume_on_pullback_lowers_score(self) -> None:
+            controlled_bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.08, 100.12],
+                highs=[99.7, 100.0, 100.4, 100.8, 100.25, 100.22],
+                lows=[99.3, 99.6, 100.05, 100.3, 100.0, 100.02],
+                volumes=[1000, 1000, 2500, 2800, 1500, 1600],
+            )
+            heavy_bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.08, 100.12],
+                highs=[99.7, 100.0, 100.4, 100.8, 100.25, 100.22],
+                lows=[99.3, 99.6, 100.05, 100.3, 100.0, 100.02],
+                volumes=[1000, 1000, 2500, 2800, 4000, 4200],
+            )
+            from strategies.confirmation.retest_hold import evaluate_retest_hold
+            controlled = evaluate_retest_hold(controlled_bars, load_config(None), {"pmh": 100.0}, direction="bullish")
+            heavy = evaluate_retest_hold(heavy_bars, load_config(None), {"pmh": 100.0}, direction="bullish")
+            self.assertTrue(heavy["retest_active"])
+            self.assertLess(heavy["score"], controlled["score"])
+            self.assertTrue(any("volume expanded" in warning.lower() for warning in heavy["warnings"]))
+
+        def test_phase2d_clean_breakout_near_level_has_normal_extension(self) -> None:
+            from strategies.confirmation.extension_exhaustion import evaluate_extension_exhaustion
+            bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.1, 100.2, 100.3, 100.35],
+                highs=[100.0, 100.2, 100.3, 100.4, 100.45, 100.45],
+                lows=[99.6, 99.8, 99.9, 100.0, 100.15, 100.25],
+            )
+            result = evaluate_extension_exhaustion(bars, load_config(None), {"pmh": 100.2}, direction="bullish")
+            self.assertEqual(result["extension_label"], "NORMAL")
+
+        def test_phase2d_clean_breakout_far_above_vwap_gets_extended_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.1, 100.2, 100.4, 102.0],
+                highs=[100.0, 100.2, 100.3, 100.4, 100.6, 102.2],
+                lows=[99.6, 99.8, 99.9, 100.0, 100.2, 101.6],
+                volumes=[1000, 1000, 1000, 1000, 1300, 3600],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.5)
+            self.assertIn(summary["extension_label"], {"EXTENDED", "VERY_EXTENDED", "DO_NOT_CHASE"})
+            self.assertTrue(any("extended from vwap" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2d_three_strong_candles_warn_late_entry(self) -> None:
+            from strategies.confirmation.extension_exhaustion import evaluate_extension_exhaustion
+            bars = self.make_strategy_bars(
+                [100.0, 100.2, 100.9, 101.7, 102.5],
+                highs=[100.2, 100.4, 101.0, 101.8, 102.6],
+                lows=[99.8, 100.0, 100.2, 100.9, 101.7],
+            )
+            result = evaluate_extension_exhaustion(bars, load_config(None), {"pmh": 100.5}, direction="bullish")
+            self.assertGreaterEqual(result["consecutive_large_candles"], 3)
+            self.assertTrue(any("multiple large candles" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2d_volume_climax_after_extension_gets_exhaustion_warning(self) -> None:
+            from strategies.confirmation.extension_exhaustion import evaluate_extension_exhaustion
+            bars = self.make_strategy_bars(
+                [99.8, 100.0, 100.8, 101.7, 102.7],
+                highs=[100.0, 100.2, 101.0, 101.9, 102.9],
+                lows=[99.6, 99.8, 100.0, 100.8, 101.7],
+            )
+            result = evaluate_extension_exhaustion(
+                bars,
+                load_config(None),
+                {"pmh": 100.2},
+                direction="bullish",
+                volume_quality={"volume_label": "CLIMAX", "is_volume_exhausted": True},
+            )
+            self.assertTrue(any("exhaustion" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2d_do_not_chase_risk_overrides_normal_risk(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.0, 99.4, 100.4, 101.6, 102.8, 104.2],
+                highs=[99.2, 99.6, 100.6, 101.8, 103.0, 104.4],
+                lows=[98.8, 99.2, 99.4, 100.4, 101.6, 102.8],
+                volumes=[1000, 1000, 2400, 3000, 4200, 6000],
+            )
+            summary = self.strategy_summary(bars, {"pmh": 100.0}, rel_vol=4.0)
+            self.assertEqual(summary["risk_label"], "DO_NOT_CHASE")
+            self.assertEqual(summary["entry_quality_label"], "DO_NOT_CHASE")
+
+        def test_phase2e_aapl_strong_while_qqq_flat_is_rs_strong(self) -> None:
+            from strategies.confirmation.relative_strength import evaluate_relative_strength
+            bars = self.make_strategy_bars([100.0, 100.1, 100.3, 100.6, 100.9, 101.2])
+            qqq = self.make_strategy_bars([100.0, 100.0, 100.02, 100.01, 100.0, 100.03])
+            spy = self.make_strategy_bars([100.0, 100.01, 100.0, 100.02, 100.01, 100.02])
+            result = evaluate_relative_strength("AAPL", bars, load_config(None), {"SPY": spy, "QQQ": qqq}, direction="bullish")
+            self.assertEqual(result["relative_strength_label"], "STRONG")
+            self.assertGreater(result["symbol_vs_qqq"], 0.2)
+
+        def test_phase2e_aapl_weak_while_qqq_strong_is_rw_weak(self) -> None:
+            from strategies.confirmation.relative_strength import evaluate_relative_strength
+            bars = self.make_strategy_bars([100.0, 99.9, 99.8, 99.7, 99.6, 99.5])
+            qqq = self.make_strategy_bars([100.0, 100.2, 100.4, 100.6, 100.8, 101.0])
+            spy = self.make_strategy_bars([100.0, 100.1, 100.2, 100.3, 100.4, 100.5])
+            result = evaluate_relative_strength("AAPL", bars, load_config(None), {"SPY": spy, "QQQ": qqq}, direction="bullish")
+            self.assertEqual(result["relative_strength_label"], "WEAK")
+            self.assertTrue(any("underperforming" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2e_bullish_setup_with_rs_gets_confidence_boost(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 101.0],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            qqq = self.make_strategy_bars([100.0, 100.05, 100.1, 100.15, 100.2, 100.25])
+            spy = self.make_strategy_bars([100.0, 100.04, 100.08, 100.12, 100.16, 100.2])
+            strong = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={"SPY": spy, "QQQ": qqq})
+            neutral = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={})
+            self.assertEqual(strong["relative_strength_label"], "STRONG")
+            self.assertGreater(strong["confidence_score"], neutral["confidence_score"])
+
+        def test_phase2e_bullish_setup_with_relative_weakness_gets_warning(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 100.8],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            qqq = self.make_strategy_bars([100.0, 100.5, 101.0, 101.5, 102.0, 102.5])
+            spy = self.make_strategy_bars([100.0, 100.3, 100.6, 100.9, 101.2, 101.5])
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={"SPY": spy, "QQQ": qqq})
+            self.assertEqual(summary["relative_strength_label"], "WEAK")
+            self.assertTrue(any("lacks relative strength" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2e_bearish_setup_with_rw_gets_boost(self) -> None:
+            bars = self.make_strategy_bars(
+                [101.0, 100.8, 100.4, 100.0, 99.6, 98.9],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            qqq = self.make_strategy_bars([100.0, 99.95, 99.9, 99.85, 99.8, 99.75])
+            spy = self.make_strategy_bars([100.0, 99.96, 99.92, 99.88, 99.84, 99.8])
+            weak = self.strategy_summary(bars, {"pml": 99.2}, rel_vol=2.0, market_bars={"SPY": spy, "QQQ": qqq})
+            neutral = self.strategy_summary(bars, {"pml": 99.2}, rel_vol=2.0, market_bars={})
+            self.assertEqual(weak["relative_strength_label"], "WEAK")
+            self.assertGreater(weak["confidence_score"], neutral["confidence_score"])
+
+        def test_phase2f_spy_qqq_above_vwap_higher_highs_bull_trend(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
+            qqq = self.make_strategy_bars([100 + i * 0.15 for i in range(15)])
+            result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
+            self.assertEqual(result["market_regime"], "BULL_TREND")
+
+        def test_phase2f_spy_qqq_below_vwap_lower_lows_bear_trend(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            spy = self.make_strategy_bars([102 - i * 0.12 for i in range(15)])
+            qqq = self.make_strategy_bars([102 - i * 0.15 for i in range(15)])
+            result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
+            self.assertEqual(result["market_regime"], "BEAR_TREND")
+
+        def test_phase2f_multiple_vwap_crosses_is_choppy(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            closes = [100.0, 100.4, 99.7, 100.3, 99.8, 100.2, 99.7, 100.3, 99.8, 100.2, 99.7, 100.3, 99.8, 100.2, 99.9]
+            spy = self.make_strategy_bars(closes)
+            qqq = self.make_strategy_bars(closes)
+            result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
+            self.assertEqual(result["market_regime"], "CHOPPY")
+
+        def test_phase2f_mixed_spy_qqq_adds_warning(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
+            qqq = self.make_strategy_bars([102 - i * 0.15 for i in range(15)])
+            result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
+            self.assertEqual(result["market_regime"], "MIXED")
+            self.assertTrue(any("mixed" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2f_choppy_market_lowers_setup_confidence(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 101.0],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            bull_spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
+            bull_qqq = self.make_strategy_bars([100 + i * 0.15 for i in range(15)])
+            choppy_closes = [100.0, 100.4, 99.7, 100.3, 99.8, 100.2, 99.7, 100.3, 99.8, 100.2, 99.7, 100.3, 99.8, 100.2, 99.9]
+            choppy_spy = self.make_strategy_bars(choppy_closes)
+            choppy_qqq = self.make_strategy_bars(choppy_closes)
+            bull = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={"SPY": bull_spy, "QQQ": bull_qqq})
+            choppy = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={"SPY": choppy_spy, "QQQ": choppy_qqq})
+            self.assertEqual(choppy["market_regime"], "CHOPPY")
+            self.assertLess(choppy["confidence_score"], bull["confidence_score"])
+
+        def test_phase2g_trades_near_ask_create_buyer_pressure(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            data = {
+                "quote": {"bid": 100.0, "ask": 100.05, "bid_size": 800, "ask_size": 300},
+                "trades": [{"price": 100.04, "size": 100}, {"price": 100.05, "size": 120}, {"price": 100.04, "size": 90}],
+            }
+            result = evaluate_pressure_score(data, load_config(None), direction="bullish")
+            self.assertEqual(result["pressure_label"], "BUYERS_ACTIVE")
+            self.assertGreater(result["trade_near_ask_count"], result["trade_near_bid_count"])
+
+        def test_phase2g_trades_near_bid_create_seller_pressure(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            data = {
+                "quote": {"bid": 100.0, "ask": 100.1, "bid_size": 300, "ask_size": 900},
+                "trades": [{"price": 100.0, "size": 100}, {"price": 100.01, "size": 130}, {"price": 100.02, "size": 110}],
+            }
+            result = evaluate_pressure_score(data, load_config(None), direction="bearish")
+            self.assertEqual(result["pressure_label"], "SELLERS_ACTIVE")
+            self.assertGreater(result["trade_near_bid_count"], result["trade_near_ask_count"])
+
+        def test_phase2g_large_print_in_setup_direction_boosts_score(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            trades = [{"price": 100.09, "size": 100} for _ in range(10)] + [{"price": 100.1, "size": 1200}]
+            data = {"quote": {"bid": 100.0, "ask": 100.1}, "trades": trades}
+            result = evaluate_pressure_score(data, load_config(None), direction="bullish")
+            self.assertGreaterEqual(result["large_print_count"], 1)
+            self.assertTrue(any("large prints" in reason.lower() for reason in result["reasons"]))
+
+        def test_phase2g_large_print_against_setup_adds_warning(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            trades = [{"price": 100.09, "size": 100} for _ in range(10)] + [{"price": 100.0, "size": 1200}]
+            data = {"quote": {"bid": 100.0, "ask": 100.1}, "trades": trades}
+            result = evaluate_pressure_score(data, load_config(None), direction="bullish")
+            self.assertTrue(any("against" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2g_missing_trade_quote_data_returns_unknown_safely(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            result = evaluate_pressure_score(None, load_config(None), direction="bullish")
+            self.assertEqual(result["pressure_label"], "UNKNOWN")
+
+        def test_phase2g_wide_spread_adds_warning(self) -> None:
+            from strategies.confirmation.pressure_score import evaluate_pressure_score
+            data = {
+                "quote": {"bid": 100.0, "ask": 100.3},
+                "trades": [{"price": 100.28, "size": 100}, {"price": 100.29, "size": 110}],
+            }
+            result = evaluate_pressure_score(data, load_config(None), direction="bullish")
+            self.assertTrue(any("spread is wide" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase2h_strong_phase1_and_phase2_gives_high_confidence(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.8, 100.2, 100.6, 100.08, 100.14],
+                highs=[99.7, 100.0, 100.4, 100.8, 100.25, 100.15],
+                lows=[99.3, 99.6, 100.05, 100.3, 100.0, 100.02],
+                volumes=[1000, 1000, 2500, 2800, 1500, 1600],
+            )
+            spy = self.make_strategy_bars([100 + i * 0.04 for i in range(15)])
+            qqq = self.make_strategy_bars([100 + i * 0.04 for i in range(15)])
+            summary = self.strategy_summary(bars, {"pmh": 100.0}, rel_vol=2.2, market_bars={"SPY": spy, "QQQ": qqq})
+            self.assertEqual(summary["confidence_label"], "HIGH")
+            self.assertIn(summary["confirmation_label"], {"NORMAL", "STRONG"})
+            self.assertEqual(summary["entry_quality_label"], "GOOD_POSITION")
+
+        def test_phase2h_strong_phase1_weak_volume_candle_lowers_confidence(self) -> None:
+            good_bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 101.0],
+                highs=[99.7, 99.9, 100.1, 100.3, 100.6, 101.1],
+                lows=[99.3, 99.5, 99.7, 99.9, 100.2, 100.0],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            weak_bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 100.7],
+                highs=[99.7, 99.9, 100.1, 100.3, 100.6, 101.8],
+                lows=[99.3, 99.5, 99.7, 99.9, 100.2, 100.2],
+                volumes=[2000, 2000, 2000, 2000, 2000, 500],
+            )
+            good = self.strategy_summary(good_bars, {"pmh": 100.5}, rel_vol=2.0)
+            weak = self.strategy_summary(weak_bars, {"pmh": 100.5}, rel_vol=0.5)
+            self.assertLess(weak["confidence_score"], good["confidence_score"])
+            self.assertTrue(any("volume" in warning.lower() or "candle" in warning.lower() for warning in weak["warnings"]))
+
+        def test_phase2h_pressure_unknown_stays_neutral(self) -> None:
+            bars = self.make_strategy_bars([99.5, 99.7, 99.9, 100.1, 100.4, 101.0], volumes=[1000, 1000, 1000, 1000, 1200, 3500])
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0)
+            self.assertEqual(summary["pressure_label"], "UNKNOWN")
+            self.assertEqual(summary["pressure_score"], 50)
+
+        def test_phase2h_conflicting_signals_produce_warnings(self) -> None:
+            bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.4, 100.8],
+                volumes=[1000, 1000, 1000, 1000, 1200, 3500],
+            )
+            qqq = self.make_strategy_bars([100.0, 100.5, 101.0, 101.5, 102.0, 102.5])
+            spy = self.make_strategy_bars([100.0, 100.3, 100.6, 100.9, 101.2, 101.5])
+            summary = self.strategy_summary(bars, {"pmh": 100.5}, rel_vol=2.0, market_bars={"SPY": spy, "QQQ": qqq})
+            self.assertTrue(summary["warnings"])
+            self.assertTrue(any("relative strength" in warning.lower() or "market" in warning.lower() for warning in summary["warnings"]))
+
+        def test_phase2h_alert_formatting_includes_compact_confirmation_fields(self) -> None:
+            alert = Alert(
+                symbol="AAPL",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=101.25,
+                direction="BULLISH",
+                primary_setup="Breakout Retest Holding",
+                strategy_confidence_score=84,
+                strategy_confidence_label="HIGH",
+                confirmation_score=78,
+                confirmation_label="STRONG",
+                entry_quality_label="GOOD_POSITION",
+                risk_label="MEDIUM",
+                volume_label="STRONG",
+                rvol_detail=2.1,
+                candle_label="BUYER_CONTROL",
+                relative_strength_label="STRONG",
+                market_regime="BULL_TREND",
+            )
+            message = compact_alert_message(alert)
+            self.assertIn("confirm 78 STRONG", message)
+            self.assertIn("entry GOOD_POSITION", message)
+            self.assertIn("RS STRONG", message)
+            full = format_alert_message(alert)
+            self.assertIn("Confirmation:", full)
+            self.assertIn("Entry quality:", full)
+
+        def test_cleanup_entry_quality_falls_back_to_early_for_active_setup(self) -> None:
+            config = load_config(None)
+            config["strategy_engine"]["volume_confirm_multiplier"] = 1.2
+            config["strategy_engine"]["enable_retest_hold"] = False
+            config["strategy_engine"]["max_extension_from_vwap_pct"] = 5.0
+            config["strategy_engine"]["max_extension_from_ema9_pct"] = 5.0
+            config["confirmation"]["extension_exhaustion"]["max_extension_from_vwap_pct"] = 5.0
+            config["confirmation"]["extension_exhaustion"]["max_extension_from_ema9_pct"] = 5.0
+            config["confirmation"]["extension_exhaustion"]["max_extension_from_key_level_pct"] = 5.0
+            bars = self.make_strategy_bars(
+                [99.5, 99.7, 99.9, 100.1, 100.3, 100.55],
+                highs=[99.7, 99.9, 100.1, 100.3, 100.5, 100.65],
+                lows=[99.3, 99.5, 99.7, 99.9, 100.1, 100.35],
+                volumes=[1000, 1000, 1000, 1000, 1200, 2500],
+            )
+            summary = evaluate_strategy_suite("TEST", bars, bars[-1], config, {"pmh": 100.5}, 2.0, "ALIGNED")
+            self.assertIsNotNone(summary["primary_setup"])
+            self.assertEqual(summary["entry_quality_label"], "EARLY")
+
+        def test_cleanup_warning_priority_orders_before_trimming(self) -> None:
+            from strategies.scoring import _prioritized_warnings
+            warnings = [
+                "Everything else",
+                "Spread is wide for pressure confirmation",
+                "Small candle body shows indecision",
+                "RVOL 0.90x is below confirmation threshold",
+                "Fakeout Risk: broke above PMH but lost the level",
+                "Bullish setup lacks relative strength",
+                "Market regime is opposing the setup",
+                "Do Not Chase: price is too far extended from VWAP",
+            ]
+            ordered = _prioritized_warnings(warnings)
+            self.assertTrue(ordered[0].startswith("Do Not Chase"))
+            self.assertIn("Market regime", ordered[1])
+            self.assertIn("relative strength", ordered[2])
+            self.assertIn("Fakeout", ordered[3])
+
+        def test_cleanup_do_not_chase_risk_displays_loudly(self) -> None:
+            alert = Alert(
+                symbol="AAPL",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=101.25,
+                direction="BULLISH",
+                risk_label="DO_NOT_CHASE",
+            )
+            compact = compact_alert_message(alert)
+            self.assertIn("RISK: DO_NOT_CHASE", compact)
+            self.assertIn("valid setup may be late", compact)
+            full = format_alert_message(alert)
+            self.assertIn("RISK:", full)
+            self.assertIn("DO_NOT_CHASE", full)
+
+        def test_relative_volume(self) -> None:
+            config = load_config(None)
+            config["symbols"] = ["ASTS"]
+            config["symbols_with_options"] = ["ASTS"]
+            provider = MockProvider(["ASTS"])
+            notifier = DiscordNotifier(None)
+            writer = AlertWriter(LOG_DIR / "test_alerts.csv", LOG_DIR / "test_alerts.jsonl")
+            state = StateStore(STATE_DIR / "test_state.json")
+            scanner = EliteScanner(config, provider, notifier, writer, state)
+            snaps = scanner.build_snapshots()
+            snap = snaps["ASTS"]
+            self.assertTrue(len(snap.recent_bars) > 5)
+            rv = scanner.compute_relative_volume(snap.recent_bars)
+            self.assertIsNotNone(rv)
+
+        def test_alert_generation(self) -> None:
+            config = load_config(None)
+            config["symbols"] = ["ASTS"]
+            config["symbols_with_options"] = ["ASTS"]
+            config["fast_move_pct_threshold"] = 0.0
+            config["relative_volume_threshold"] = 0.0
+            provider = MockProvider(["ASTS"])
+            notifier = DiscordNotifier(None)
+            writer = AlertWriter(LOG_DIR / "test2_alerts.csv", LOG_DIR / "test2_alerts.jsonl")
+            state = StateStore(STATE_DIR / "test2_state.json")
+            scanner = EliteScanner(config, provider, notifier, writer, state)
+            snaps = scanner.build_snapshots()
+            alerts = scanner.evaluate_symbol(snaps["ASTS"])
+            self.assertTrue(len(alerts) >= 1)
+
+        def test_stale_snapshot_suppresses_alerts(self) -> None:
+            config = load_config(None)
+            config["symbols"] = ["ASTS"]
+            config["symbols_with_options"] = ["ASTS"]
+            config["fast_move_pct_threshold"] = 0.0
+            config["relative_volume_threshold"] = 0.0
+            old = now_utc() - timedelta(minutes=60)
+            bars = [
+                Bar(t=old + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.0 + i * 0.1, v=200000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(symbol="ASTS", latest_bar=bars[-1], recent_bars=bars)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["ASTS"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_stale_alerts.csv", LOG_DIR / "test_stale_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_stale_state.json"),
+            )
+            self.assertEqual(snapshot_data_quality(snap, config), "Stale")
+            self.assertEqual(scanner.evaluate_symbol(snap), [])
+
+        def test_session_anchor_prefers_regular_open(self) -> None:
+            config = load_config(None)
+            pre = set_today_time_et(config["premarket_start"]).astimezone(UTC)
+            open_t = set_today_time_et(config["market_open"]).astimezone(UTC)
+            bars = [
+                Bar(t=pre + timedelta(minutes=1), o=90.0, h=91.0, l=89.0, c=90.0, v=1000),
+                Bar(t=open_t, o=100.0, h=101.0, l=99.0, c=100.0, v=1000),
+                Bar(t=open_t + timedelta(minutes=1), o=101.0, h=102.0, l=100.0, c=101.0, v=1000),
+            ]
+            self.assertIs(session_anchor_bar(bars, config), bars[1])
+
+        def test_premarket_levels_from_premarket_only(self) -> None:
+            config = load_config(None)
+            pre = set_today_time_et(config["premarket_start"]).astimezone(UTC)
+            open_t = set_today_time_et(config["market_open"]).astimezone(UTC)
+            bars = [
+                Bar(t=pre + timedelta(minutes=1), o=10.0, h=12.0, l=9.0, c=11.0, v=1000),
+                Bar(t=open_t, o=20.0, h=30.0, l=19.0, c=25.0, v=1000),
+            ]
+            pre_bars = [b for b in bars if is_premarket_bar(b.t, config)]
+            self.assertEqual(max(b.h for b in pre_bars), 12.0)
+            self.assertEqual(min(b.l for b in pre_bars), 9.0)
+
+        def test_opening_range_requires_complete_bars(self) -> None:
+            config = load_config(None)
+            open_t = set_today_time_et(config["market_open"]).astimezone(UTC)
+            incomplete = [
+                Bar(t=open_t + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.0, v=1000)
+                for i in range(int(config["opening_range_minutes"]) - 1)
+            ]
+            complete = incomplete + [
+                Bar(t=open_t + timedelta(minutes=int(config["opening_range_minutes"]) - 1), o=100.0, h=101.0, l=99.0, c=100.0, v=1000)
+            ]
+            self.assertFalse(opening_range_complete(incomplete, config))
+            self.assertTrue(opening_range_complete(complete, config))
+
+        def option_contract(
+            self,
+            option_type: str = "C",
+            expiration: Optional[date] = None,
+            strike: float = 100.0,
+            bid: float = 1.95,
+            ask: float = 2.05,
+            quote_time: Optional[datetime] = None,
+            volume: int = 200,
+            open_interest: int = 500,
+            delta: Optional[float] = 0.45,
+        ) -> OptionContractSnapshot:
+            expiration = expiration or now_et().date()
+            quote_time = quote_time or now_utc()
+            if option_type == "P" and delta is not None and delta > 0:
+                delta = -delta
+            return OptionContractSnapshot(
+                symbol=option_symbol("TEST", expiration, option_type, strike),
+                underlying_symbol="TEST",
+                option_type=option_type,
+                expiration_date=expiration,
+                strike=strike,
+                bid=bid,
+                ask=ask,
+                quote_time=quote_time,
+                volume=volume,
+                open_interest=open_interest,
+                delta=delta,
+                implied_volatility=0.55,
+            )
+
+        def phase2_sms_fixture(self, direction: str = "BULLISH") -> tuple[EliteScanner, SymbolSnapshot, Alert]:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_phase2_sms_gate.csv", LOG_DIR / "test_phase2_sms_gate.jsonl"),
+                StateStore(STATE_DIR / "test_phase2_sms_gate_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            if direction == "BEARISH":
+                bars = [
+                    Bar(t=start + timedelta(minutes=i), o=105.0 - i * 0.2, h=105.2 - i * 0.2, l=104.2 - i * 0.25, c=104.5 - i * 0.25, v=50000)
+                    for i in range(12)
+                ]
+                snap = SymbolSnapshot(
+                    symbol="TEST",
+                    latest_bar=bars[-1],
+                    recent_bars=bars,
+                    premarket_low=102.5,
+                    opening_range_low=102.0,
+                    best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+                )
+                alert = Alert(
+                    symbol="TEST",
+                    timestamp=now_utc(),
+                    category="PREMARKET LOW BREAK",
+                    price=101.75,
+                    fast_move_pct=-1.1,
+                    day_move_pct=-2.2,
+                    relative_volume=2.1,
+                    primary_setup="5-Min ORB Short",
+                    strategy_direction="bearish",
+                    strategy_confidence_score=92,
+                    strategy_confidence_label="HIGH",
+                    confirmation_score=72,
+                    confirmation_label="STRONG",
+                    risk_label="LOW",
+                    entry_quality_label="GOOD_POSITION",
+                    volume_label="STRONG",
+                    candle_label="SELLER_CONTROL",
+                    market_regime="BEAR_TREND",
+                    relative_strength_label="NEUTRAL",
+                    strategy_results=[{"active": True, "direction": "bearish", "score": 92, "label": "5-Min ORB Short"}],
+                )
+            else:
+                bars = [
+                    Bar(t=start + timedelta(minutes=i), o=100.0 + i * 0.2, h=101.0 + i * 0.2, l=99.0 + i * 0.1, c=101.0 + i * 0.25, v=50000)
+                    for i in range(12)
+                ]
+                snap = SymbolSnapshot(
+                    symbol="TEST",
+                    latest_bar=bars[-1],
+                    recent_bars=bars,
+                    opening_range_high=103.2,
+                    best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+                )
+                alert = Alert(
+                    symbol="TEST",
+                    timestamp=now_utc(),
+                    category="OPENING RANGE BREAK UP",
+                    price=103.75,
+                    fast_move_pct=1.1,
+                    day_move_pct=2.2,
+                    relative_volume=2.1,
+                    primary_setup="5-Min ORB Long",
+                    strategy_direction="bullish",
+                    strategy_confidence_score=92,
+                    strategy_confidence_label="HIGH",
+                    confirmation_score=72,
+                    confirmation_label="STRONG",
+                    risk_label="LOW",
+                    entry_quality_label="GOOD_POSITION",
+                    volume_label="STRONG",
+                    candle_label="BUYER_CONTROL",
+                    market_regime="BULL_TREND",
+                    relative_strength_label="NEUTRAL",
+                    strategy_results=[{"active": True, "direction": "bullish", "score": 92, "label": "5-Min ORB Long"}],
+                )
+            return scanner, snap, alert
+
+        def test_phase2_direction_conflict_caps_grade_and_blocks_sms(self) -> None:
+            scanner, snap, alert = self.phase2_sms_fixture("BEARISH")
+            alert.primary_setup = "Bullish Liquidity Sweep Reclaim"
+            alert.strategy_direction = "bullish"
+            alert.strategy_results = [{"active": True, "direction": "bullish", "score": 88, "label": alert.primary_setup}]
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertLessEqual(graded.alert_score or 0, 54)
+            self.assertIn("Direction conflict", graded.text_alert_reason)
+
+        def test_phase2_weak_confirmation_caps_a_grade(self) -> None:
+            scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+            alert.confirmation_score = 58
+            alert.confirmation_label = "NORMAL"
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertLessEqual(graded.alert_score or 0, 69)
+            self.assertNotEqual(graded.alert_grade, "A+")
+
+        def test_phase2_high_and_do_not_chase_risk_block_sms(self) -> None:
+            for risk in ("HIGH", "DO_NOT_CHASE"):
+                scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+                alert.risk_label = risk
+                graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+                self.assertFalse(graded.sms_allowed)
+                self.assertIn(f"Phase 2 risk is {risk}", graded.text_alert_reason)
+
+        def test_phase2_choppy_unknown_market_blocks_sms_unless_strict_exception(self) -> None:
+            scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+            alert.market_regime = "CHOPPY"
+            alert.confirmation_score = 69
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("Market regime is CHOPPY", graded.text_alert_reason)
+
+            scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+            alert.market_regime = "UNKNOWN"
+            alert.strategy_confidence_score = 95
+            alert.confirmation_score = 72
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertTrue(graded.sms_allowed)
+
+        def test_phase2_indecision_or_rejection_candle_blocks_sms(self) -> None:
+            for candle in ("INDECISION", "REJECTION"):
+                scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+                alert.candle_label = candle
+                graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+                self.assertFalse(graded.sms_allowed)
+                self.assertIn(f"Candle quality is {candle}", graded.text_alert_reason)
+
+        def test_aapl_bearish_continuation_pullback_rejecting_label(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["AAPL"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_aapl_bearish_continuation.csv", LOG_DIR / "test_aapl_bearish_continuation.jsonl"),
+                StateStore(STATE_DIR / "test_aapl_bearish_continuation_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            closes = [316.0, 315.6, 315.0, 314.5, 314.0, 313.6, 313.2, 312.8, 312.5, 312.25, 312.05, 311.8]
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=close + 0.15, h=close + 0.30, l=close - 0.20, c=close, v=40000)
+                for i, close in enumerate(closes)
+            ]
+            bars[-1] = Bar(t=now_utc(), o=312.25, h=312.62, l=311.55, c=311.8, v=70000)
+            snap = SymbolSnapshot(
+                symbol="AAPL",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_low=313.8,
+                premarket_low=313.6,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="AAPL",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK DOWN",
+                price=311.8,
+                fast_move_pct=-0.9,
+                day_move_pct=-1.2,
+                relative_volume=1.2,
+                direction="BEARISH",
+            )
+            alert = scanner.attach_strategy_context(scanner.attach_option_context(alert, snap), snap, {"SPY": "BEARISH", "QQQ": "BEARISH"}, {"SPY": bars, "QQQ": bars})
+            self.assertEqual(alert.primary_setup, "Bearish Trend Continuation - Pullback Rejecting")
+            self.assertEqual(alert.entry_quality_label, "GOOD_POSITION")
+            graded = scanner.grade_alert(alert, snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            self.assertGreaterEqual(graded.confirmation_score or 0, 65)
+
+        def test_repeated_orb_short_sms_requires_improved_confirmation(self) -> None:
+            scanner, snap, first = self.phase2_sms_fixture("BEARISH")
+            first.category = "OPENING RANGE BREAK DOWN"
+            first.primary_setup = "5-Min ORB Short"
+            first.confirmation_score = 65
+            first.confirmation_label = "NORMAL"
+            key = scanner.orb_sms_state_key(first)
+            scanner.state_store.set_last_alert_time(key, now_utc())
+            scanner.state_store.data.setdefault("orb_sms_confirmation_scores", {})[key] = 66
+            graded = scanner.grade_alert(scanner.attach_option_context(first, snap), snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("repeated ORB SMS blocked", graded.text_alert_reason)
+
+            scanner, snap, improved = self.phase2_sms_fixture("BEARISH")
+            improved.category = "OPENING RANGE BREAK DOWN"
+            improved.primary_setup = "5-Min ORB Short"
+            improved.confirmation_score = 72
+            improved.confirmation_label = "STRONG"
+            key = scanner.orb_sms_state_key(improved)
+            scanner.state_store.set_last_alert_time(key, now_utc())
+            scanner.state_store.data.setdefault("orb_sms_confirmation_scores", {})[key] = 66
+            graded = scanner.grade_alert(scanner.attach_option_context(improved, snap), snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            self.assertTrue(graded.sms_allowed)
+
+        def test_options_selects_0dte_first(self) -> None:
+            config = load_config(None)
+            today = now_et().date()
+            weekly = today + timedelta(days=7)
+            chain = [
+                self.option_contract(expiration=weekly, strike=100.0),
+                self.option_contract(expiration=today, strike=100.0, bid=1.90, ask=2.00),
+            ]
+            selection = choose_best_option_contract(chain, "C", 100.0, config)
+            self.assertEqual(selection.contract.expiration_date, today)
+            self.assertEqual(selection.quality, "Tradable")
+
+        def test_options_falls_back_to_nearest_weekly(self) -> None:
+            config = load_config(None)
+            weekly = now_et().date() + timedelta(days=7)
+            selection = choose_best_option_contract([self.option_contract(expiration=weekly)], "C", 100.0, config)
+            self.assertEqual(selection.contract.expiration_date, weekly)
+
+        def test_options_rejects_wide_spread(self) -> None:
+            config = load_config(None)
+            selection = choose_best_option_contract([self.option_contract(bid=1.00, ask=1.50)], "C", 100.0, config)
+            self.assertEqual(selection.quality, "Wide spread")
+            self.assertEqual(selection.score, 0)
+
+        def test_options_rejects_stale_quote(self) -> None:
+            config = load_config(None)
+            stale = now_utc() - timedelta(minutes=10)
+            selection = choose_best_option_contract([self.option_contract(quote_time=stale)], "C", 100.0, config)
+            self.assertEqual(selection.quality, "Stale quote")
+
+        def test_options_rejects_delta_outside_range(self) -> None:
+            config = load_config(None)
+            selection = choose_best_option_contract([self.option_contract(delta=0.90)], "C", 100.0, config)
+            self.assertEqual(selection.quality, "No clean contract")
+
+        def test_directional_alert_prefers_call_or_put(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_options_alerts.csv", LOG_DIR / "test_options_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_options_state.json"),
+            )
+            call = OptionSelection(self.option_contract("C"), "Tradable", 90)
+            put = OptionSelection(self.option_contract("P"), "Tradable", 88)
+            snap = SymbolSnapshot(symbol="TEST", best_call=call, best_put=put)
+            bullish = Alert(symbol="TEST", timestamp=now_utc(), category="OPENING RANGE BREAK UP", price=100, fast_move_pct=1.0)
+            bearish = Alert(symbol="TEST", timestamp=now_utc(), category="OPENING RANGE BREAK DOWN", price=100, fast_move_pct=-1.0)
+            bearish_with_green_fast_move = Alert(symbol="TEST", timestamp=now_utc(), category="OPENING RANGE BREAK DOWN", price=100, fast_move_pct=1.0)
+            self.assertEqual(scanner.attach_option_context(bullish, snap).option_type, "CALL")
+            self.assertEqual(scanner.attach_option_context(bearish, snap).option_type, "PUT")
+            self.assertEqual(scanner.attach_option_context(bearish_with_green_fast_move, snap).option_type, "PUT")
+
+        def test_generic_momentum_uses_price_direction(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_direction_alerts.csv", LOG_DIR / "test_direction_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_direction_state.json"),
+            )
+            call = OptionSelection(self.option_contract("C"), "Tradable", 90)
+            put = OptionSelection(self.option_contract("P"), "Tradable", 88)
+            snap = SymbolSnapshot(symbol="TEST", best_call=call, best_put=put)
+            runner = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="CATALYST RUNNER",
+                price=602.69,
+                fast_move_pct=-0.18,
+                day_move_pct=-4.25,
+                relative_volume=4.73,
+            )
+            high_rvol = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="HIGH RELATIVE VOLUME",
+                price=602.69,
+                fast_move_pct=-0.18,
+                day_move_pct=-4.25,
+                relative_volume=4.73,
+            )
+            self.assertEqual(scanner.infer_alert_direction(runner), "BEARISH")
+            self.assertEqual(scanner.attach_option_context(runner, snap).option_type, "PUT")
+            self.assertEqual(scanner.infer_alert_direction(high_rvol), "BEARISH")
+            self.assertEqual(scanner.attach_option_context(high_rvol, snap).option_type, "PUT")
+
+        def test_low_quality_breakout_does_not_allow_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_low_quality_alerts.csv", LOG_DIR / "test_low_quality_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_low_quality_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.2, v=20000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=100.0,
+                best_call=OptionSelection(self.option_contract("C"), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=100.2,
+                fast_move_pct=0.1,
+                day_move_pct=0.2,
+                relative_volume=0.8,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn(graded.alert_grade, {"Avoid", "C"})
+
+        def test_strong_bullish_breakout_allows_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_strong_quality_alerts.csv", LOG_DIR / "test_strong_quality_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_strong_quality_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0 + i * 0.2, h=101.0 + i * 0.2, l=99.0, c=101.0 + i * 0.25, v=30000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=103.2,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=103.75,
+                fast_move_pct=1.1,
+                day_move_pct=2.2,
+                relative_volume=2.1,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertTrue(graded.sms_allowed)
+            self.assertIn(graded.alert_grade, {"B", "A", "A+"})
+
+        def test_phase2_direction_conflict_blocks_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_phase2_direction_conflict_alerts.csv", LOG_DIR / "test_phase2_direction_conflict_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_phase2_direction_conflict_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0 - i * 0.1, h=101.0, l=98.0 - i * 0.2, c=99.0 - i * 0.25, v=50000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=2.0, ask=2.04), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="PREMARKET LOW BREAK",
+                price=96.25,
+                fast_move_pct=-1.1,
+                day_move_pct=-2.2,
+                relative_volume=2.1,
+                primary_setup="Bullish Liquidity Sweep Reclaim",
+                strategy_direction="bullish",
+                strategy_confidence_score=88,
+                strategy_confidence_label="HIGH",
+                confirmation_score=78,
+                confirmation_label="STRONG",
+                risk_label="LOW",
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("Phase 2 setup direction conflicts with alert direction", graded.text_alert_reason)
+
+        def test_phase2_weak_confirmation_or_high_risk_blocks_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_phase2_weak_confirmation_alerts.csv", LOG_DIR / "test_phase2_weak_confirmation_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_phase2_weak_confirmation_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0 + i * 0.2, h=101.0 + i * 0.2, l=99.0, c=101.0 + i * 0.25, v=50000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=103.2,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=103.75,
+                fast_move_pct=1.1,
+                day_move_pct=2.2,
+                relative_volume=2.1,
+                primary_setup="5-Min ORB Long",
+                strategy_direction="bullish",
+                strategy_confidence_score=88,
+                strategy_confidence_label="HIGH",
+                confirmation_score=44,
+                confirmation_label="WEAK",
+                risk_label="HIGH",
+                strategy_warnings=["Candle quality contradicts bullish setup"],
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("Phase 2 has conflicting confirmation warnings", graded.text_alert_reason)
+
+        def test_strong_fast_break_allows_near_threshold_rvol_with_unknown_market(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_near_rvol_break_alerts.csv", LOG_DIR / "test_near_rvol_break_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_near_rvol_break_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0 + i * 0.2, h=101.0 + i * 0.2, l=99.0, c=101.0 + i * 0.25, v=30000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=103.2,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=103.55,
+                fast_move_pct=1.1,
+                day_move_pct=0.3,
+                relative_volume=1.45,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "UNKNOWN", "QQQ": "UNKNOWN"})
+            self.assertTrue(graded.sms_allowed)
+            self.assertIn(graded.alert_grade, {"B", "A", "A+"})
+
+        def test_weak_rvol_break_still_does_not_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_weak_rvol_break_alerts.csv", LOG_DIR / "test_weak_rvol_break_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_weak_rvol_break_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0 + i * 0.2, h=101.0 + i * 0.2, l=99.0, c=101.0 + i * 0.25, v=30000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=103.2,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=103.55,
+                fast_move_pct=1.1,
+                day_move_pct=0.3,
+                relative_volume=1.05,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "UNKNOWN", "QQQ": "UNKNOWN"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("RVOL is only moderate", graded.text_alert_reason)
+
+        def test_fast_clean_break_can_alert_before_hold_confirmation(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_fast_clean_break_alerts.csv", LOG_DIR / "test_fast_clean_break_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_fast_clean_break_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=102.0, l=99.0, c=101.8, v=30000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=start + timedelta(minutes=11), o=101.9, h=102.5, l=101.8, c=102.35, v=45000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=102.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=102.35,
+                fast_move_pct=0.35,
+                day_move_pct=1.8,
+                relative_volume=1.7,
+            )
+            enriched = scanner.attach_option_context(alert, snap)
+            graded = scanner.grade_alert(enriched, snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(scanner.breakout_hold_ok(graded, snap))
+            self.assertTrue(scanner.immediate_break_ok(graded, snap))
+            self.assertTrue(graded.sms_allowed)
+            self.assertIn("fast clean-break", graded.text_alert_reason)
+
+        def test_sms_upgrade_can_bypass_category_cooldown_after_non_text_alert(self) -> None:
+            config = load_config(None)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                scanner = EliteScanner(
+                    config,
+                    MockProvider(["TEST"]),
+                    DiscordNotifier(None),
+                    AlertWriter(Path(temp_dir) / "upgrade_alerts.csv", Path(temp_dir) / "upgrade_alerts.jsonl"),
+                    StateStore(Path(temp_dir) / "upgrade_state.json"),
+                )
+                first = Alert(
+                    symbol="TEST",
+                    timestamp=now_utc(),
+                    category="OPENING RANGE BREAK UP",
+                    price=102.2,
+                    fast_move_pct=0.2,
+                    day_move_pct=0.4,
+                    relative_volume=1.0,
+                    alert_grade="C",
+                    alert_score=40,
+                    sms_allowed=False,
+                    watch_allowed=False,
+                    setup_level="ALERT",
+                    text_alert_reason="below text-alert threshold",
+                )
+                second = Alert(
+                    symbol="TEST",
+                    timestamp=now_utc(),
+                    category="OPENING RANGE BREAK UP",
+                    price=103.0,
+                    fast_move_pct=1.1,
+                    day_move_pct=0.8,
+                    relative_volume=1.45,
+                    alert_grade="A",
+                    alert_score=84,
+                    sms_allowed=True,
+                    watch_allowed=False,
+                    setup_level="ALERT",
+                    text_alert_reason="passed checks",
+                )
+                self.assertTrue(scanner.process_alert(first))
+                self.assertTrue(scanner.process_alert(second))
+                self.assertTrue(any("text alert upgrade" in note for note in second.notes))
+                self.assertIsNotNone(scanner.state_store.get_last_alert_time(scanner.text_cooldown_key(second, "SMS")))
+
+        def test_extended_breakout_does_not_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_extended_break_alerts.csv", LOG_DIR / "test_extended_break_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_extended_break_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=104.0, l=99.0, c=103.3, v=30000)
+                for i in range(12)
+            ]
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=102.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK UP",
+                price=103.3,
+                fast_move_pct=1.0,
+                day_move_pct=2.2,
+                relative_volume=2.5,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("break already extended", graded.text_alert_reason)
+
+        def test_opening_range_watch_is_not_text_alert(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_or_watch_alerts.csv", LOG_DIR / "test_or_watch_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_or_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=102.0, l=99.0, c=101.6, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=101.7, h=102.0, l=101.6, c=101.93, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=102.0,
+                opening_range_low=99.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK UP")
+            self.assertEqual(watch.setup_level, "WATCH")
+            self.assertTrue(watch.watch_allowed)
+            self.assertFalse(watch.sms_allowed)
+
+        def test_opening_range_watch_can_fire_before_full_rvol_confirmation(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_early_or_watch_alerts.csv", LOG_DIR / "test_early_or_watch_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_early_or_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=100.2, l=99.0, c=99.6, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=99.35, h=99.4, l=99.04, c=99.06, v=10000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=100.2,
+                opening_range_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, None)
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK DOWN")
+            self.assertLess(watch.relative_volume or 0, config["alert_quality"]["watch_min_rvol"])
+            self.assertTrue(watch.watch_allowed)
+            self.assertFalse(watch.sms_allowed)
+
+        def test_premarket_watch_is_not_text_alert(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_premarket_watch_alerts.csv", LOG_DIR / "test_premarket_watch_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_premarket_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.4, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=100.5, h=100.9, l=100.4, c=100.88, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_high=101.0,
+                premarket_low=99.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH PREMARKET HIGH BREAK")
+            self.assertEqual(watch.trigger_level, 101.0)
+            self.assertTrue(watch.watch_allowed)
+            self.assertFalse(watch.sms_allowed)
+
+        def test_bearish_watch_can_warn_when_market_opposed_if_stock_specific(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            config["alert_quality"]["fast_impulse_watch_enabled"] = False
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_watch_opposed_alerts.csv", LOG_DIR / "test_watch_opposed_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_watch_opposed_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=99.6 - i * 0.02, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=99.3, h=99.4, l=99.0, c=99.05, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=101.0,
+                opening_range_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK DOWN")
+            self.assertEqual(watch.market_alignment, "OPPOSED")
+            self.assertTrue(watch.watch_allowed)
+            self.assertFalse(watch.sms_allowed)
+            self.assertIn("bearish stock-specific move", watch.text_alert_reason)
+
+        def test_bullish_watch_still_blocks_opposed_market_read(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_bullish_watch_opposed_alerts.csv", LOG_DIR / "test_bullish_watch_opposed_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_bullish_watch_opposed_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.0 + i * 0.02, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=100.6, h=100.92, l=100.5, c=100.88, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=101.0,
+                opening_range_low=99.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK UP")
+            self.assertEqual(watch.market_alignment, "OPPOSED")
+            self.assertFalse(watch.watch_allowed)
+
+        def test_opposed_bearish_watch_blocks_low_rvol_drift(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_opposed_bearish_low_rvol.csv", LOG_DIR / "test_opposed_bearish_low_rvol.jsonl"),
+                StateStore(STATE_DIR / "test_opposed_bearish_low_rvol_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=99.6 - i * 0.02, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=99.3, h=99.4, l=99.0, c=99.05, v=5000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=101.0,
+                opening_range_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK DOWN")
+            self.assertFalse(watch.watch_allowed)
+
+        def test_opposed_bearish_watch_blocks_weak_put_option(self) -> None:
+            config = load_config(None)
+            config["opening_range_minutes"] = 0
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_opposed_bearish_weak_put.csv", LOG_DIR / "test_opposed_bearish_weak_put.jsonl"),
+                StateStore(STATE_DIR / "test_opposed_bearish_weak_put_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=99.6 - i * 0.02, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=99.3, h=99.4, l=99.0, c=99.05, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=101.0,
+                opening_range_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=1.00, ask=1.25), "Wide spread", 40),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH OPENING RANGE BREAK DOWN")
+            self.assertFalse(watch.watch_allowed)
+
+        def test_opposed_bearish_alert_can_downgrade_to_watch_only(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_opposed_bearish_downgrade.csv", LOG_DIR / "test_opposed_bearish_downgrade.jsonl"),
+                StateStore(STATE_DIR / "test_opposed_bearish_downgrade_state.json"),
+            )
+            now = now_utc()
+            bars = [
+                Bar(t=now - timedelta(minutes=12 - i), o=100.0, h=100.3, l=99.5, c=100.0 - i * 0.08, v=20000)
+                for i in range(11)
+            ]
+            latest = Bar(t=now, o=99.0, h=99.1, l=98.35, c=98.4, v=26000)
+            bars.append(latest)
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=latest,
+                recent_bars=bars,
+                opening_range_high=101.0,
+                opening_range_low=99.0,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now,
+                category="OPENING RANGE BREAK DOWN",
+                price=98.4,
+                fast_move_pct=-0.24,
+                day_move_pct=-1.2,
+                relative_volume=1.0,
+                setup_level="ALERT",
+                trigger_level=99.0,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertEqual(graded.market_alignment, "OPPOSED")
+            self.assertFalse(graded.sms_allowed)
+            self.assertTrue(graded.watch_allowed)
+            self.assertIn("bearish stock-specific move", graded.text_alert_reason)
+
+        def test_bullish_reversal_watch_after_recent_bearish_watch(self) -> None:
+            config = load_config(None)
+            config["alert_quality"]["fast_impulse_watch_enabled"] = False
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = StateStore(Path(temp_dir) / "reversal_state.json")
+                state.set_last_alert_time(f"{now_et().strftime('%Y-%m-%d')}:WATCH:TEST:BEARISH", now_utc())
+                scanner = EliteScanner(
+                    config,
+                    MockProvider(["TEST"]),
+                    DiscordNotifier(None),
+                    AlertWriter(Path(temp_dir) / "reversal_alerts.csv", Path(temp_dir) / "reversal_alerts.jsonl"),
+                    state,
+                )
+                start = now_utc() - timedelta(minutes=11)
+                bars = [
+                    Bar(t=start + timedelta(minutes=i), o=100.0, h=101.0, l=99.0, c=100.0 + i * 0.02, v=20000)
+                    for i in range(11)
+                ]
+                bars.append(Bar(t=now_utc(), o=100.2, h=100.9, l=100.1, c=100.85, v=26000))
+                snap = SymbolSnapshot(
+                    symbol="TEST",
+                    latest_bar=bars[-1],
+                    recent_bars=bars,
+                    best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+                )
+                alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH REVERSAL UP")
+            self.assertTrue(watch.watch_allowed)
+            self.assertEqual(watch.direction, "BULLISH")
+            self.assertIn("reversal after recent opposite watch", watch.notes)
+
+        def test_same_scan_watch_favors_bullish_latest_move(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_same_scan_bullish_watch.csv", LOG_DIR / "test_same_scan_bullish_watch.jsonl"),
+                StateStore(STATE_DIR / "test_same_scan_bullish_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=100.4, h=101.0, l=100.3, c=100.4 + i * 0.03, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=100.55, h=100.9, l=100.5, c=100.85, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_high=101.0,
+                premarket_low=100.7,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, None)
+            bullish = next(alert for alert in alerts if alert.category == "WATCH PREMARKET HIGH BREAK")
+            bearish = next(alert for alert in alerts if alert.category == "WATCH PREMARKET LOW BREAK")
+            self.assertEqual(alerts.index(bullish), 0)
+            self.assertTrue(bullish.watch_allowed)
+            self.assertFalse(bearish.watch_allowed)
+            self.assertIn("latest fast move opposes setup direction", bearish.text_alert_reason)
+
+        def test_same_scan_watch_favors_bearish_latest_move(self) -> None:
+            config = load_config(None)
+            config["alert_quality"]["fast_impulse_watch_enabled"] = False
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_same_scan_bearish_watch.csv", LOG_DIR / "test_same_scan_bearish_watch.jsonl"),
+                StateStore(STATE_DIR / "test_same_scan_bearish_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=11)
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=101.2, h=101.4, l=100.8, c=101.2 - i * 0.02, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now_utc(), o=101.0, h=101.05, l=100.8, c=100.85, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_high=101.0,
+                premarket_low=100.7,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, None)
+            bearish = next(alert for alert in alerts if alert.category == "WATCH PREMARKET LOW BREAK")
+            bullish = next(alert for alert in alerts if alert.category == "WATCH PREMARKET HIGH BREAK")
+            self.assertEqual(alerts.index(bearish), 0)
+            self.assertTrue(bearish.watch_allowed)
+            self.assertFalse(bullish.watch_allowed)
+            self.assertIn("latest fast move opposes setup direction", bullish.text_alert_reason)
+
+        def test_failed_opening_range_breakout_creates_bearish_watch(self) -> None:
+            config = load_config(None)
+            config["alert_quality"]["fast_impulse_watch_enabled"] = False
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_failed_breakout_watch.csv", LOG_DIR / "test_failed_breakout_watch.jsonl"),
+                StateStore(STATE_DIR / "test_failed_breakout_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=12)
+            closes = [100.1, 100.2, 100.35, 100.55, 100.78, 101.15, 101.4, 101.2, 101.05, 100.85, 100.72]
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=close - 0.05, h=close + 0.08, l=close - 0.12, c=close, v=20000)
+                for i, close in enumerate(closes)
+            ]
+            bars.append(Bar(t=now_utc(), o=100.68, h=100.76, l=100.45, c=100.55, v=26000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                opening_range_high=100.7,
+                opening_range_low=99.2,
+                best_put=OptionSelection(self.option_contract("P", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BEARISH", "QQQ": "BEARISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH FAILED BREAKOUT DOWN")
+            self.assertTrue(watch.watch_allowed)
+            self.assertEqual(watch.direction, "BEARISH")
+            self.assertEqual(watch.trigger_level, 100.7)
+            self.assertIn("failed opening-range breakout reversal", watch.notes)
+
+        def test_bullish_break_does_not_text_when_fast_move_is_bearish(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["TEST"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_opposed_fast_move.csv", LOG_DIR / "test_opposed_fast_move.jsonl"),
+                StateStore(STATE_DIR / "test_opposed_fast_move_state.json"),
+            )
+            now = now_utc()
+            bars = [
+                Bar(t=now - timedelta(minutes=12 - i), o=100.0, h=101.0, l=99.8, c=100.0 + i * 0.08, v=20000)
+                for i in range(11)
+            ]
+            bars.append(Bar(t=now, o=101.0, h=101.2, l=100.6, c=100.85, v=36000))
+            snap = SymbolSnapshot(
+                symbol="TEST",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_high=100.2,
+                opening_range_high=100.4,
+                opening_range_low=99.0,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alert = Alert(
+                symbol="TEST",
+                timestamp=now,
+                category="PREMARKET HIGH BREAK",
+                price=100.85,
+                trigger_level=100.2,
+                setup_level="ALERT",
+                fast_move_pct=-0.16,
+                day_move_pct=0.25,
+                relative_volume=2.0,
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertEqual(graded.direction, "BULLISH")
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("latest fast move opposes setup direction", graded.text_alert_reason)
+
+        def test_sustained_index_trend_creates_bullish_watch_before_full_rvol(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["SPY"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_sustained_trend_watch.csv", LOG_DIR / "test_sustained_trend_watch.jsonl"),
+                StateStore(STATE_DIR / "test_sustained_trend_watch_state.json"),
+            )
+            start = now_utc() - timedelta(minutes=13)
+            closes = [757.72, 757.78, 757.83, 757.88, 757.94, 758.02, 758.08, 758.16, 758.25, 758.34, 758.43, 758.55, 758.64]
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=close - 0.03, h=close + 0.05, l=close - 0.06, c=close, v=20000)
+                for i, close in enumerate(closes)
+            ]
+            snap = SymbolSnapshot(
+                symbol="SPY",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                premarket_high=757.37,
+                opening_range_high=757.71,
+                opening_range_low=756.91,
+                best_call=OptionSelection(self.option_contract("C", bid=1.95, ask=2.02), "Tradable", 90),
+            )
+            alerts = scanner.evaluate_symbol(snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            watch = next(alert for alert in alerts if alert.category == "WATCH SUSTAINED TREND UP")
+            self.assertTrue(watch.watch_allowed)
+            self.assertFalse(watch.sms_allowed)
+            self.assertEqual(watch.direction, "BULLISH")
+            self.assertIn("sustained 12m trend move", " | ".join(watch.notes))
+
+        def test_fast_impulse_watch_detects_dramatic_regular_hours_jump(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["AAPL"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_fast_impulse_watch.csv", LOG_DIR / "test_fast_impulse_watch.jsonl"),
+                StateStore(STATE_DIR / "test_fast_impulse_watch_state.json"),
+            )
+            start = set_today_time_et(config["market_open"]).astimezone(UTC) + timedelta(minutes=40)
+            closes = [314.05, 314.04, 314.02, 314.03, 314.01, 314.00, 314.15, 314.44, 314.78, 315.12]
+            bars = [
+                Bar(t=start + timedelta(minutes=i), o=close - 0.08, h=close + 0.10, l=close - 0.12, c=close, v=25000)
+                for i, close in enumerate(closes)
+            ]
+            snap = SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)
+            watch = scanner.maybe_fast_impulse_watch(
+                snap,
+                bars[-1],
+                fast_move=pct_change(bars[-1].c, bars[-6].c),
+                day_move=1.2,
+                rel_vol=2.2,
+                notes=["data quality: Fresh"],
+            )
+            self.assertIsNotNone(watch)
+            assert watch is not None
+            self.assertEqual(watch.category, "WATCH FAST IMPULSE UP")
+            self.assertEqual(watch.setup_level, "WATCH")
+            self.assertIn("fast 3m impulse move", " | ".join(watch.notes))
+
+        def test_fast_impulse_watch_gets_clean_watch_reason(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["AAPL"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_fast_impulse_reason.csv", LOG_DIR / "test_fast_impulse_reason.jsonl"),
+                StateStore(STATE_DIR / "test_fast_impulse_reason_state.json"),
+            )
+            bars = [
+                Bar(t=now_utc() - timedelta(minutes=9 - i), o=100.0 + i * 0.1, h=100.3 + i * 0.1, l=99.9 + i * 0.1, c=100.1 + i * 0.1, v=25000)
+                for i in range(10)
+            ]
+            snap = SymbolSnapshot(
+                symbol="AAPL",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                best_call=OptionSelection(self.option_contract("C", bid=1.00, ask=1.04), "Tradable", 82),
+            )
+            alert = Alert(
+                symbol="AAPL",
+                timestamp=now_utc(),
+                category="WATCH FAST IMPULSE UP",
+                price=101.0,
+                fast_move_pct=0.35,
+                day_move_pct=1.0,
+                relative_volume=2.2,
+                option_quality="Tradable",
+                options_score=82,
+                option_spread_pct=3.9,
+                setup_level="WATCH",
+            )
+            graded = scanner.grade_alert(alert, snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertTrue(graded.watch_allowed)
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("fast impulse", graded.text_alert_reason)
+
+        def test_generic_high_rvol_does_not_text_when_day_trend_conflicts(self) -> None:
+            config = load_config(None)
+            scanner = EliteScanner(
+                config,
+                MockProvider(["NVDA"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_generic_day_conflict.csv", LOG_DIR / "test_generic_day_conflict.jsonl"),
+                StateStore(STATE_DIR / "test_generic_day_conflict_state.json"),
+            )
+            bars = [
+                Bar(t=now_utc() - timedelta(minutes=9 - i), o=100.0, h=100.4, l=99.8, c=100.1, v=25000)
+                for i in range(10)
+            ]
+            snap = SymbolSnapshot(
+                symbol="NVDA",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                best_call=OptionSelection(self.option_contract("C", bid=1.00, ask=1.03), "Tradable", 82),
+            )
+            alert = Alert(
+                symbol="NVDA",
+                timestamp=now_utc(),
+                category="HIGH RELATIVE VOLUME",
+                price=222.68,
+                fast_move_pct=0.16,
+                day_move_pct=-1.99,
+                relative_volume=3.8,
+                option_quality="Tradable",
+                options_score=82,
+                option_spread_pct=2.9,
+            )
+            graded = scanner.grade_alert(alert, snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertEqual(graded.direction, "BULLISH")
+            self.assertFalse(graded.sms_allowed)
+            self.assertIn("day trend conflicts with small fast move", graded.text_alert_reason)
+
+        def test_compact_alert_message_is_short_and_actionable(self) -> None:
+            alert = Alert(
+                symbol="NVDA",
+                timestamp=now_utc(),
+                category="OPENING RANGE BREAK DOWN",
+                price=212.25,
+                fast_move_pct=-0.42,
+                day_move_pct=-1.2,
+                relative_volume=2.4,
+                option_quality="Tradable",
+                option_spread_pct=3.1,
+                direction="BEARISH",
+                alert_grade="A",
+                setup_level="ALERT",
+                trigger_level=212.50,
+            )
+            message = compact_alert_message(alert)
+            self.assertIn("ALERT NVDA BEARISH", message)
+            self.assertIn("level 212.50", message)
+            self.assertIn("confirm in Webull", message)
+            self.assertLess(len(message), 180)
+
+        def test_messages_phone_list_supports_multiple_recipients(self) -> None:
+            numbers = parse_phone_numbers("2125550101, (917) 555-0102; 5551234567")
+            self.assertEqual(numbers, ["2125550101", "(917) 555-0102", "5551234567"])
+
+        def test_messages_phone_numbers_are_normalized(self) -> None:
+            self.assertEqual(normalize_phone_for_messages("2125550101"), "+12125550101")
+            self.assertEqual(normalize_phone_for_messages("(917) 555-0102"), "+19175550102")
+            self.assertEqual(normalize_phone_for_messages("+19175550102"), "+19175550102")
+
+        def test_dry_run_options_are_simulated_and_labeled(self) -> None:
+            config = load_config(None)
+            provider = MockProvider(["ASTS"])
+            chain = provider.get_option_chain("ASTS", config)
+            self.assertTrue(chain)
+            self.assertTrue(all(contract.is_simulated for contract in chain))
+            selection = choose_best_option_contract(chain, "C", provider._base_price("ASTS"), config)
+            alert = Alert(symbol="ASTS", timestamp=now_utc(), category="OPENING RANGE BREAK UP", price=100, fast_move_pct=1.0)
+            scanner = EliteScanner(
+                config,
+                provider,
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_sim_options_alerts.csv", LOG_DIR / "test_sim_options_alerts.jsonl"),
+                StateStore(STATE_DIR / "test_sim_options_state.json"),
+            )
+            snap = SymbolSnapshot(symbol="ASTS", best_call=selection)
+            enriched = scanner.attach_option_context(alert, snap)
+            self.assertTrue(any("simulated dry-run" in note for note in enriched.notes))
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(ScannerTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+def run_phone_push_test() -> int:
+    token = (os.getenv("PUSHOVER_APP_TOKEN") or "").strip()
+    user_key = (os.getenv("PUSHOVER_USER_KEY") or "").strip()
+    if not token or not user_key:
+        logger.error("Phone push is not configured. Add PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY to .env.")
+        return 2
+
+    payload = {
+        "token": token,
+        "user": user_key,
+        "title": "Elite Scanner Phone Push Test",
+        "message": "Phone notifications are connected. Future A/A+ scanner alerts can reach this phone. Confirm trades in Webull.",
+        "priority": 1,
+        "sound": "cashregister",
+    }
+    try:
+        resp = requests.post("https://api.pushover.net/1/messages.json", data=payload, timeout=20)
+    except Exception as exc:
+        logger.error("Pushover test failed before the server replied: %s", exc)
+        return 1
+    if resp.status_code != 200:
+        logger.error("Pushover test failed: HTTP %s %s", resp.status_code, resp.text[:500])
+        return 1
+    logger.info("Pushover phone push test sent successfully.")
+    return 0
+
+
+def run_desktop_notification_test() -> int:
+    script = """
+    display notification "Computer alerts are connected. Future high-quality scanner alerts will pop up here. Confirm trades in Webull." with title "Elite Scanner Test" subtitle "Desktop notifications" sound name "Glass"
+    """
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+    except Exception as exc:
+        logger.error("Mac desktop notification test failed: %s", exc)
+        return 1
+    logger.info("Mac desktop notification test sent successfully.")
+    return 0
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+def make_provider(mode: str, symbols: List[str], config: Optional[Dict[str, Any]] = None) -> DataProvider:
+    if mode in {"dry-run", "test"}:
+        return MockProvider(symbols)
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY for live mode.")
+    return AlpacaProvider(api_key, secret_key, feed=stock_feed_from_config(config or DEFAULT_CONFIG))
+
+
+def log_market_data_startup_status(provider: DataProvider, config: Dict[str, Any], symbol: str = "AAPL") -> Dict[str, Any]:
+    if isinstance(provider, AlpacaProvider):
+        status = provider.check_market_data_status(config, symbol=symbol)
+    else:
+        checked_at = now_utc().isoformat()
+        status = {
+            "timestamp": checked_at,
+            "last_data_check_time": checked_at,
+            "symbol": symbol,
+            "stock_feed_requested": "SIMULATED",
+            "stock_feed_status": "simulated",
+            "options_feed_requested": "SIMULATED",
+            "options_feed_status": "simulated",
+            "opra_status": "not_applicable",
+            "api_rate_limit_mode": "dry-run/test",
+            "websocket_symbol_limit": "dry-run/test",
+            "allow_indicative_options_fallback": bool(config.get("options", {}).get("allow_indicative_fallback", True)),
+            "feed_warning": "",
+        }
+    append_market_data_status(status)
+    logger.info("Market data status | Stock feed requested: %s", status.get("stock_feed_requested", "UNKNOWN"))
+    logger.info("Market data status | Options feed requested: %s", status.get("options_feed_requested", "UNKNOWN"))
+    logger.info("Market data status | OPRA status: %s", status.get("opra_status", "unknown"))
+    logger.info("Market data status | Options feed status: %s", status.get("options_feed_status", "unknown"))
+    logger.info("Market data status | API rate limit mode: %s", status.get("api_rate_limit_mode", "unknown"))
+    logger.info("Market data status | Websocket symbol limit: %s", status.get("websocket_symbol_limit", "unknown"))
+    if status.get("feed_warning"):
+        logger.warning("Market data status | %s", status["feed_warning"])
+    return status
+
+
+def main() -> int:
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Elite Momentum Scanner")
+    parser.add_argument("--mode", choices=["live", "dry-run", "test"], default="dry-run")
+    parser.add_argument("--config", type=str, help="Optional JSON config path")
+    parser.add_argument("--test-phone-push", action="store_true", help="Send a test Pushover phone notification")
+    parser.add_argument("--test-desktop-notification", action="store_true", help="Send a test Mac desktop notification")
+    args = parser.parse_args()
+
+    config_path = Path(args.config).resolve() if args.config else None
+    config = load_config(config_path)
+
+    if args.test_phone_push:
+        return run_phone_push_test()
+
+    if args.test_desktop_notification:
+        return run_desktop_notification_test()
+
+    if args.mode == "test":
+        return run_tests()
+
+    provider = make_provider(args.mode, list(config["symbols"]), config)
+    notifier = make_notifier(config)
+    writer = AlertWriter(Path(config["outputs"]["csv_log"]), Path(config["outputs"]["jsonl_log"]))
+    state = StateStore(Path(config["outputs"]["state_file"]))
+    scanner = EliteScanner(config, provider, notifier, writer, state)
+
+    if args.mode == "dry-run":
+        logger.info("Running dry-run scanner. Press Ctrl+C to stop.")
+    else:
+        logger.info("Running live scanner. Press Ctrl+C to stop.")
+    if config.get("notifications", {}).get("telegram_send_test_on_start", False):
+        send_telegram_test_message(config)
+    log_market_data_startup_status(provider, config, symbol=(config.get("symbols") or ["AAPL"])[0])
+    scanner.run_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,26 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+.venv.*/
+__pycache__/
+*.py[cod]
+
+# Runtime data and generated exports
+logs/
+state/
+exports/
+dashboard_export_*.json
+*.pid
+*.log
+*.out
+*.err
+
+# macOS and editor files
+.DS_Store
+.idea/
+.vscode/
+

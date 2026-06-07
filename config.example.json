@@ -1,0 +1,172 @@
+{
+  "symbols": ["AAPL"],
+  "scan_interval_seconds": 15,
+  "lookback_minutes_fast_move": 5,
+  "fast_move_pct_threshold": 1.5,
+  "day_move_pct_threshold": 4.0,
+  "relative_volume_threshold": 3.0,
+  "opening_range_minutes": 5,
+  "opening_range_break_buffer_pct": 0.1,
+  "alert_cooldown_seconds": 600,
+  "notifications": {
+    "mac_desktop_enabled": true,
+    "pushover_enabled": true,
+    "messages_enabled": true,
+    "messages_watch_enabled": true,
+    "telegram_enabled": false,
+    "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS"],
+    "telegram_aapl_only": true,
+    "telegram_send_test_on_start": false,
+    "telegram_timeout_seconds": 8
+  },
+  "filters": {
+    "min_price": 2.0,
+    "max_price": 1000.0,
+    "min_day_volume": 100000
+  },
+  "market_data": {
+    "stock_feed": "sip",
+    "api_rate_limit_mode": "Algo Trader Plus expected",
+    "websocket_symbol_limit": "paid/unlimited expected"
+  },
+  "alert_quality": {
+    "sms_symbol_cooldown_seconds": 1200,
+    "watch_symbol_cooldown_seconds": 600,
+    "sms_min_confirmation_score": 60,
+    "sms_strong_confirmation_score": 70,
+    "sms_block_choppy_market": true,
+    "sms_require_candle_alignment": true,
+    "sms_require_no_direction_conflict": true,
+    "sms_orb_dedupe_minutes": 15,
+    "a_plus_min_confirmation_score": 70,
+    "late_day_repeat_after": "14:30",
+    "late_day_generic_min_aligned_fast_move_pct": 0.12,
+    "late_day_generic_min_rvol": 3.5,
+    "trend_flip_watch_enabled": true
+  },
+  "strategy_engine": {
+    "enabled": true,
+    "enable_liquidity_sweep": true,
+    "enable_vwap_reclaim": true,
+    "enable_opening_range": true,
+    "enable_volume_quality": true,
+    "enable_candle_strength": true,
+    "enable_retest_hold": true,
+    "enable_extension_exhaustion": true,
+    "enable_relative_strength": true,
+    "enable_market_regime": true,
+    "enable_pressure_score": false,
+    "min_strategy_score_to_alert": 60,
+    "sweep_reclaim_candles": 3,
+    "volume_confirm_multiplier": 1.5,
+    "max_extension_from_vwap_pct": 0.6,
+    "max_extension_from_ema9_pct": 0.4,
+    "opening_range_minutes_primary": 5,
+    "opening_range_minutes_secondary": 15
+  },
+  "options": {
+    "enabled": true,
+    "feed": "opra",
+    "allow_indicative_fallback": true,
+    "expiry_mode": "0dte_then_weekly",
+    "delta_min": 0.3,
+    "delta_max": 0.6,
+    "max_spread_pct": 12,
+    "min_option_volume": 100,
+    "min_open_interest": 250,
+    "max_quote_age_seconds": 60,
+    "max_chain_contracts": 1000
+  },
+  "scenario_engine": {
+    "enabled": true,
+    "shadow_mode": false,
+    "control_dashboard": true,
+    "control_sms": false,
+    "enable_phase3_heads_up_alerts": true,
+    "phase3_heads_up_sms_enabled": true,
+    "phase3_heads_up_min_scenario_score": 80,
+    "phase3_heads_up_min_stock_score": 65,
+    "phase3_heads_up_min_confirmation_score": 55,
+    "phase3_good_position_min_scenario_score": 85,
+    "phase3_good_position_min_stock_score": 70,
+    "phase3_good_position_min_confirmation_score": 60,
+    "phase3_heads_up_dedupe_minutes": 15,
+    "phase3_heads_up_symbols": ["AAPL"],
+    "market_context_symbols": ["SPY", "QQQ"],
+    "phase3_late_warning_phone_enabled": false,
+    "phase3_late_warning_dedupe_minutes": 30,
+    "min_dashboard_score": 55,
+    "min_confirmed_score": 70,
+    "good_position_score": 75,
+    "dedupe_minutes": 10,
+    "option_logic_separate_from_stock_setup": true,
+    "options_do_not_hide_stock_setups": true,
+    "options_block_sms_only": true,
+    "opra_unavailable_allow_stock_dashboard": true,
+    "opra_unavailable_require_stronger_sms": true,
+    "sms_min_stock_setup_score": 70,
+    "sms_min_confirmation_score": 60,
+    "sms_strong_stock_setup_score": 85,
+    "sms_strong_confirmation_score": 70,
+    "sms_block_scenario_conflict": true,
+    "sms_require_good_stage": true
+  },
+  "confirmation": {
+    "volume_quality": {
+      "enabled": true,
+      "rvol_lookback_candles": 20,
+      "min_rvol_confirmation": 1.5,
+      "strong_rvol_confirmation": 2.0,
+      "climax_rvol_multiplier": 3.5,
+      "volume_exhaustion_candle_count": 3
+    },
+    "candle_strength": {
+      "enabled": true,
+      "buyer_control_close_top_pct": 25,
+      "seller_control_close_bottom_pct": 25,
+      "min_body_pct_for_control": 45,
+      "large_wick_pct": 40,
+      "indecision_body_pct": 25
+    },
+    "retest_hold": {
+      "enabled": true,
+      "retest_lookback_candles": 10,
+      "retest_max_distance_from_level_pct": 0.15,
+      "retest_confirm_candles": 2,
+      "retest_pullback_volume_max_multiplier": 1.2
+    },
+    "extension_exhaustion": {
+      "enabled": true,
+      "max_extension_from_vwap_pct": 0.6,
+      "max_extension_from_ema9_pct": 0.4,
+      "max_extension_from_key_level_pct": 0.3,
+      "consecutive_large_candle_limit": 3,
+      "do_not_chase_extension_score": 80
+    },
+    "relative_strength": {
+      "enabled": true,
+      "rs_lookback_candles": 5,
+      "rs_strong_diff_pct": 0.2,
+      "rs_weak_diff_pct": -0.2,
+      "market_confirm_symbols": ["SPY", "QQQ"]
+    },
+    "market_regime": {
+      "enabled": true,
+      "market_regime_lookback_candles": 15,
+      "choppy_vwap_cross_count": 3,
+      "trend_min_score": 65
+    },
+    "pressure_score": {
+      "enabled": false,
+      "pressure_lookback_trades": 50,
+      "large_print_multiplier": 3.0,
+      "min_pressure_score_confirmation": 60,
+      "max_spread_pct": 0.08,
+      "enable_quote_imbalance": true
+    }
+  },
+  "discord": {
+    "enabled": true,
+    "mention": ""
+  }
+}
