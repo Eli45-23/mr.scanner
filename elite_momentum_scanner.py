@@ -55,6 +55,7 @@ import logging
 import os
 import random
 import platform
+import re
 import socket
 import subprocess
 import tempfile
@@ -735,9 +736,20 @@ def parse_optional_dt(value: Any) -> Optional[datetime]:
     if isinstance(value, datetime):
         parsed = value
     else:
+        raw_value = str(value).strip()
+        # Alpaca OPRA timestamps can contain nanoseconds. Python versions
+        # differ in how many fractional-second digits fromisoformat accepts,
+        # so normalize to datetime's microsecond precision before parsing.
+        nanosecond_match = re.match(
+            r"^(.*T\d{2}:\d{2}:\d{2})\.(\d+)(Z|[+-]\d{2}:?\d{2})$",
+            raw_value,
+        )
+        if nanosecond_match:
+            prefix, fraction, suffix = nanosecond_match.groups()
+            raw_value = f"{prefix}.{fraction[:6]}{suffix}"
         try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
             return None
     # Alpaca timestamps are UTC. Treat a missing timezone as UTC so local
     # machine timezone settings cannot change quote freshness decisions.
@@ -777,10 +789,10 @@ def extract_quote_timestamp(quote: Any, symbol: Optional[str] = None) -> Dict[st
         mapping = safe_market_data_mapping(value)
         available_fields.extend(f"{path}.{key}" for key in mapping.keys())
         for name in candidate_names:
-            candidate = getattr(value, name, None)
-            if candidate is None:
-                candidate = mapping.get(name)
-            if parse_optional_dt(candidate):
+            # Prefer direct mapping access for Alpaca REST quote dictionaries.
+            # Timestamp field discovery must not depend on parsing succeeding.
+            candidate = mapping.get(name) if name in mapping else getattr(value, name, None)
+            if candidate is not None and candidate != "":
                 return candidate, f"{path}.{name}"
         nested_names = ("quotes", "latestQuote", "latest_quote", "quote", "raw", "raw_data")
         if symbol:
@@ -8012,6 +8024,26 @@ def run_tests() -> int:
                 self.assertIsNotNone(extracted["quote_timestamp_utc"])
                 self.assertEqual(extracted["timestamp_source_field"], expected_source)
                 self.assertFalse(extracted["timestamp_extraction_failed"])
+
+        def test_extract_quote_timestamp_handles_exact_alpaca_opra_dict(self) -> None:
+            raw = {
+                "ap": 0.04,
+                "as": 4,
+                "ax": "N",
+                "bp": 0.03,
+                "bs": 84,
+                "bx": "W",
+                "c": "A",
+                "t": "2026-06-08T19:59:59.964593176Z",
+            }
+            extracted = extract_quote_timestamp(raw)
+            self.assertEqual(extracted["timestamp_source_field"], "quote.t")
+            self.assertEqual(extracted["quote_timestamp_raw"], raw["t"])
+            self.assertEqual(
+                extracted["quote_timestamp_utc"],
+                datetime(2026, 6, 8, 19, 59, 59, 964593, tzinfo=UTC),
+            )
+            self.assertFalse(extracted["timestamp_extraction_failed"])
 
         def test_option_missing_quote_timestamp_recent_trade_is_diagnostic_only(self) -> None:
             config = load_config(None)
