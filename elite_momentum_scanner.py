@@ -556,6 +556,8 @@ class Alert:
     market_context_missing_warning: Optional[bool] = None
     option_stale_did_not_block_heads_up: Optional[bool] = None
     context_symbols_expected: List[str] = field(default_factory=list)
+    watch_only_late_move: Optional[bool] = None
+    do_not_chase_watch: Optional[bool] = None
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -1493,6 +1495,8 @@ class AlertWriter:
                 "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
                 "market_context_missing_warning": alert.market_context_missing_warning,
                 "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
+                "watch_only_late_move": alert.watch_only_late_move,
+                "do_not_chase_watch": alert.do_not_chase_watch,
             },
         )
         self._append_jsonl(
@@ -1552,7 +1556,9 @@ class AlertWriter:
                 "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
                 "market_context_missing_warning": alert.market_context_missing_warning,
                 "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
-                "telegram_attempted": False,
+                "watch_only_late_move": alert.watch_only_late_move,
+                "do_not_chase_watch": alert.do_not_chase_watch,
+                "telegram_attempted": bool(alert.phase3_heads_up_sent),
                 "telegram_sent": False,
                 "telegram_error": "",
                 "message_preview": alert.phase3_heads_up_message_preview,
@@ -1643,6 +1649,35 @@ def phase3_heads_up_message(alert: Alert) -> str:
     reason_text = ", ".join(reasons[:3]) if reasons else "Strong Phase 3 scenario read."
     early = alert.phase3_heads_up_type == "EARLY_WATCH"
     stock_only = alert.phase3_heads_up_type == "STOCK_ONLY_WARNING"
+    late_move = alert.phase3_heads_up_type == "WATCH_ONLY_LATE_MOVE"
+    do_not_chase_watch = alert.phase3_heads_up_type == "DO_NOT_CHASE_WATCH"
+    if do_not_chase_watch:
+        return "\n".join(
+            [
+                f"{alert.symbol} Watch-Only Warning",
+                "Do Not Chase",
+                "Price is extended.",
+                "Wait for pullback/retest.",
+                "Not a buy/sell signal.",
+                "Confirm manually on chart.",
+            ]
+        )
+    if late_move:
+        invalidation = scenario.get("invalidation_reason")
+        if not invalidation and scenario.get("invalidation_level") is not None:
+            invalidation = f"loses/recovers {float(scenario['invalidation_level']):.2f}"
+        lines = [
+            f"{alert.symbol} Phase 3 Watch-Only Heads-Up",
+            f"{direction_text} {scenario_name} — WATCH ONLY — LATE / DO NOT CHASE",
+            "This is not trade-ready.",
+            "Do not chase. Wait for pullback/retest.",
+            f"Score {alert.scenario_score or 0} | Stock {alert.stock_setup_score or 0} | Confirm {alert.confirmation_score or 0}",
+            f"Reason: {reason_text}",
+        ]
+        if invalidation:
+            lines.append(f"Invalidation: {invalidation}.")
+        lines.append("Confirm manually on chart.")
+        return "\n".join(lines)
     title = "Phase 3 Stock Heads-Up" if stock_only else "Phase 3 Early Heads-Up" if early else "Phase 3 Heads-Up"
     display_stage = f"{stage} WARNING" if stock_only and stage in {"LATE", "DO_NOT_CHASE"} else stage
     reminder = (
@@ -1687,7 +1722,8 @@ def phase3_heads_up_dedupe_key(alert: Alert) -> str:
     scenario_name = str(scenario.get("scenario_name") or alert.primary_setup or "SCENARIO").strip()
     direction = str(alert.scenario_direction or scenario.get("direction") or alert.direction or "MOMENTUM").upper()
     stage = str(alert.scenario_stage or scenario.get("stage") or "UNKNOWN").upper()
-    return f"{alert.symbol.upper()}|{scenario_name}|{stage}|{direction}|PHASE3_HEADS_UP"
+    alert_type = str(alert.phase3_heads_up_type or "PHASE3_HEADS_UP").upper()
+    return f"{alert.symbol.upper()}|{scenario_name}|{stage}|{direction}|{alert_type}"
 
 
 def phase3_heads_up_message_fingerprint(alert: Alert) -> str:
@@ -2184,6 +2220,17 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
         "dedupe_blocked": True,
         "dedupe_reason": alert.phase3_heads_up_dedupe_reason,
         "last_sent_at": alert.phase3_heads_up_last_sent_time,
+        "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
+        "stock_only_heads_up_reason": alert.stock_only_heads_up_reason,
+        "phase3_heads_up_final_decision": alert.phase3_heads_up_final_decision,
+        "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
+        "watch_only_late_move": alert.watch_only_late_move,
+        "do_not_chase_watch": alert.do_not_chase_watch,
+        "context_symbols_available": alert.context_symbols_available,
+        "market_confirmation_status": alert.market_confirmation_status,
+        "telegram_attempted": False,
+        "telegram_sent": False,
+        "telegram_error": "",
     }
     try:
         with (LOG_DIR / "phase3_heads_up.jsonl").open("a", encoding="utf-8") as handle:
@@ -2195,13 +2242,17 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
 def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -> None:
     if not alert.phase3_heads_up_eligible:
         return
+    alert.phase3_heads_up_final_decision = "SENT" if sent else "TELEGRAM_FAILED"
+    alert.phase3_heads_up_final_block_reason = "" if sent else redact_notification_error(error)
     payload = {
         "timestamp": now_utc().isoformat(),
         "symbol": alert.symbol,
-        "phase3_heads_up_final_decision": alert.phase3_heads_up_final_decision,
-        "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
+        "phase3_heads_up_final_decision": "SENT" if sent else "TELEGRAM_FAILED",
+        "phase3_heads_up_final_block_reason": "" if sent else redact_notification_error(error),
         "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
         "stock_only_heads_up_reason": alert.stock_only_heads_up_reason,
+        "watch_only_late_move": alert.watch_only_late_move,
+        "do_not_chase_watch": alert.do_not_chase_watch,
         "market_context_missing_warning": alert.market_context_missing_warning,
         "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
         "context_symbols_expected": alert.context_symbols_expected,
@@ -3360,6 +3411,8 @@ class EliteScanner:
         alert.phase3_heads_up_final_decision = "BLOCKED"
         alert.phase3_heads_up_final_block_reason = ""
         alert.option_stale_did_not_block_heads_up = False
+        alert.watch_only_late_move = False
+        alert.do_not_chase_watch = False
 
         def block(reason: str) -> None:
             alert.phase3_heads_up_block_reason = reason
@@ -3378,25 +3431,7 @@ class EliteScanner:
 
         scenario = alert.scenario_top
         scenario_name = str(scenario.get("scenario_name") or "").strip()
-        allowed_scenarios = {
-            "Pullback Holding",
-            "Pullback Rejecting",
-            "Bullish VWAP/EMA Reclaim Continuation",
-            "Bearish VWAP/EMA Rejection Continuation",
-            "Bullish Trend Continuation",
-            "Bearish Trend Continuation",
-            "Breakout Continuation",
-            "Failed VWAP/EMA Reclaim",
-        }
-        if scenario_name not in allowed_scenarios:
-            block(f"scenario {scenario_name or 'unknown'} is not heads-up eligible")
-            return
-
         scenario_direction = str(alert.scenario_direction or scenario.get("direction") or "").upper()
-        if scenario_direction not in {"BULLISH", "BEARISH"}:
-            block("top scenario has no bullish/bearish direction")
-            return
-
         if (data_quality or snapshot_data_quality(snap, self.config)) != "Fresh":
             block("Blocked: stale data")
             return
@@ -3410,6 +3445,60 @@ class EliteScanner:
         confirmation_score = int(alert.confirmation_score or 0)
         risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
         entry_quality = str(alert.entry_quality_label or "").upper()
+        available_context = set(alert.context_symbols_available)
+        has_spy_qqq = {"SPY", "QQQ"}.issubset(available_context)
+        context_aligned = str(alert.market_alignment or "").upper() == "ALIGNED"
+        context_ready = alert.market_confirmation_status == "AVAILABLE" or context_aligned
+        extended = (
+            str(alert.extension_label or "").upper() in {"EXTENDED", "VERY_EXTENDED", "DO_NOT_CHASE"}
+            or bool(scenario.get("do_not_chase"))
+            or any(
+                "extended" in str(item).lower()
+                for item in list(alert.scenario_reasons or []) + list(alert.scenario_warnings or [])
+            )
+        )
+        high_or_do_not_chase = "HIGH" in risk or "DO_NOT_CHASE" in risk
+        allowed_scenarios = {
+            "Pullback Holding",
+            "Pullback Rejecting",
+            "Bullish VWAP/EMA Reclaim Continuation",
+            "Bearish VWAP/EMA Rejection Continuation",
+            "Bullish Trend Continuation",
+            "Bearish Trend Continuation",
+            "Breakout Continuation",
+            "Failed VWAP/EMA Reclaim",
+        }
+        watch_only_late_move = (
+            alert.symbol.upper() == "AAPL"
+            and bool(phase3_heads_up_message(alert))
+            and not alert.scenario_conflict
+            and context_ready
+            and has_spy_qqq
+            and scenario_direction in {"BULLISH", "BEARISH"}
+            and scenario_score >= 80
+            and confirmation_score >= 50
+            and stock_score >= 50
+            and stage == "LATE"
+            and high_or_do_not_chase
+            and scenario_name in allowed_scenarios
+        )
+        do_not_chase_watch = (
+            alert.symbol.upper() == "AAPL"
+            and bool(phase3_heads_up_message(alert))
+            and scenario_name == "Do Not Chase"
+            and scenario_score >= 55
+            and (context_aligned or has_spy_qqq)
+            and extended
+        )
+        special_watch_only = watch_only_late_move or do_not_chase_watch
+
+        if not special_watch_only and scenario_name not in allowed_scenarios:
+            block(f"scenario {scenario_name or 'unknown'} is not heads-up eligible")
+            return
+        if not special_watch_only and scenario_direction not in {"BULLISH", "BEARISH"}:
+            block("top scenario has no bullish/bearish direction")
+            return
+
         failure_or_rejection = any(term in scenario_name.lower() for term in ("reject", "fail"))
         candle_opposes = self.phase2_candle_contradicts(alert, scenario_direction)
         stock_only_allowed = (
@@ -3421,6 +3510,20 @@ class EliteScanner:
             and (not candle_opposes or failure_or_rejection)
             and stage not in {"INVALIDATED"}
         )
+        if watch_only_late_move:
+            alert.watch_only_late_move = True
+            alert.stock_only_heads_up_allowed = True
+            alert.stock_only_heads_up_reason = (
+                "WATCH_ONLY_LATE_MOVE: aligned AAPL late/high-risk movement met watch thresholds"
+            )
+            alert.phase3_heads_up_type = "WATCH_ONLY_LATE_MOVE"
+        elif do_not_chase_watch:
+            alert.do_not_chase_watch = True
+            alert.stock_only_heads_up_allowed = True
+            alert.stock_only_heads_up_reason = (
+                "DO_NOT_CHASE_WATCH: extended AAPL move met watch-only threshold"
+            )
+            alert.phase3_heads_up_type = "DO_NOT_CHASE_WATCH"
 
         normal_block_reason = ""
         if stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}:
@@ -3442,13 +3545,14 @@ class EliteScanner:
         elif alert.extension_label in {"VERY_EXTENDED", "DO_NOT_CHASE"}:
             normal_block_reason = "Blocked: price is extremely extended"
 
-        if normal_block_reason and not stock_only_allowed:
+        if normal_block_reason and not stock_only_allowed and not special_watch_only:
             block(normal_block_reason)
             return
-        if normal_block_reason:
+        if normal_block_reason and not special_watch_only:
             alert.stock_only_heads_up_allowed = True
             alert.stock_only_heads_up_reason = normal_block_reason
             alert.phase3_heads_up_type = "STOCK_ONLY_WARNING"
+        if alert.stock_only_heads_up_allowed:
             if alert.option_quality in {"Stale quote", "Missing quote", "Unavailable"} or not alert.option_tradable:
                 alert.option_stale_did_not_block_heads_up = True
                 warning = "Option quote stale/missing — stock setup only."
@@ -3528,7 +3632,7 @@ class EliteScanner:
         alert.phase3_heads_up_sent = True
         alert.phase3_heads_up_block_reason = ""
         alert.phase3_heads_up_final_decision = (
-            "STOCK_ONLY_PHASE3_HEADS_UP" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
+            "TELEGRAM_ATTEMPTED" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
         )
         alert.phase3_heads_up_final_block_reason = ""
         alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
@@ -5932,7 +6036,7 @@ def run_tests() -> int:
             )
             scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh", {})
             self.assertTrue(alert.phase3_heads_up_sent)
-            self.assertEqual(alert.phase3_heads_up_final_decision, "STOCK_ONLY_PHASE3_HEADS_UP")
+            self.assertEqual(alert.phase3_heads_up_final_decision, "TELEGRAM_ATTEMPTED")
             self.assertTrue(alert.market_context_missing_warning)
             self.assertTrue(alert.option_stale_did_not_block_heads_up)
             message = phase3_heads_up_message(alert)
@@ -5954,6 +6058,120 @@ def run_tests() -> int:
             self.assertTrue(alert.phase3_heads_up_sent)
             self.assertFalse(alert.sms_allowed)
             self.assertIn("Do Not Chase — watch only.", alert.scenario_warnings)
+
+        def test_watch_only_late_move_with_aligned_context_sends_telegram_heads_up(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                risk_label="HIGH",
+                entry_quality_label="LATE",
+                scenario_stage="LATE",
+                scenario_score=83,
+                stock_setup_score=51,
+                confirmation_score=50,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 83},
+            )
+            scanner.evaluate_phase3_heads_up(
+                alert,
+                self.make_phase3_heads_up_snapshot(),
+                "Fresh",
+                {"SPY": "BULLISH", "QQQ": "BULLISH"},
+            )
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertTrue(alert.stock_only_heads_up_allowed)
+            self.assertTrue(alert.watch_only_late_move)
+            self.assertEqual(alert.phase3_heads_up_type, "WATCH_ONLY_LATE_MOVE")
+            self.assertEqual(alert.phase3_heads_up_final_decision, "TELEGRAM_ATTEMPTED")
+            self.assertFalse(alert.sms_allowed)
+            message = phase3_heads_up_message(alert)
+            self.assertIn("WATCH ONLY — LATE / DO NOT CHASE", message)
+            self.assertIn("This is not trade-ready.", message)
+            self.assertIn("Wait for pullback/retest.", message)
+
+        def test_watch_only_late_move_scenario_conflict_blocks(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                scenario_conflict=True,
+                risk_label="HIGH",
+                entry_quality_label="LATE",
+                scenario_stage="LATE",
+                scenario_score=83,
+                stock_setup_score=51,
+                confirmation_score=50,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 83},
+            )
+            scanner.evaluate_phase3_heads_up(
+                alert,
+                self.make_phase3_heads_up_snapshot(),
+                "Fresh",
+                {"SPY": "BULLISH", "QQQ": "BULLISH"},
+            )
+            self.assertFalse(alert.phase3_heads_up_sent)
+            self.assertFalse(alert.watch_only_late_move)
+
+        def test_do_not_chase_scenario_sends_watch_only_warning(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                direction="NEUTRAL",
+                strategy_direction="neutral",
+                scenario_direction="neutral",
+                risk_label="DO_NOT_CHASE",
+                entry_quality_label="DO_NOT_CHASE",
+                extension_label="VERY_EXTENDED",
+                scenario_stage="DO_NOT_CHASE",
+                scenario_score=58,
+                stock_setup_score=7,
+                confirmation_score=47,
+                scenario_top={
+                    "scenario_name": "Do Not Chase",
+                    "direction": "neutral",
+                    "stage": "DO_NOT_CHASE",
+                    "score": 58,
+                    "do_not_chase": True,
+                },
+            )
+            scanner.evaluate_phase3_heads_up(
+                alert,
+                self.make_phase3_heads_up_snapshot(),
+                "Fresh",
+                {"SPY": "BULLISH", "QQQ": "BULLISH"},
+            )
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertTrue(alert.do_not_chase_watch)
+            self.assertEqual(alert.phase3_heads_up_type, "DO_NOT_CHASE_WATCH")
+            self.assertFalse(alert.sms_allowed)
+            message = phase3_heads_up_message(alert)
+            self.assertIn("AAPL Watch-Only Warning", message)
+            self.assertIn("Not a buy/sell signal.", message)
+
+        def test_do_not_chase_watch_duplicate_is_deduped(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            kwargs = {
+                "direction": "NEUTRAL",
+                "strategy_direction": "neutral",
+                "scenario_direction": "neutral",
+                "risk_label": "DO_NOT_CHASE",
+                "entry_quality_label": "DO_NOT_CHASE",
+                "extension_label": "VERY_EXTENDED",
+                "scenario_stage": "DO_NOT_CHASE",
+                "scenario_score": 58,
+                "stock_setup_score": 7,
+                "confirmation_score": 47,
+                "scenario_top": {
+                    "scenario_name": "Do Not Chase",
+                    "direction": "neutral",
+                    "stage": "DO_NOT_CHASE",
+                    "score": 58,
+                    "do_not_chase": True,
+                },
+            }
+            context = {"SPY": "BULLISH", "QQQ": "BULLISH"}
+            first = self.make_phase3_heads_up_alert(**kwargs)
+            second = self.make_phase3_heads_up_alert(**kwargs)
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh", context)
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh", context)
+            self.assertTrue(first.phase3_heads_up_sent)
+            self.assertFalse(second.phase3_heads_up_sent)
+            self.assertTrue(second.phase3_heads_up_dedupe_blocked)
 
         def test_stock_only_phase3_duplicate_is_deduped(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
@@ -6227,6 +6445,7 @@ def run_tests() -> int:
             from unittest.mock import patch
             scanner = self.make_phase3_heads_up_scanner()
             alert = self.make_phase3_heads_up_alert()
+            alert.phase3_heads_up_type = "GOOD_POSITION"
             scanner.state_store.set_last_alert_time(scanner.phase3_heads_up_state_key(alert), now_utc())
             scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
             self.assertFalse(alert.phase3_heads_up_sent)
