@@ -1045,7 +1045,9 @@ def build_symbol_rows(
             "phase3_heads_up_block_reason": heads_up_alert.phase3_heads_up_block_reason if heads_up_alert else None,
             "phase3_heads_up_type": heads_up_alert.phase3_heads_up_type if heads_up_alert else None,
             "phase3_heads_up_dedupe_key": heads_up_alert.phase3_heads_up_dedupe_key if heads_up_alert else None,
+            "phase3_heads_up_message_fingerprint": heads_up_alert.phase3_heads_up_message_fingerprint if heads_up_alert else None,
             "phase3_heads_up_dedupe_blocked": heads_up_alert.phase3_heads_up_dedupe_blocked if heads_up_alert else None,
+            "phase3_heads_up_dedupe_reason": heads_up_alert.phase3_heads_up_dedupe_reason if heads_up_alert else None,
             "phase3_heads_up_last_sent_time": heads_up_alert.phase3_heads_up_last_sent_time if heads_up_alert else None,
             "phase3_heads_up_next_eligible_time": heads_up_alert.phase3_heads_up_next_eligible_time if heads_up_alert else None,
             "phase3_heads_up_dedupe_minutes_remaining": heads_up_alert.phase3_heads_up_dedupe_minutes_remaining if heads_up_alert else None,
@@ -2031,6 +2033,7 @@ INDEX_HTML = r"""<!doctype html>
         <div>Telegram enabled: <strong>${enabled ? 'Yes' : 'No'}</strong></div>
         <div>Telegram configured: <strong>${configured ? 'Yes' : 'No'}</strong></div>
         <div>Last Telegram alert: <strong>${fmtTime(status.last_telegram_alert_time)}</strong></div>
+        <div>Duplicate blocked: <strong>${status.telegram_duplicate_blocked ? 'Yes' : 'No'}</strong></div>
         <div>Active channels: <strong>${esc((status.active_alert_channels || []).join(', ') || 'None')}</strong></div>
         ${error ? `<div class="muted">Last error: ${esc(error)}</div>` : ''}
       `;
@@ -2597,6 +2600,8 @@ def run_tests() -> int:
             self.assertIn("phase3_heads_up_block_reason", rows[0])
             self.assertIn("phase3_heads_up_type", rows[0])
             self.assertIn("phase3_heads_up_dedupe_blocked", rows[0])
+            self.assertIn("phase3_heads_up_dedupe_reason", rows[0])
+            self.assertIn("phase3_heads_up_message_fingerprint", rows[0])
             self.assertIn("market_confirmation_status", rows[0])
             self.assertEqual(rows[0]["market_confirmation_status"], "AVAILABLE")
 
@@ -2608,6 +2613,7 @@ def run_tests() -> int:
             self.assertIn("Market Confirmation", INDEX_HTML)
             self.assertIn("Notification Status", INDEX_HTML)
             self.assertIn("Telegram configured", INDEX_HTML)
+            self.assertIn("Duplicate blocked", INDEX_HTML)
             self.assertIn("Active channels", INDEX_HTML)
 
         def test_dashboard_status_includes_telegram_without_exposing_token(self) -> None:

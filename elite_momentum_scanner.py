@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -75,6 +77,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
 NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
+PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 
 logger = logging.getLogger("elite_scanner")
 logging.basicConfig(
@@ -535,7 +538,9 @@ class Alert:
     phase3_heads_up_block_reason: Optional[str] = None
     phase3_heads_up_type: Optional[str] = None
     phase3_heads_up_dedupe_key: Optional[str] = None
+    phase3_heads_up_message_fingerprint: Optional[str] = None
     phase3_heads_up_dedupe_blocked: Optional[bool] = None
+    phase3_heads_up_dedupe_reason: Optional[str] = None
     phase3_heads_up_last_sent_time: Optional[str] = None
     phase3_heads_up_next_eligible_time: Optional[str] = None
     phase3_heads_up_dedupe_minutes_remaining: Optional[float] = None
@@ -1189,6 +1194,13 @@ class StateStore:
     def set_last_alert_time(self, key: str, dt: datetime) -> None:
         self.data.setdefault("last_alert_times", {})[key] = dt.astimezone(UTC).isoformat()
 
+    def get_phase3_heads_up_record(self, symbol: str) -> Optional[Dict[str, Any]]:
+        record = self.data.get("phase3_heads_up_records", {}).get(symbol.upper())
+        return dict(record) if isinstance(record, dict) else None
+
+    def set_phase3_heads_up_record(self, alert: Alert, dt: Optional[datetime] = None) -> None:
+        self.data.setdefault("phase3_heads_up_records", {})[alert.symbol.upper()] = phase3_heads_up_record(alert, dt)
+
 
 # ------------------------------------------------------------
 # Logging outputs
@@ -1458,7 +1470,9 @@ class AlertWriter:
                 "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
                 "phase3_heads_up_type": alert.phase3_heads_up_type,
                 "phase3_heads_up_dedupe_key": alert.phase3_heads_up_dedupe_key,
+                "phase3_heads_up_message_fingerprint": alert.phase3_heads_up_message_fingerprint,
                 "phase3_heads_up_dedupe_blocked": alert.phase3_heads_up_dedupe_blocked,
+                "phase3_heads_up_dedupe_reason": alert.phase3_heads_up_dedupe_reason,
                 "phase3_heads_up_last_sent_time": alert.phase3_heads_up_last_sent_time,
                 "phase3_heads_up_next_eligible_time": alert.phase3_heads_up_next_eligible_time,
                 "market_confirmation_status": alert.market_confirmation_status,
@@ -1506,7 +1520,10 @@ class AlertWriter:
                 "phase3_heads_up_sent": alert.phase3_heads_up_sent,
                 "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
                 "dedupe_key": alert.phase3_heads_up_dedupe_key,
+                "message_fingerprint": alert.phase3_heads_up_message_fingerprint,
                 "dedupe_blocked": alert.phase3_heads_up_dedupe_blocked,
+                "dedupe_reason": alert.phase3_heads_up_dedupe_reason,
+                "last_sent_at": alert.phase3_heads_up_last_sent_time,
                 "last_sent_time": alert.phase3_heads_up_last_sent_time,
                 "next_eligible_time": alert.phase3_heads_up_next_eligible_time,
                 "dedupe_minutes_remaining": alert.phase3_heads_up_dedupe_minutes_remaining,
@@ -1624,6 +1641,72 @@ def phase3_heads_up_message(alert: Alert) -> str:
         lines.append(f"Invalidation: {invalidation}.")
     lines.append(f"Reminder: {' '.join(warnings)}")
     return "\n".join(lines)
+
+
+def phase3_heads_up_dedupe_key(alert: Alert) -> str:
+    scenario = alert.scenario_top or {}
+    scenario_name = str(scenario.get("scenario_name") or alert.primary_setup or "SCENARIO").strip()
+    direction = str(alert.scenario_direction or scenario.get("direction") or alert.direction or "MOMENTUM").upper()
+    stage = str(alert.scenario_stage or scenario.get("stage") or "UNKNOWN").upper()
+    return f"{alert.symbol.upper()}|{scenario_name}|{stage}|{direction}|PHASE3_HEADS_UP"
+
+
+def phase3_heads_up_message_fingerprint(alert: Alert) -> str:
+    return hashlib.sha256(phase3_heads_up_message(alert).encode("utf-8")).hexdigest()
+
+
+def phase3_heads_up_record(alert: Alert, sent_at: Optional[datetime] = None) -> Dict[str, Any]:
+    scenario = alert.scenario_top or {}
+    return {
+        "sent_at": (sent_at or now_utc()).astimezone(UTC).isoformat(),
+        "dedupe_key": phase3_heads_up_dedupe_key(alert),
+        "message_fingerprint": phase3_heads_up_message_fingerprint(alert),
+        "symbol": alert.symbol.upper(),
+        "scenario": str(scenario.get("scenario_name") or alert.primary_setup or "SCENARIO").strip(),
+        "stage": str(alert.scenario_stage or scenario.get("stage") or "UNKNOWN").upper(),
+        "direction": str(alert.scenario_direction or scenario.get("direction") or alert.direction or "MOMENTUM").upper(),
+        "scenario_score": int(alert.scenario_score or scenario.get("score") or 0),
+        "key_level": (scenario.get("invalidation_level") if scenario else None),
+    }
+
+
+def phase3_heads_up_meaningful_change(previous: Dict[str, Any], current: Dict[str, Any]) -> Optional[str]:
+    if previous.get("scenario") != current.get("scenario"):
+        return "scenario changed"
+    if previous.get("direction") != current.get("direction"):
+        return "direction changed"
+    if previous.get("stage") != current.get("stage"):
+        return "scenario stage changed"
+    if abs(int(current.get("scenario_score") or 0) - int(previous.get("scenario_score") or 0)) >= 10:
+        return "scenario score changed by at least 10 points"
+    previous_level = previous.get("key_level")
+    current_level = current.get("key_level")
+    if previous_level is not None and current_level is not None and previous_level != current_level:
+        return "key level changed"
+    return None
+
+
+def phase3_heads_up_dedupe_decision(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+    dedupe_minutes: int,
+    now: Optional[datetime] = None,
+) -> Tuple[bool, str, Optional[datetime]]:
+    if not previous:
+        return True, "first Phase 3 heads-up", None
+    try:
+        last_sent = datetime.fromisoformat(str(previous.get("sent_at")))
+    except (TypeError, ValueError):
+        return True, "previous send time unavailable", None
+    current_time = now or now_utc()
+    if (current_time - last_sent).total_seconds() > dedupe_minutes * 60:
+        return True, "Phase 3 heads-up cooldown elapsed", last_sent
+    if previous.get("message_fingerprint") == current.get("message_fingerprint"):
+        return False, "duplicate blocked: identical Phase 3 heads-up fingerprint within cooldown", last_sent
+    meaningful_change = phase3_heads_up_meaningful_change(previous, current)
+    if meaningful_change:
+        return True, meaningful_change, last_sent
+    return False, "duplicate blocked: near-identical Phase 3 heads-up within cooldown", last_sent
 
 
 def format_alert_message(alert: Alert, markdown: bool = True) -> str:
@@ -1942,8 +2025,60 @@ def latest_notification_status(config: Optional[Dict[str, Any]] = None) -> Dict[
         "telegram_configured": configured,
         "last_telegram_alert_time": latest_sent.get("timestamp"),
         "last_telegram_error": latest_telegram.get("error") or "",
+        "telegram_duplicate_blocked": "duplicate" in str(latest_telegram.get("error") or "").lower(),
         "active_alert_channels": active_channels,
     }
+
+
+def claim_phase3_telegram_delivery(
+    alert: Alert,
+    dedupe_minutes: int,
+    state_path: Path = PHASE3_TELEGRAM_DEDUPE_STATE,
+) -> Tuple[bool, str, Optional[datetime]]:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state: Dict[str, Any] = {}
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                state = {}
+        current = phase3_heads_up_record(alert)
+        previous = state.get(alert.symbol.upper())
+        allowed, reason, last_sent = phase3_heads_up_dedupe_decision(previous, current, dedupe_minutes)
+        if allowed:
+            state[alert.symbol.upper()] = current
+            temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            temp_path.replace(state_path)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    return allowed, reason, last_sent
+
+
+def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
+    payload = {
+        "timestamp": now_utc().isoformat(),
+        "symbol": alert.symbol,
+        "direction": alert.scenario_direction or alert.direction,
+        "top_scenario": alert.scenario_top,
+        "scenario_stage": alert.scenario_stage,
+        "scenario_score": alert.scenario_score,
+        "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
+        "phase3_heads_up_sent": False,
+        "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
+        "dedupe_key": alert.phase3_heads_up_dedupe_key,
+        "message_fingerprint": alert.phase3_heads_up_message_fingerprint,
+        "dedupe_blocked": True,
+        "dedupe_reason": alert.phase3_heads_up_dedupe_reason,
+        "last_sent_at": alert.phase3_heads_up_last_sent_time,
+    }
+    try:
+        with (LOG_DIR / "phase3_heads_up.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        logger.warning("Phase 3 dedupe log failed: %s", redact_notification_error(exc))
 
 
 class TelegramNotifier:
@@ -1955,6 +2090,8 @@ class TelegramNotifier:
         alert_types: Optional[Iterable[str]] = None,
         aapl_only: bool = True,
         timeout_seconds: int = 8,
+        phase3_dedupe_minutes: int = 15,
+        phase3_dedupe_state_path: Path = PHASE3_TELEGRAM_DEDUPE_STATE,
     ) -> None:
         self.bot_token = (bot_token or "").strip()
         self.chat_id = (chat_id or "").strip()
@@ -1962,6 +2099,8 @@ class TelegramNotifier:
         self.alert_types = {str(value).strip().upper() for value in (alert_types or []) if str(value).strip()}
         self.aapl_only = aapl_only
         self.timeout_seconds = timeout_seconds
+        self.phase3_dedupe_minutes = phase3_dedupe_minutes
+        self.phase3_dedupe_state_path = phase3_dedupe_state_path
 
     def alert_type_for(self, alert: Alert) -> Optional[str]:
         if alert.phase3_heads_up_sent:
@@ -1982,6 +2121,30 @@ class TelegramNotifier:
             append_notification_status("telegram", alert_type, alert.symbol, False, "Telegram bot token or chat ID is missing")
             return
         message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
+        if alert_type == "PHASE3_HEADS_UP":
+            allowed, reason, last_sent = claim_phase3_telegram_delivery(
+                alert,
+                self.phase3_dedupe_minutes,
+                self.phase3_dedupe_state_path,
+            )
+            alert.phase3_heads_up_dedupe_key = phase3_heads_up_dedupe_key(alert)
+            alert.phase3_heads_up_message_fingerprint = phase3_heads_up_message_fingerprint(alert)
+            alert.phase3_heads_up_dedupe_reason = reason
+            if not allowed:
+                alert.phase3_heads_up_sent = False
+                alert.phase3_heads_up_dedupe_blocked = True
+                alert.phase3_heads_up_block_reason = reason
+                alert.phase3_heads_up_last_sent_time = last_sent.isoformat() if last_sent else None
+                append_phase3_telegram_dedupe_block(alert)
+                append_notification_status(
+                    "telegram",
+                    alert_type,
+                    alert.symbol,
+                    False,
+                    f"duplicate blocked: {reason}",
+                    message,
+                )
+                return
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
@@ -2061,6 +2224,7 @@ def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
             alert_types=telegram_alert_types,
             aapl_only=bool(notification_config.get("telegram_aapl_only", True)),
             timeout_seconds=int(notification_config.get("telegram_timeout_seconds", 8)),
+            phase3_dedupe_minutes=int(config.get("scenario_engine", {}).get("phase3_heads_up_dedupe_minutes", 15)),
         ),
     ])
 
@@ -2956,12 +3120,8 @@ class EliteScanner:
         return [value for value in values if value]
 
     def phase3_heads_up_state_key(self, alert: Alert) -> str:
-        scenario = alert.scenario_top or {}
-        scenario_name = str(scenario.get("scenario_name") or alert.primary_setup or "SCENARIO").upper()
-        direction = str(alert.scenario_direction or scenario.get("direction") or alert.direction or "MOMENTUM").upper()
-        stage = str(alert.scenario_stage or scenario.get("stage") or "UNKNOWN").upper()
         day_key = alert.timestamp.astimezone(ET).strftime("%Y-%m-%d")
-        return f"{day_key}:PHASE3_HEADS_UP:{alert.symbol}:{direction}:{scenario_name}:{stage}"
+        return f"{day_key}:{phase3_heads_up_dedupe_key(alert)}"
 
     def evaluate_phase3_heads_up(
         self,
@@ -2976,7 +3136,9 @@ class EliteScanner:
         alert.phase3_heads_up_block_reason = ""
         alert.phase3_heads_up_type = "BLOCKED"
         alert.phase3_heads_up_dedupe_key = None
+        alert.phase3_heads_up_message_fingerprint = None
         alert.phase3_heads_up_dedupe_blocked = False
+        alert.phase3_heads_up_dedupe_reason = None
         alert.phase3_heads_up_last_sent_time = None
         alert.phase3_heads_up_next_eligible_time = None
         alert.phase3_heads_up_dedupe_minutes_remaining = None
@@ -3095,11 +3257,25 @@ class EliteScanner:
             return
 
         key = self.phase3_heads_up_state_key(alert)
-        alert.phase3_heads_up_dedupe_key = key
+        alert.phase3_heads_up_dedupe_key = phase3_heads_up_dedupe_key(alert)
+        alert.phase3_heads_up_message_fingerprint = phase3_heads_up_message_fingerprint(alert)
         self.state_store.load()
-        last = self.state_store.get_last_alert_time(key)
         dedupe_minutes = int(config.get("phase3_heads_up_dedupe_minutes", 15))
-        if last and (now_utc() - last).total_seconds() <= dedupe_minutes * 60:
+        current_record = phase3_heads_up_record(alert)
+        previous_record = self.state_store.get_phase3_heads_up_record(alert.symbol)
+        allowed, dedupe_reason, last = phase3_heads_up_dedupe_decision(
+            previous_record,
+            current_record,
+            dedupe_minutes,
+        )
+        if previous_record is None:
+            legacy_last = self.state_store.get_last_alert_time(key)
+            if legacy_last and (now_utc() - legacy_last).total_seconds() <= dedupe_minutes * 60:
+                allowed = False
+                dedupe_reason = "duplicate Phase 3 heads-up blocked by legacy cooldown"
+                last = legacy_last
+        alert.phase3_heads_up_dedupe_reason = dedupe_reason
+        if not allowed and last:
             next_eligible = last + timedelta(minutes=dedupe_minutes)
             alert.phase3_heads_up_dedupe_blocked = True
             alert.phase3_heads_up_last_sent_time = last.isoformat()
@@ -3108,7 +3284,7 @@ class EliteScanner:
                 max(0.0, (next_eligible - now_utc()).total_seconds() / 60.0),
                 1,
             )
-            block("duplicate Phase 3 heads-up blocked by dedupe")
+            block(dedupe_reason)
             return
 
         alert.phase3_heads_up_sent = True
@@ -3116,6 +3292,10 @@ class EliteScanner:
         alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
         alert.notes.append("Phase 3 heads-up only: confirm on chart")
         alert.phase3_heads_up_message_preview = phase3_heads_up_message(alert)
+        claim_time = now_utc()
+        self.state_store.set_last_alert_time(key, claim_time)
+        self.state_store.set_phase3_heads_up_record(alert, claim_time)
+        self.state_store.save()
 
     def grade_alert(self, alert: Alert, snap: SymbolSnapshot, market_context: Optional[Dict[str, str]]) -> Alert:
         quality_config = self.config.get("alert_quality", {})
@@ -5509,6 +5689,75 @@ def run_tests() -> int:
             self.assertTrue(second.phase3_heads_up_dedupe_blocked)
             self.assertIsNotNone(second.phase3_heads_up_next_eligible_time)
             self.assertIn("duplicate", second.phase3_heads_up_block_reason.lower())
+            self.assertIsNotNone(second.phase3_heads_up_message_fingerprint)
+            self.assertIsNotNone(second.phase3_heads_up_dedupe_reason)
+
+        def test_phase3_heads_up_same_setup_after_cooldown_is_allowed(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert()
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            old = now_utc() - timedelta(minutes=16)
+            scanner.state_store.set_phase3_heads_up_record(first, old)
+            scanner.state_store.set_last_alert_time(scanner.phase3_heads_up_state_key(first), old)
+            scanner.state_store.save()
+            second = self.make_phase3_heads_up_alert()
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(second.phase3_heads_up_sent)
+            self.assertIn("cooldown elapsed", second.phase3_heads_up_dedupe_reason or "")
+
+        def test_phase3_heads_up_stage_change_is_allowed_during_cooldown(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert(
+                scenario_stage="FORMING",
+                entry_quality_label="EARLY",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "FORMING", "score": 84},
+                scenario_score=84,
+            )
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            second = self.make_phase3_heads_up_alert(
+                scenario_stage="GOOD_POSITION",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "GOOD_POSITION", "score": 87},
+            )
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(second.phase3_heads_up_sent)
+            self.assertEqual(second.phase3_heads_up_dedupe_reason, "scenario stage changed")
+
+        def test_phase3_heads_up_scenario_change_is_allowed_during_cooldown(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert()
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            second = self.make_phase3_heads_up_alert(
+                scenario_top={"scenario_name": "Bullish Trend Continuation", "direction": "bullish", "stage": "CONFIRMED", "score": 87},
+            )
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(second.phase3_heads_up_sent)
+            self.assertEqual(second.phase3_heads_up_dedupe_reason, "scenario changed")
+
+        def test_phase3_heads_up_score_change_ten_points_is_allowed_during_cooldown(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            first = self.make_phase3_heads_up_alert(
+                scenario_score=80,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "CONFIRMED", "score": 80},
+            )
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            second = self.make_phase3_heads_up_alert(
+                scenario_score=90,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "CONFIRMED", "score": 90},
+            )
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(second.phase3_heads_up_sent)
+            self.assertIn("10 points", second.phase3_heads_up_dedupe_reason or "")
+
+        def test_phase3_heads_up_premarket_duplicate_is_blocked(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            premarket = set_today_time_et("08:15").astimezone(UTC)
+            first = self.make_phase3_heads_up_alert(timestamp=premarket)
+            second = self.make_phase3_heads_up_alert(timestamp=premarket + timedelta(seconds=20))
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(first.phase3_heads_up_sent)
+            self.assertFalse(second.phase3_heads_up_sent)
+            self.assertTrue(second.phase3_heads_up_dedupe_blocked)
 
         def test_phase3_heads_up_dedupe_key_includes_stage(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
@@ -5619,6 +5868,30 @@ def run_tests() -> int:
             with patch("requests.post") as post:
                 notifier.send(alert)
             post.assert_not_called()
+
+        def test_telegram_phase3_identical_alert_three_times_only_sends_once(self) -> None:
+            from unittest.mock import Mock, patch
+            temp_dir = Path(tempfile.mkdtemp())
+            notifier = TelegramNotifier(
+                "secret-token",
+                "123",
+                enabled=True,
+                alert_types=["PHASE3_HEADS_UP"],
+                phase3_dedupe_state_path=temp_dir / "telegram_dedupe.json",
+            )
+            alerts = [self.make_phase3_heads_up_alert() for _ in range(3)]
+            for alert in alerts:
+                alert.phase3_heads_up_sent = True
+                alert.phase3_heads_up_type = "GOOD_POSITION"
+            response = Mock()
+            response.raise_for_status.return_value = None
+            with patch("requests.post", return_value=response) as post:
+                for alert in alerts:
+                    notifier.send(alert)
+            self.assertEqual(post.call_count, 1)
+            self.assertFalse(alerts[1].phase3_heads_up_sent)
+            self.assertFalse(alerts[2].phase3_heads_up_sent)
+            self.assertTrue(alerts[1].phase3_heads_up_dedupe_blocked)
 
         def test_telegram_env_config(self) -> None:
             previous = self.with_env(
