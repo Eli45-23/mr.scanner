@@ -60,6 +60,7 @@ def package_data(root: Path) -> dict[str, Any]:
     heads = read_jsonl(root, "phase3_heads_up.jsonl")
     startups = read_jsonl(root, "scanner_startup_status.jsonl")
     market = read_jsonl(root, "market_data_status.jsonl")
+    options = read_jsonl(root, "option_quality_decisions.jsonl")
     latest_start = startups[-1] if startups else {}
     latest_market = market[-1] if market else {}
     return {
@@ -68,6 +69,7 @@ def package_data(root: Path) -> dict[str, Any]:
         "heads": heads,
         "identity": latest_start,
         "market": latest_market,
+        "options": options,
         "counts": Counter(alert_type(row) for row in notifications),
     }
 
@@ -135,6 +137,28 @@ def main() -> int:
         right = package_data(unpack(Path(args.right).resolve(), temp))
     timeline = compare_events(left["notifications"], right["notifications"])
     decision_differences = compare_decisions(left["scenarios"], right["scenarios"])
+    def option_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        qualities = Counter(
+            str(
+                row.get("option_quality_label")
+                or ("Tradable" if row.get("option_tradable") else None)
+                or row.get("stale_reason")
+                or row.get("option_warning")
+                or "unknown"
+            )
+            for row in rows
+        )
+        ages = [float(row["quote_age_seconds"]) for row in rows if isinstance(row.get("quote_age_seconds"), (int, float))]
+        reasons = Counter(str(row.get("stale_reason") or "none") for row in rows)
+        return {
+            "quality_counts": dict(qualities),
+            "average_quote_age_seconds": round(sum(ages) / len(ages), 2) if ages else None,
+            "max_quote_age_seconds": max(ages) if ages else None,
+            "option_symbols": sorted({str(row.get("selected_option_symbol")) for row in rows if row.get("selected_option_symbol")}),
+            "stale_reasons": dict(reasons),
+        }
+    left_options = option_summary(left["options"])
+    right_options = option_summary(right["options"])
     summary = {
         "left_name": args.left_name,
         "right_name": args.right_name,
@@ -146,6 +170,8 @@ def main() -> int:
         "right_alert_counts": dict(right["counts"]),
         "timeline": timeline,
         "decision_differences": decision_differences,
+        "left_option_data": left_options,
+        "right_option_data": right_options,
     }
     json_path = output.with_suffix(".json")
     csv_path = output.with_suffix(".csv")
@@ -161,7 +187,23 @@ def main() -> int:
     lines += ["", "## Alert Counts", "", "| Alert Type | Left | Right |", "| --- | ---: | ---: |"]
     for key in sorted(set(left["counts"]) | set(right["counts"])):
         lines.append(f"| {key} | {left['counts'].get(key, 0)} | {right['counts'].get(key, 0)} |")
-    lines += ["", "## Timeline and Decisions", "", f"- Left events: {len(left['notifications'])}", f"- Right events: {len(right['notifications'])}", f"- Left events matched within 60 seconds: {sum(1 for row in timeline if row['match_within_60s'])}", f"- Scenario decision differences within 60 seconds: {len(decision_differences)}", "", f"JSON: `{json_path}`", f"CSV: `{csv_path}`", ""]
+    lines += [
+        "", "## Option Data Comparison", "",
+        f"- {args.left_name} quality counts: {left_options['quality_counts']}",
+        f"- {args.right_name} quality counts: {right_options['quality_counts']}",
+        f"- {args.left_name} average/max quote age: {left_options['average_quote_age_seconds']} / {left_options['max_quote_age_seconds']}",
+        f"- {args.right_name} average/max quote age: {right_options['average_quote_age_seconds']} / {right_options['max_quote_age_seconds']}",
+        f"- {args.left_name} stale reasons: {left_options['stale_reasons']}",
+        f"- {args.right_name} stale reasons: {right_options['stale_reasons']}",
+        "- Likely cause when only one machine is mostly stale: timezone/config/code-version mismatch or cached old quote timestamps.",
+        "- Recommended check: run `tools/check_option_quote_freshness.py --symbol AAPL` on both machines using the same commit and profile.",
+        "", "## Timeline and Decisions", "",
+        f"- Left events: {len(left['notifications'])}",
+        f"- Right events: {len(right['notifications'])}",
+        f"- Left events matched within 60 seconds: {sum(1 for row in timeline if row['match_within_60s'])}",
+        f"- Scenario decision differences within 60 seconds: {len(decision_differences)}",
+        "", f"JSON: `{json_path}`", f"CSV: `{csv_path}`", ""
+    ]
     output.write_text("\n".join(lines), encoding="utf-8")
     print(f"Markdown: {output}")
     print(f"JSON: {json_path}")

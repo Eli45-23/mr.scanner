@@ -60,7 +60,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
@@ -404,6 +404,7 @@ def scanner_identity(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         alert_types = [part.strip().upper() for part in alert_types.split(",") if part.strip()]
     return {
         "scanner_instance_name": os.getenv("SCANNER_INSTANCE_NAME", "").strip() or socket.gethostname(),
+        "machine_name": os.getenv("SCANNER_INSTANCE_NAME", "").strip() or socket.gethostname(),
         "scanner_machine_role": os.getenv("SCANNER_MACHINE_ROLE", "").strip() or "unspecified",
         "scanner_alert_profile": os.getenv("SCANNER_ALERT_PROFILE", "").strip() or "AAPL_TESTING",
         "hostname": socket.gethostname(),
@@ -528,6 +529,13 @@ class Alert:
     option_iv: Optional[float] = None
     option_volume: Optional[int] = None
     option_open_interest: Optional[int] = None
+    option_quote_timestamp_raw: Optional[str] = None
+    option_quote_timestamp_utc: Optional[str] = None
+    option_quote_age_seconds: Optional[float] = None
+    option_max_quote_age_seconds: Optional[float] = None
+    option_stale_reason: Optional[str] = None
+    option_data_source: Optional[str] = None
+    option_fallback_used: Optional[bool] = None
     option_quality: Optional[str] = None
     options_score: Optional[int] = None
     direction: Optional[str] = None
@@ -577,6 +585,14 @@ class Alert:
     chop_score: Optional[int] = None
     fakeout_score: Optional[int] = None
     scenario_conflict: Optional[bool] = None
+    mixed_signal_detected: Optional[bool] = None
+    primary_setup_direction: Optional[str] = None
+    phase3_scenario_direction: Optional[str] = None
+    mixed_signal_reason: Optional[str] = None
+    conflict_warning_added: Optional[bool] = None
+    news_context_present: Optional[bool] = None
+    news_used_for_context_only: Optional[bool] = None
+    news_upgraded_alert: Optional[bool] = None
     all_scenarios: List[Dict[str, Any]] = field(default_factory=list)
     stock_setup_score: Optional[int] = None
     stock_setup_valid: Optional[bool] = None
@@ -703,11 +719,17 @@ def parse_optional_dt(value: Any) -> Optional[datetime]:
     if not value:
         return None
     if isinstance(value, datetime):
-        return value.astimezone(UTC)
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
-    except ValueError:
-        return None
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    # Alpaca timestamps are UTC. Treat a missing timezone as UTC so local
+    # machine timezone settings cannot change quote freshness decisions.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def parse_option_symbol(contract_symbol: str, underlying_symbol: str) -> Optional[Tuple[str, date, float]]:
@@ -1555,13 +1577,43 @@ class AlertWriter:
                 "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
                 "watch_only_late_move": alert.watch_only_late_move,
                 "do_not_chase_watch": alert.do_not_chase_watch,
+                "mixed_signal_detected": alert.mixed_signal_detected,
+                "primary_setup_direction": alert.primary_setup_direction,
+                "phase3_scenario_direction": alert.phase3_scenario_direction,
+                "mixed_signal_reason": alert.mixed_signal_reason,
+                "conflict_warning_added": alert.conflict_warning_added,
+                "news_context_present": alert.news_context_present,
+                "news_used_for_context_only": alert.news_used_for_context_only,
+                "news_upgraded_alert": alert.news_upgraded_alert,
             },
         )
         self._append_jsonl(
             self.option_jsonl_path,
             {
                 "timestamp": alert.timestamp.isoformat(),
+                **scanner_identity(),
                 "symbol": alert.symbol,
+                "selected_option_symbol": alert.option_contract,
+                "underlying_price": alert.price,
+                "strike": alert.option_strike,
+                "expiration": alert.option_expiration,
+                "option_type": alert.option_type,
+                "bid": alert.option_bid,
+                "ask": alert.option_ask,
+                "mid": alert.option_mid,
+                "spread": alert.option_spread_pct,
+                "quote_timestamp_raw": alert.option_quote_timestamp_raw,
+                "quote_timestamp_utc": alert.option_quote_timestamp_utc,
+                "scanner_timestamp_utc": alert.timestamp.astimezone(UTC).isoformat(),
+                "quote_age_seconds": alert.option_quote_age_seconds,
+                "max_allowed_quote_age_seconds": alert.option_max_quote_age_seconds,
+                "stale_reason": alert.option_stale_reason,
+                "opra_feed_requested": latest_market_data_status().get("options_feed_requested"),
+                "opra_status": latest_market_data_status().get("opra_status"),
+                "data_source": alert.option_data_source,
+                "fallback_used": alert.option_fallback_used,
+                "option_quality_label": alert.option_quality,
+                "option_quality_score": alert.options_score,
                 "alert_score": alert.alert_score,
                 "option_feed_status": alert.option_feed_status,
                 "option_tradability_score": alert.option_tradability_score,
@@ -1656,6 +1708,8 @@ def compact_alert_message(alert: Alert) -> str:
         parts.append(f"RVOL {alert.relative_volume:.2f}x")
     if alert.primary_setup:
         parts.append(f"setup {alert.primary_setup}")
+    if alert.mixed_signal_detected:
+        parts.append("MIXED SIGNAL")
     if alert.scenario_top and (alert.scenario_top.get("scenario_name") or alert.scenario_stage):
         scenario_name = alert.scenario_top.get("scenario_name") or "scenario"
         scenario_stage = alert.scenario_stage or alert.scenario_top.get("stage") or ""
@@ -1680,6 +1734,8 @@ def compact_alert_message(alert: Alert) -> str:
         parts.append(f"pressure {alert.pressure_label}")
     if alert.option_feed_status and alert.option_feed_status != "UNAVAILABLE":
         parts.append(f"feed {alert.option_feed_status}")
+    if alert.news_context_present:
+        parts.append("news context only")
     if alert.risk_label == "DO_NOT_CHASE":
         parts.append("RISK: DO_NOT_CHASE — valid setup may be late")
     elif alert.risk_label:
@@ -1728,12 +1784,17 @@ def phase3_heads_up_message(alert: Alert) -> str:
             f"{alert.symbol} Phase 3 Watch-Only Heads-Up",
             f"{direction_text} {scenario_name} — WATCH ONLY — LATE / DO NOT CHASE",
             "This is not trade-ready.",
+            "This is not a buy/sell signal.",
             "Do not chase. Wait for pullback/retest.",
             f"Score {alert.scenario_score or 0} | Stock {alert.stock_setup_score or 0} | Confirm {alert.confirmation_score or 0}",
             f"Reason: {reason_text}",
         ]
         if invalidation:
             lines.append(f"Invalidation: {invalidation}.")
+        if alert.option_stale_did_not_block_heads_up:
+            lines.append("Warning: Option quote stale/missing — stock setup only.")
+        if alert.mixed_signal_detected and alert.mixed_signal_reason:
+            lines.append(f"Warning: Mixed signal / conflict — {alert.mixed_signal_reason}")
         lines.append("Confirm manually on chart.")
         return "\n".join(lines)
     title = "Phase 3 Stock Heads-Up" if stock_only else "Phase 3 Early Heads-Up" if early else "Phase 3 Heads-Up"
@@ -2743,10 +2804,55 @@ def snapshot_data_quality(snap: SymbolSnapshot, config: Dict[str, Any]) -> str:
     return "Fresh"
 
 
-def option_quote_age_seconds(contract: OptionContractSnapshot) -> Optional[float]:
-    if not contract.quote_time:
+def option_quote_age_seconds(
+    contract: OptionContractSnapshot,
+    scanner_time: Optional[datetime] = None,
+) -> Optional[float]:
+    quote_time = parse_optional_dt(contract.quote_time)
+    if not quote_time:
         return None
-    return max(0.0, (now_utc() - contract.quote_time.astimezone(UTC)).total_seconds())
+    current = parse_optional_dt(scanner_time or now_utc()) or now_utc()
+    return max(0.0, (current - quote_time).total_seconds())
+
+
+def options_session_active(at: Optional[datetime] = None) -> bool:
+    current = (parse_optional_dt(at or now_utc()) or now_utc()).astimezone(ET)
+    return current.weekday() < 5 and datetime_time(9, 30) <= current.time() <= datetime_time(16, 0)
+
+
+def option_freshness_details(
+    contract: OptionContractSnapshot,
+    config: Dict[str, Any],
+    scanner_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = parse_optional_dt(scanner_time or now_utc()) or now_utc()
+    quote_time = parse_optional_dt(contract.quote_time)
+    max_age = float(config.get("options", {}).get("max_quote_age_seconds", 60))
+    age = option_quote_age_seconds(contract, current)
+    reason = ""
+    status = "recent"
+    if contract.bid is None or contract.ask is None or contract.bid <= 0 or contract.ask <= 0 or contract.ask <= contract.bid:
+        status = "invalid"
+        reason = "missing_bid_ask"
+    elif quote_time is None:
+        status = "stale"
+        reason = "missing_timestamp"
+    elif age is not None and age > max_age:
+        status = "stale"
+        reason = "options_session_inactive" if not options_session_active(current) else "quote_age_exceeded"
+    elif contract.spread_pct is None or contract.spread_pct > float(config.get("options", {}).get("max_spread_pct", 12)):
+        status = "poor_quality"
+        reason = "wide_spread"
+    return {
+        "status": status,
+        "stale_reason": reason,
+        "quote_timestamp_raw": str(contract.quote_time) if contract.quote_time is not None else None,
+        "quote_timestamp_utc": quote_time.isoformat() if quote_time else None,
+        "scanner_timestamp_utc": current.isoformat(),
+        "quote_age_seconds": round(age, 3) if age is not None else None,
+        "max_allowed_quote_age_seconds": max_age,
+        "options_session_active": options_session_active(current),
+    }
 
 
 def option_expiration_rank(expiration: date, config: Dict[str, Any]) -> Optional[int]:
@@ -2764,17 +2870,13 @@ def option_expiration_rank(expiration: date, config: Dict[str, Any]) -> Optional
 def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, Any]) -> Tuple[str, List[str]]:
     options_config = config.get("options", {})
     reasons: List[str] = []
-    if contract.bid is None or contract.ask is None or contract.bid <= 0 or contract.ask <= 0 or contract.ask <= contract.bid:
-        return "No clean contract", ["missing or crossed bid/ask"]
-
-    age = option_quote_age_seconds(contract)
-    max_age = float(options_config.get("max_quote_age_seconds", 60))
-    if age is None or age > max_age:
-        return "Stale quote", ["option quote is stale or missing"]
-
-    spread_pct = contract.spread_pct
-    if spread_pct is None or spread_pct > float(options_config.get("max_spread_pct", 12)):
-        return "Wide spread", ["bid/ask spread is too wide"]
+    freshness = option_freshness_details(contract, config)
+    if freshness["status"] == "invalid":
+        return "Invalid quote", [freshness["stale_reason"]]
+    if freshness["status"] == "stale":
+        return "Stale quote", [freshness["stale_reason"]]
+    if freshness["status"] == "poor_quality":
+        return "Wide spread", [freshness["stale_reason"]]
 
     min_volume = int(options_config.get("min_option_volume", 100))
     min_oi = int(options_config.get("min_open_interest", 250))
@@ -3566,15 +3668,14 @@ class EliteScanner:
         watch_only_late_move = (
             alert.symbol.upper() == "AAPL"
             and bool(phase3_heads_up_message(alert))
-            and not alert.scenario_conflict
-            and context_ready
-            and has_spy_qqq
+            and (not alert.scenario_conflict or bool(alert.mixed_signal_reason))
+            and (context_ready or bool(alert.market_context_missing_warning))
+            and (has_spy_qqq or bool(alert.market_context_missing_warning))
             and scenario_direction in {"BULLISH", "BEARISH"}
             and scenario_score >= 80
             and confirmation_score >= 50
             and stock_score >= 50
-            and stage == "LATE"
-            and high_or_do_not_chase
+            and stage in {"LATE", "DO_NOT_CHASE"}
             and scenario_name in allowed_scenarios
         )
         do_not_chase_watch = (
@@ -3821,7 +3922,7 @@ class EliteScanner:
                 score -= 15
                 reasons.append("breakout/breakdown has not held long enough")
         if alert.headline:
-            score += 5
+            reasons.append("fresh news present as context only")
 
         if alert.option_quality == "Tradable":
             score += 15
@@ -4488,6 +4589,7 @@ class EliteScanner:
         alert.strategy_warnings = list(summary.get("warnings") or [])
         alert.strategy_levels = dict(summary.get("levels") or {})
         alert.strategy_results = list(summary.get("strategy_results") or [])
+        self.apply_mixed_signal_and_news_context(alert)
         self.apply_aapl_bearish_continuation_label(alert, snap, market_context)
         if alert.primary_setup:
             alert.notes.append(
@@ -4518,6 +4620,42 @@ class EliteScanner:
             alert.notes.append(f"strategy warning: {alert.strategy_warnings[0]}")
         return alert
 
+    def apply_mixed_signal_and_news_context(self, alert: Alert) -> None:
+        alert.primary_setup_direction = str(alert.strategy_direction or "").upper() or None
+        alert.phase3_scenario_direction = str(alert.scenario_direction or "").upper() or None
+        alert.mixed_signal_detected = bool(
+            alert.scenario_conflict
+            or (
+                alert.primary_setup_direction in {"BULLISH", "BEARISH"}
+                and alert.phase3_scenario_direction in {"BULLISH", "BEARISH"}
+                and alert.primary_setup_direction != alert.phase3_scenario_direction
+            )
+        )
+        alert.conflict_warning_added = False
+        if alert.mixed_signal_detected:
+            primary_lower = str(alert.primary_setup or "").lower()
+            scenario_lower = str((alert.scenario_top or {}).get("scenario_name") or "").lower()
+            if "liquidity sweep" in primary_lower and "fail" in scenario_lower:
+                alert.mixed_signal_reason = "Bullish sweep happened, but reclaim failed — bearish warning."
+            elif "liquidity sweep" in primary_lower and alert.phase3_scenario_direction == "BULLISH":
+                alert.mixed_signal_reason = "Bearish sweep happened, but price reclaimed support — bullish warning."
+            else:
+                alert.mixed_signal_reason = "Price swept/reclaimed one level, but failed to hold VWAP/EMA."
+            warning = f"Mixed signal / conflict: {alert.mixed_signal_reason}"
+            if warning not in alert.strategy_warnings:
+                alert.strategy_warnings.insert(0, warning)
+                alert.conflict_warning_added = True
+        alert.news_context_present = bool(alert.headline)
+        alert.news_used_for_context_only = bool(alert.headline)
+        alert.news_upgraded_alert = False
+        if alert.headline:
+            for warning in (
+                "Fresh AAPL news present — context only.",
+                "Confirm price reaction before using news.",
+            ):
+                if warning not in alert.strategy_warnings:
+                    alert.strategy_warnings.append(warning)
+
     def attach_option_context(self, alert: Alert, snap: SymbolSnapshot) -> Alert:
         selection = self.preferred_option_selection(alert, snap)
         contract = selection.contract
@@ -4525,6 +4663,7 @@ class EliteScanner:
         alert.options_score = selection.score
         alert.option_tradable = selection.is_tradable()
         if contract:
+            freshness = option_freshness_details(contract, self.config, alert.timestamp)
             if contract.is_simulated:
                 alert.option_feed_status = "SIMULATED"
             elif contract.feed == "opra":
@@ -4549,6 +4688,13 @@ class EliteScanner:
             alert.option_iv = contract.implied_volatility
             alert.option_volume = contract.volume
             alert.option_open_interest = contract.open_interest
+            alert.option_quote_timestamp_raw = freshness["quote_timestamp_raw"]
+            alert.option_quote_timestamp_utc = freshness["quote_timestamp_utc"]
+            alert.option_quote_age_seconds = freshness["quote_age_seconds"]
+            alert.option_max_quote_age_seconds = freshness["max_allowed_quote_age_seconds"]
+            alert.option_stale_reason = freshness["stale_reason"]
+            alert.option_data_source = contract.feed or "unknown"
+            alert.option_fallback_used = contract.feed == "indicative"
             alert.notes.append(
                 f"suggested option: {contract.symbol} ({selection.quality}, score {selection.score})"
             )
@@ -5115,6 +5261,10 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     options["allow_indicative_fallback"] = env_bool(
         "ALPACA_ALLOW_INDICATIVE_OPTIONS_FALLBACK",
         bool(options.get("allow_indicative_fallback", True)),
+    )
+    options["max_quote_age_seconds"] = env_int(
+        "MAX_OPTION_QUOTE_AGE_SECONDS",
+        int(options.get("max_quote_age_seconds", 60)),
     )
 
     quality = config.setdefault("alert_quality", {})
@@ -6119,7 +6269,7 @@ def run_tests() -> int:
             scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
             self.assertTrue(alert.phase3_heads_up_sent)
             self.assertTrue(alert.stock_only_heads_up_allowed)
-            self.assertEqual(alert.phase3_heads_up_type, "STOCK_ONLY_WARNING")
+            self.assertEqual(alert.phase3_heads_up_type, "WATCH_ONLY_LATE_MOVE")
             self.assertIn("Late warning — do not chase.", alert.scenario_warnings)
             self.assertIn("not a buy/sell signal", phase3_heads_up_message(alert))
 
@@ -6141,8 +6291,9 @@ def run_tests() -> int:
             self.assertTrue(alert.market_context_missing_warning)
             self.assertTrue(alert.option_stale_did_not_block_heads_up)
             message = phase3_heads_up_message(alert)
-            self.assertIn("AAPL Phase 3 Stock Heads-Up", message)
-            self.assertIn("LATE WARNING", message)
+            self.assertIn("AAPL Phase 3 Watch-Only Heads-Up", message)
+            self.assertIn("LATE / DO NOT CHASE", message)
+            self.assertIn("not trade-ready", message)
             self.assertIn("Option quote stale/missing", message)
 
         def test_stock_only_phase3_do_not_chase_is_warning_only(self) -> None:
@@ -7678,6 +7829,52 @@ def run_tests() -> int:
             stale = now_utc() - timedelta(minutes=10)
             selection = choose_best_option_contract([self.option_contract(quote_time=stale)], "C", 100.0, config)
             self.assertEqual(selection.quality, "Stale quote")
+
+        def test_option_freshness_normalizes_utc_et_and_naive_timestamps(self) -> None:
+            config = load_config(None)
+            current = datetime(2026, 6, 8, 15, 0, tzinfo=UTC)
+            utc_contract = self.option_contract(quote_time=current - timedelta(seconds=10))
+            et_contract = self.option_contract(quote_time=(current - timedelta(seconds=10)).astimezone(ET))
+            naive_contract = self.option_contract(quote_time=(current - timedelta(seconds=10)).replace(tzinfo=None))
+            for contract in (utc_contract, et_contract, naive_contract):
+                details = option_freshness_details(contract, config, current)
+                self.assertEqual(details["status"], "recent")
+                self.assertAlmostEqual(details["quote_age_seconds"], 10.0)
+
+        def test_option_freshness_missing_timestamp_and_bid_ask_reasons(self) -> None:
+            config = load_config(None)
+            missing_time = self.option_contract()
+            missing_time.quote_time = None
+            self.assertEqual(option_freshness_details(missing_time, config)["stale_reason"], "missing_timestamp")
+            zero_bid = self.option_contract(bid=0.0)
+            details = option_freshness_details(zero_bid, config)
+            self.assertEqual(details["status"], "invalid")
+            self.assertEqual(details["stale_reason"], "missing_bid_ask")
+            self.assertEqual(option_contract_quality(zero_bid, config)[0], "Invalid quote")
+
+        def test_option_freshness_wide_spread_is_poor_quality_not_stale(self) -> None:
+            config = load_config(None)
+            details = option_freshness_details(self.option_contract(bid=1.0, ask=1.5), config)
+            self.assertEqual(details["status"], "poor_quality")
+            self.assertEqual(details["stale_reason"], "wide_spread")
+
+        def test_mixed_signal_and_news_are_explained_as_context_only(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                primary_setup="Bullish Liquidity Sweep Reclaim",
+                strategy_direction="bullish",
+                scenario_direction="bearish",
+                scenario_conflict=True,
+                scenario_top={"scenario_name": "Failed VWAP/EMA Reclaim", "direction": "bearish", "stage": "FORMING", "score": 70},
+                headline="Fresh AAPL catalyst",
+            )
+            scanner.apply_mixed_signal_and_news_context(alert)
+            self.assertTrue(alert.mixed_signal_detected)
+            self.assertIn("Bullish sweep happened", alert.mixed_signal_reason)
+            self.assertTrue(alert.conflict_warning_added)
+            self.assertTrue(alert.news_context_present)
+            self.assertTrue(alert.news_used_for_context_only)
+            self.assertFalse(alert.news_upgraded_alert)
 
         def test_options_rejects_delta_outside_range(self) -> None:
             config = load_config(None)

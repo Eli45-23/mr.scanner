@@ -46,6 +46,14 @@ git pull --ff-only origin main
 .venv/bin/python tools/check_config_consistency.py
 ```
 
+Check OPRA quote freshness on each machine:
+
+```bash
+.venv/bin/python tools/check_option_quote_freshness.py --symbol AAPL
+```
+
+The quote timestamp and scanner timestamp are normalized to timezone-aware UTC. Recent OPRA quotes should normally show an age well below `MAX_OPTION_QUOTE_AGE_SECONDS=60` while the options session is active.
+
 Compare the output from both machines. The commit, alert profile, alert symbols, context symbols, Telegram alert types, destination last four digits, and feeds must match.
 
 ## Export and Compare Review Packages

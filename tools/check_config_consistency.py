@@ -35,6 +35,8 @@ def build_report() -> dict:
         "telegram_enabled": bool(config.get("notifications", {}).get("telegram_enabled")),
         "stock_feed": str(config.get("market_data", {}).get("stock_feed", "unknown")).upper(),
         "options_feed": str(config.get("options", {}).get("feed", "unknown")).upper(),
+        "max_option_quote_age_seconds": config.get("options", {}).get("max_quote_age_seconds", 60),
+        "option_freshness_mode": "timezone-aware UTC",
         "opra_status": market.get("opra_status", "unknown"),
         "scanner_running": running("elite_momentum_scanner.py --mode live"),
         "dashboard_running": running("scanner_dashboard.py"),
