@@ -5871,7 +5871,12 @@ def run_tests() -> int:
 
         def test_telegram_phase3_identical_alert_three_times_only_sends_once(self) -> None:
             from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG, LOG_DIR
+            original_notification_log = NOTIFICATION_STATUS_LOG
+            original_log_dir = LOG_DIR
             temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            LOG_DIR = temp_dir
             notifier = TelegramNotifier(
                 "secret-token",
                 "123",
@@ -5885,13 +5890,17 @@ def run_tests() -> int:
                 alert.phase3_heads_up_type = "GOOD_POSITION"
             response = Mock()
             response.raise_for_status.return_value = None
-            with patch("requests.post", return_value=response) as post:
-                for alert in alerts:
-                    notifier.send(alert)
-            self.assertEqual(post.call_count, 1)
-            self.assertFalse(alerts[1].phase3_heads_up_sent)
-            self.assertFalse(alerts[2].phase3_heads_up_sent)
-            self.assertTrue(alerts[1].phase3_heads_up_dedupe_blocked)
+            try:
+                with patch("requests.post", return_value=response) as post:
+                    for alert in alerts:
+                        notifier.send(alert)
+                self.assertEqual(post.call_count, 1)
+                self.assertFalse(alerts[1].phase3_heads_up_sent)
+                self.assertFalse(alerts[2].phase3_heads_up_sent)
+                self.assertTrue(alerts[1].phase3_heads_up_dedupe_blocked)
+            finally:
+                NOTIFICATION_STATUS_LOG = original_notification_log
+                LOG_DIR = original_log_dir
 
         def test_telegram_env_config(self) -> None:
             previous = self.with_env(
