@@ -14,7 +14,7 @@
     "messages_enabled": true,
     "messages_watch_enabled": true,
     "telegram_enabled": false,
-    "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS"],
+    "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS", "NORMAL_WATCH"],
     "telegram_aapl_only": true,
     "telegram_send_test_on_start": false,
     "telegram_timeout_seconds": 8

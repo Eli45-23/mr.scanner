@@ -78,6 +78,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
 NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
+TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 
 logger = logging.getLogger("elite_scanner")
 logging.basicConfig(
@@ -136,7 +137,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "messages_enabled": True,
         "messages_watch_enabled": True,
         "telegram_enabled": False,
-        "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS"],
+        "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS", "NORMAL_WATCH"],
         "telegram_aapl_only": True,
         "telegram_send_test_on_start": False,
         "telegram_timeout_seconds": 8,
@@ -476,6 +477,7 @@ class Alert:
     alert_score: Optional[int] = None
     sms_allowed: bool = False
     watch_allowed: bool = False
+    sms_sent: Optional[bool] = None
     market_alignment: Optional[str] = None
     text_alert_reason: Optional[str] = None
     setup_level: Optional[str] = None
@@ -1876,6 +1878,7 @@ class MessagesNotifier:
                 alert.text_alert_reason,
             )
             return
+        alert.sms_sent = False
         message = phase3_heads_up_message(alert) if alert.phase3_heads_up_sent else format_alert_message(alert, markdown=False)
         script = """
         on run argv
@@ -1891,6 +1894,7 @@ class MessagesNotifier:
         for phone_number in self.phone_numbers:
             try:
                 subprocess.run(["osascript", "-e", script, phone_number, message], check=True, timeout=20)
+                alert.sms_sent = True
                 logger.info("Messages alert sent to %s for %s %s", phone_number, alert.symbol, alert.category)
             except Exception as exc:
                 logger.warning("Messages send failed for %s: %s", phone_number, exc)
@@ -1972,6 +1976,8 @@ def append_notification_status(
     sent: bool,
     error: Any = "",
     message_preview: str = "",
+    sms_sent: Optional[bool] = None,
+    dedupe_blocked: bool = False,
 ) -> None:
     payload = {
         "timestamp": now_utc().isoformat(),
@@ -1979,6 +1985,11 @@ def append_notification_status(
         "alert_type": alert_type,
         "symbol": symbol,
         "sent": bool(sent),
+        "sms_sent": sms_sent,
+        "telegram_sent": bool(sent) if channel == "telegram" else None,
+        "telegram_chat_id": "[REDACTED]" if channel == "telegram" else None,
+        "telegram_error": redact_notification_error(error) if channel == "telegram" else "",
+        "dedupe_blocked": bool(dedupe_blocked),
         "error": redact_notification_error(error),
         "message_preview": message_preview[:300],
         "token_redacted": True,
@@ -2057,6 +2068,69 @@ def claim_phase3_telegram_delivery(
     return allowed, reason, last_sent
 
 
+def telegram_message_fingerprint(alert_type: str, alert: Alert, message: str) -> str:
+    payload = "|".join(
+        [
+            alert.symbol.upper(),
+            alert_type.upper(),
+            str(alert.category or "").upper(),
+            str(alert.direction or "").upper(),
+            message,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def claim_telegram_delivery(
+    alert_type: str,
+    alert: Alert,
+    message: str,
+    dedupe_minutes: int,
+    state_path: Path = TELEGRAM_DELIVERY_DEDUPE_STATE,
+) -> Tuple[bool, str, Optional[datetime]]:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    fingerprint = telegram_message_fingerprint(alert_type, alert, message)
+    now = now_utc()
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        state: Dict[str, Any] = {}
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                state = {}
+        previous = state.get(fingerprint)
+        last_sent: Optional[datetime] = None
+        if isinstance(previous, dict):
+            try:
+                last_sent = datetime.fromisoformat(str(previous.get("sent_at")))
+            except (TypeError, ValueError):
+                last_sent = None
+        allowed = not last_sent or (now - last_sent).total_seconds() > dedupe_minutes * 60
+        reason = "first Telegram delivery" if not last_sent else "Telegram delivery cooldown elapsed"
+        if not allowed:
+            reason = "duplicate blocked: identical Telegram message within cooldown"
+        else:
+            state[fingerprint] = {
+                "sent_at": now.isoformat(),
+                "symbol": alert.symbol.upper(),
+                "alert_type": alert_type.upper(),
+            }
+            cutoff = now - timedelta(days=1)
+            state = {
+                key: value
+                for key, value in state.items()
+                if isinstance(value, dict)
+                and datetime.fromisoformat(str(value.get("sent_at"))) >= cutoff
+            }
+            temp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            temp_path.replace(state_path)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    return allowed, reason, last_sent
+
+
 def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
     payload = {
         "timestamp": now_utc().isoformat(),
@@ -2092,6 +2166,8 @@ class TelegramNotifier:
         timeout_seconds: int = 8,
         phase3_dedupe_minutes: int = 15,
         phase3_dedupe_state_path: Path = PHASE3_TELEGRAM_DEDUPE_STATE,
+        delivery_dedupe_minutes: int = 15,
+        delivery_dedupe_state_path: Path = TELEGRAM_DELIVERY_DEDUPE_STATE,
     ) -> None:
         self.bot_token = (bot_token or "").strip()
         self.chat_id = (chat_id or "").strip()
@@ -2101,24 +2177,40 @@ class TelegramNotifier:
         self.timeout_seconds = timeout_seconds
         self.phase3_dedupe_minutes = phase3_dedupe_minutes
         self.phase3_dedupe_state_path = phase3_dedupe_state_path
+        self.delivery_dedupe_minutes = delivery_dedupe_minutes
+        self.delivery_dedupe_state_path = delivery_dedupe_state_path
 
     def alert_type_for(self, alert: Alert) -> Optional[str]:
         if alert.phase3_heads_up_sent:
             return "PHASE3_HEADS_UP"
         if alert.sms_allowed:
             return "NORMAL_SMS"
+        if alert.watch_allowed:
+            return "NORMAL_WATCH"
         return None
+
+    def alert_type_enabled(self, alert_type: str) -> bool:
+        if alert_type == "NORMAL_WATCH":
+            return "NORMAL_WATCH" in self.alert_types or "NORMAL_SMS" in self.alert_types
+        return alert_type in self.alert_types
 
     def send(self, alert: Alert) -> None:
         if not self.enabled:
             return
         alert_type = self.alert_type_for(alert)
-        if not alert_type or alert_type not in self.alert_types:
+        if not alert_type or not self.alert_type_enabled(alert_type):
             return
         if self.aapl_only and alert.symbol.upper() != "AAPL":
             return
         if not self.bot_token or not self.chat_id:
-            append_notification_status("telegram", alert_type, alert.symbol, False, "Telegram bot token or chat ID is missing")
+            append_notification_status(
+                "telegram",
+                alert_type,
+                alert.symbol,
+                False,
+                "Telegram bot token or chat ID is missing",
+                sms_sent=alert.sms_sent,
+            )
             return
         message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
         if alert_type == "PHASE3_HEADS_UP":
@@ -2143,8 +2235,29 @@ class TelegramNotifier:
                     False,
                     f"duplicate blocked: {reason}",
                     message,
+                    sms_sent=alert.sms_sent,
+                    dedupe_blocked=True,
                 )
                 return
+        allowed, reason, _ = claim_telegram_delivery(
+            alert_type,
+            alert,
+            message,
+            self.delivery_dedupe_minutes,
+            self.delivery_dedupe_state_path,
+        )
+        if not allowed:
+            append_notification_status(
+                "telegram",
+                alert_type,
+                alert.symbol,
+                False,
+                reason,
+                message,
+                sms_sent=alert.sms_sent,
+                dedupe_blocked=True,
+            )
+            return
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
@@ -2152,10 +2265,25 @@ class TelegramNotifier:
                 timeout=self.timeout_seconds,
             )
             response.raise_for_status()
-            append_notification_status("telegram", alert_type, alert.symbol, True, message_preview=message)
+            append_notification_status(
+                "telegram",
+                alert_type,
+                alert.symbol,
+                True,
+                message_preview=message,
+                sms_sent=alert.sms_sent,
+            )
         except Exception as exc:
             redacted = redact_notification_error(exc, [self.bot_token])
-            append_notification_status("telegram", alert_type, alert.symbol, False, redacted, message)
+            append_notification_status(
+                "telegram",
+                alert_type,
+                alert.symbol,
+                False,
+                redacted,
+                message,
+                sms_sent=alert.sms_sent,
+            )
             logger.warning("Telegram send failed for %s: %s", alert.symbol, redacted)
 
 
@@ -2199,7 +2327,7 @@ def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
     pushover_token = os.getenv("PUSHOVER_APP_TOKEN")
     pushover_user = os.getenv("PUSHOVER_USER_KEY")
     notification_config = config.get("notifications", {})
-    telegram_alert_types = notification_config.get("telegram_alert_types", ["PHASE3_HEADS_UP", "NORMAL_SMS"])
+    telegram_alert_types = notification_config.get("telegram_alert_types", ["PHASE3_HEADS_UP", "NORMAL_SMS", "NORMAL_WATCH"])
     if isinstance(telegram_alert_types, str):
         telegram_alert_types = [part.strip() for part in telegram_alert_types.split(",") if part.strip()]
     return CompositeNotifier([
@@ -2225,6 +2353,7 @@ def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
             aapl_only=bool(notification_config.get("telegram_aapl_only", True)),
             timeout_seconds=int(notification_config.get("telegram_timeout_seconds", 8)),
             phase3_dedupe_minutes=int(config.get("scenario_engine", {}).get("phase3_heads_up_dedupe_minutes", 15)),
+            delivery_dedupe_minutes=int(config.get("scenario_engine", {}).get("phase3_heads_up_dedupe_minutes", 15)),
         ),
     ])
 
@@ -5807,6 +5936,7 @@ def run_tests() -> int:
             notifier = TelegramNotifier("secret-token", "123", enabled=False, alert_types=["NORMAL_SMS"])
             alert = self.make_phase3_heads_up_alert()
             alert.sms_allowed = True
+            alert.sms_sent = True
             with patch("requests.post") as post:
                 notifier.send(alert)
             post.assert_not_called()
@@ -5817,6 +5947,24 @@ def run_tests() -> int:
             alert.sms_allowed = True
             notifier.send(alert)
 
+        def test_telegram_test_alert_still_sends_to_group_chat(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            response = Mock()
+            response.raise_for_status.return_value = None
+            previous = self.with_env({"TELEGRAM_BOT_TOKEN": "secret-token", "TELEGRAM_CHAT_ID": "-5213422925"})
+            try:
+                with patch("requests.post", return_value=response) as post:
+                    self.assertTrue(send_telegram_test_message(load_config(None)))
+                self.assertEqual(post.call_args.kwargs["json"]["chat_id"], "-5213422925")
+                self.assertIn('"alert_type": "TEST"', NOTIFICATION_STATUS_LOG.read_text())
+            finally:
+                self.restore_env(previous)
+                NOTIFICATION_STATUS_LOG = original_log
+
         def test_telegram_success_and_failure_are_logged_without_token(self) -> None:
             from unittest.mock import Mock, patch
             global NOTIFICATION_STATUS_LOG
@@ -5824,19 +5972,30 @@ def run_tests() -> int:
             temp_dir = Path(tempfile.mkdtemp())
             NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
             token = "secret-telegram-token"
-            notifier = TelegramNotifier(token, "123", enabled=True, alert_types=["NORMAL_SMS"])
+            notifier = TelegramNotifier(
+                token,
+                "-5213422925",
+                enabled=True,
+                alert_types=["NORMAL_SMS"],
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
+            )
             alert = self.make_phase3_heads_up_alert()
             alert.sms_allowed = True
+            alert.sms_sent = True
             response = Mock()
             response.raise_for_status.return_value = None
             try:
                 with patch("requests.post", return_value=response):
                     notifier.send(alert)
+                alert.category = "SECOND APPROVED ALERT"
                 with patch("requests.post", side_effect=RuntimeError(f"failed {token}")):
                     notifier.send(alert)
                 text = NOTIFICATION_STATUS_LOG.read_text(encoding="utf-8")
                 self.assertIn('"sent": true', text)
                 self.assertIn('"sent": false', text)
+                self.assertIn('"telegram_sent": true', text)
+                self.assertIn('"telegram_chat_id": "[REDACTED]"', text)
+                self.assertIn('"sms_sent": true', text)
                 self.assertIn("[REDACTED]", text)
                 self.assertNotIn(token, text)
             finally:
@@ -5883,6 +6042,7 @@ def run_tests() -> int:
                 enabled=True,
                 alert_types=["PHASE3_HEADS_UP"],
                 phase3_dedupe_state_path=temp_dir / "telegram_dedupe.json",
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
             )
             alerts = [self.make_phase3_heads_up_alert() for _ in range(3)]
             for alert in alerts:
@@ -5901,6 +6061,119 @@ def run_tests() -> int:
             finally:
                 NOTIFICATION_STATUS_LOG = original_notification_log
                 LOG_DIR = original_log_dir
+
+        def test_telegram_normal_watch_alert_is_mirrored(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            notifier = TelegramNotifier(
+                "secret-token",
+                "-5213422925",
+                enabled=True,
+                alert_types=["PHASE3_HEADS_UP", "NORMAL_SMS"],
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
+            )
+            alert = self.make_phase3_heads_up_alert(category="WATCH AAPL BULLISH")
+            alert.phase3_heads_up_sent = False
+            alert.sms_allowed = False
+            alert.watch_allowed = True
+            alert.sms_sent = True
+            response = Mock()
+            response.raise_for_status.return_value = None
+            try:
+                with patch("requests.post", return_value=response) as post:
+                    notifier.send(alert)
+                post.assert_called_once()
+                payload = post.call_args.kwargs["json"]
+                self.assertEqual(payload["chat_id"], "-5213422925")
+                record = json.loads(NOTIFICATION_STATUS_LOG.read_text().splitlines()[-1])
+                self.assertEqual(record["alert_type"], "NORMAL_WATCH")
+                self.assertTrue(record["telegram_sent"])
+                self.assertTrue(record["sms_sent"])
+            finally:
+                NOTIFICATION_STATUS_LOG = original_log
+
+        def test_telegram_sms_approved_alert_is_mirrored(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            notifier = TelegramNotifier(
+                "secret-token",
+                "-5213422925",
+                enabled=True,
+                alert_types=["NORMAL_SMS"],
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
+            )
+            alert = self.make_phase3_heads_up_alert()
+            alert.phase3_heads_up_sent = False
+            alert.sms_allowed = True
+            response = Mock()
+            response.raise_for_status.return_value = None
+            try:
+                with patch("requests.post", return_value=response) as post:
+                    notifier.send(alert)
+                post.assert_called_once()
+            finally:
+                NOTIFICATION_STATUS_LOG = original_log
+
+        def test_approved_messages_watch_is_mirrored_to_telegram(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            telegram = TelegramNotifier(
+                "secret-token",
+                "-5213422925",
+                enabled=True,
+                alert_types=["NORMAL_SMS"],
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
+            )
+            notifier = CompositeNotifier([MessagesNotifier("5551234567", send_watch=True), telegram])
+            alert = self.make_phase3_heads_up_alert(category="WATCH AAPL BULLISH")
+            alert.phase3_heads_up_sent = False
+            alert.sms_allowed = False
+            alert.watch_allowed = True
+            response = Mock()
+            response.raise_for_status.return_value = None
+            try:
+                with patch("subprocess.run") as messages_send, patch("requests.post", return_value=response) as telegram_send:
+                    notifier.send(alert)
+                messages_send.assert_called_once()
+                telegram_send.assert_called_once()
+                self.assertTrue(alert.sms_sent)
+            finally:
+                NOTIFICATION_STATUS_LOG = original_log
+
+        def test_telegram_normal_alert_duplicate_is_blocked(self) -> None:
+            from unittest.mock import Mock, patch
+            global NOTIFICATION_STATUS_LOG
+            original_log = NOTIFICATION_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            NOTIFICATION_STATUS_LOG = temp_dir / "notification_status.jsonl"
+            notifier = TelegramNotifier(
+                "secret-token",
+                "-5213422925",
+                enabled=True,
+                alert_types=["NORMAL_SMS"],
+                delivery_dedupe_state_path=temp_dir / "delivery_dedupe.json",
+            )
+            alert = self.make_phase3_heads_up_alert()
+            alert.phase3_heads_up_sent = False
+            alert.sms_allowed = True
+            response = Mock()
+            response.raise_for_status.return_value = None
+            try:
+                with patch("requests.post", return_value=response) as post:
+                    notifier.send(alert)
+                    notifier.send(alert)
+                self.assertEqual(post.call_count, 1)
+            finally:
+                NOTIFICATION_STATUS_LOG = original_log
 
         def test_telegram_env_config(self) -> None:
             previous = self.with_env(
