@@ -976,6 +976,7 @@ def build_symbol_rows(
                 strategy_results=list(strategy_summary.get("strategy_results") or []),
             )
             app.evaluate_phase3_heads_up(heads_up_alert, snap, quality, market_context)
+            scanner_app.assign_professional_alert_tier(heads_up_alert)
         rows.append({
             "symbol": snap.symbol,
             "source": source_map.get(snap.symbol, "Discovery"),
@@ -988,6 +989,10 @@ def build_symbol_rows(
             "scenario_entry_quality_label": strategy_summary.get("scenario_entry_quality_label"),
             "scenario_risk_label": strategy_summary.get("scenario_risk_label"),
             "scenario_alert_tier": strategy_summary.get("scenario_alert_tier"),
+            "alert_tier": heads_up_alert.alert_tier if heads_up_alert else None,
+            "alert_tier_reason": heads_up_alert.alert_tier_reason if heads_up_alert else None,
+            "alert_source": heads_up_alert.alert_source if heads_up_alert else None,
+            "message_source_path": heads_up_alert.message_source_path if heads_up_alert else None,
             "scenario_alert_block_reason": strategy_summary.get("scenario_alert_block_reason"),
             "scenario_reasons": strategy_summary.get("scenario_reasons", []),
             "scenario_warnings": strategy_summary.get("scenario_warnings", []),
@@ -1926,6 +1931,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="muted">
           Phase 3: Scenario ${esc(scenario)} ${esc(stage)} | Stock ${item.stock_setup_score ?? item.strategy_confidence_score ?? ''} |
           Scenario ${item.scenario_score ?? ''} | Option ${item.option_tradability_score ?? ''} ${esc(optionFeed)} |
+          Alert Tier ${esc(item.alert_tier || '')} | ${esc(item.alert_tier_reason || '')} |
           Tier ${esc(item.scenario_alert_tier || '')} | Alert Block ${esc(item.scenario_alert_block_reason || '')} | Eligible ${item.scenario_alert_eligible ? 'Yes' : 'No'} | Would SMS ${item.scenario_would_sms ? 'Yes' : 'No'} |
           Heads-Up ${esc(item.phase3_heads_up_type || 'BLOCKED')} / ${item.phase3_heads_up_eligible ? 'Eligible' : 'No'} / Sent ${item.phase3_heads_up_sent ? 'Yes' : 'No'} |
           ${esc(item.phase3_heads_up_block_reason || '')} |
@@ -1955,6 +1961,8 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="muted">Stock Reason</span> ${esc(item.stock_setup_score_reason || '')}</div>
           <div><span class="muted">Scenario Score</span> ${item.scenario_score ?? ''} ${esc(item.scenario_confidence_label || '')}</div>
           <div><span class="muted">Scenario Tier</span> ${esc(item.scenario_alert_tier || '')}</div>
+          <div><span class="muted">Professional Alert Tier</span> ${esc(item.alert_tier || '')}</div>
+          <div><span class="muted">Alert Tier Reason</span> ${esc(item.alert_tier_reason || '')}</div>
           <div><span class="muted">Scenario Eligible</span> ${item.scenario_alert_eligible ? 'Yes' : 'No'}</div>
           <div><span class="muted">Would SMS</span> ${item.scenario_would_sms ? 'Yes' : 'No'}</div>
           <div><span class="muted">Scenario Alert Block</span> ${esc(item.scenario_alert_block_reason || '')}</div>
@@ -2634,6 +2642,10 @@ def run_tests() -> int:
             self.assertEqual(rows[0]["option_feed_status"], "INDICATIVE")
             self.assertEqual(rows[0]["stock_setup_score"], 82)
             self.assertEqual(rows[0]["scenario_alert_tier"], "DASHBOARD_ALERT")
+            self.assertIn(rows[0]["alert_tier"], {"SETUP_CONFIRMED", "SETUP_FORMING", "RISK_WARNING"})
+            self.assertTrue(rows[0]["alert_tier_reason"])
+            self.assertTrue(rows[0]["alert_source"])
+            self.assertTrue(rows[0]["message_source_path"])
             self.assertEqual(rows[0]["stock_setup_score_reason"], "Breakout Retest Holding is strong")
             self.assertTrue(rows[0]["scenario_alert_eligible"])
             self.assertFalse(rows[0]["scenario_would_sms"])
@@ -2662,6 +2674,8 @@ def run_tests() -> int:
             self.assertIn("renderScannerIdentityStatus", INDEX_HTML)
             self.assertIn("alert-only", INDEX_HTML)
             self.assertIn("context-only", INDEX_HTML)
+            self.assertIn("Professional Alert Tier", INDEX_HTML)
+            self.assertIn("Alert Tier Reason", INDEX_HTML)
 
         def test_dashboard_status_includes_telegram_without_exposing_token(self) -> None:
             old_token = os.environ.get("TELEGRAM_BOT_TOKEN")

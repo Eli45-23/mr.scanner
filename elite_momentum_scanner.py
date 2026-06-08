@@ -556,6 +556,10 @@ class Alert:
     direction: Optional[str] = None
     alert_grade: Optional[str] = None
     alert_score: Optional[int] = None
+    alert_tier: Optional[str] = None
+    alert_tier_reason: Optional[str] = None
+    alert_source: Optional[str] = None
+    message_source_path: Optional[str] = None
     sms_allowed: bool = False
     watch_allowed: bool = False
     sms_sent: Optional[bool] = None
@@ -1663,6 +1667,10 @@ class AlertWriter:
                 "ema9": alert.scenario_levels.get("ema9") if alert.scenario_levels else None,
                 "ema20": alert.scenario_levels.get("ema20") if alert.scenario_levels else None,
                 "market_context": alert.market_alignment,
+                "alert_tier": alert.alert_tier,
+                "alert_tier_reason": alert.alert_tier_reason,
+                "alert_source": alert.alert_source,
+                "message_source_path": alert.message_source_path,
                 "scenario_alert_tier": alert.scenario_alert_tier,
                 "scenario_alert_eligible": alert.scenario_alert_eligible,
                 "scenario_would_sms": alert.scenario_would_sms,
@@ -1759,6 +1767,10 @@ class AlertWriter:
                 "timestamp": alert.timestamp.isoformat(),
                 "symbol": alert.symbol,
                 "direction": alert.scenario_direction or alert.direction,
+                "alert_tier": alert.alert_tier,
+                "alert_tier_reason": alert.alert_tier_reason,
+                "alert_source": alert.alert_source,
+                "message_source_path": alert.message_source_path,
                 "top_scenario": alert.scenario_top,
                 "scenario_stage": alert.scenario_stage,
                 "scenario_score": alert.scenario_score,
@@ -1808,11 +1820,91 @@ class AlertWriter:
 # ------------------------------------------------------------
 # Discord notifier
 # ------------------------------------------------------------
+PROFESSIONAL_ALERT_TIERS = {
+    "CONTEXT",
+    "SETUP_FORMING",
+    "SETUP_CONFIRMED",
+    "TRADE_QUALITY_WATCH",
+    "RISK_WARNING",
+}
+
+
+def assign_professional_alert_tier(alert: Alert) -> Alert:
+    category = str(alert.category or "").upper()
+    stage = str(alert.scenario_stage or (alert.scenario_top or {}).get("stage") or "").upper()
+    risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
+    entry = str(alert.entry_quality_label or alert.scenario_entry_quality_label or "").upper()
+    option_quality = str(alert.option_quality or "").upper()
+    warning_text = " ".join(
+        [*alert.strategy_warnings, *alert.scenario_warnings, alert.text_alert_reason or ""]
+    ).upper()
+    risk_warning = (
+        risk in {"HIGH", "DO_NOT_CHASE"}
+        or entry in {"LATE", "DO_NOT_CHASE"}
+        or stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}
+        or bool(alert.mixed_signal_detected or alert.scenario_conflict)
+        or option_quality in {"WIDE SPREAD", "POOR_QUALITY", "STALE QUOTE", "INVALID QUOTE"}
+        or any(term in warning_text for term in ("DO NOT CHASE", "WIDE SPREAD", "MIXED SIGNAL", "DIRECTION CONFLICT"))
+    )
+    if risk_warning:
+        tier = "RISK_WARNING"
+        reason = "late/chase/mixed-signal/option-quality risk requires manual review"
+    elif alert.sms_allowed and bool(alert.option_tradable or alert.option_quality == "Tradable"):
+        tier = "TRADE_QUALITY_WATCH"
+        reason = "existing strict alert approval passed with a tradable option"
+    elif stage in {"CONFIRMED", "GOOD_POSITION"} or alert.phase3_heads_up_type == "GOOD_POSITION":
+        tier = "SETUP_CONFIRMED"
+        reason = "Phase 3 setup is confirmed or in a good-position stage"
+    elif (
+        alert.watch_allowed
+        or alert.phase3_heads_up_sent
+        or stage in {"WATCHING", "FORMING"}
+        or bool(alert.primary_setup)
+    ):
+        tier = "SETUP_FORMING"
+        reason = "setup is developing and still requires confirmation"
+    else:
+        tier = "CONTEXT"
+        reason = "context or key-level awareness only"
+    if category.startswith("WATCH ") and not alert.primary_setup and stage not in {"CONFIRMED", "GOOD_POSITION"}:
+        tier = "CONTEXT"
+        reason = "key level is approaching; wait for setup confirmation"
+    alert.alert_tier = tier
+    alert.alert_tier_reason = reason
+    if alert.phase3_heads_up_sent:
+        alert.alert_source = "STOCK_ONLY_WARNING" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
+        alert.message_source_path = "phase3_heads_up_message"
+    elif alert.sms_allowed:
+        alert.alert_source = "NORMAL_SMS"
+        alert.message_source_path = "format_alert_message"
+    elif alert.watch_allowed:
+        alert.alert_source = "NORMAL_WATCH"
+        alert.message_source_path = "format_alert_message"
+    else:
+        alert.alert_source = "SCANNER_CONTEXT"
+        alert.message_source_path = "format_alert_message"
+    return alert
+
+
+def confirmation_required_for_tier(alert: Alert) -> str:
+    if alert.alert_tier == "TRADE_QUALITY_WATCH":
+        return "Existing strict approval passed; confirm timing and risk manually."
+    if alert.alert_tier == "SETUP_CONFIRMED":
+        return "Confirm hold/retest and chart alignment."
+    if alert.alert_tier == "SETUP_FORMING":
+        return "Wait for confirmation before acting."
+    if alert.alert_tier == "RISK_WARNING":
+        return "Do not chase; review risk and wait for a cleaner setup."
+    return "Context only; wait for a valid setup."
+
+
 def compact_alert_message(alert: Alert) -> str:
+    assign_professional_alert_tier(alert)
     level = "WATCH" if alert.setup_level == "WATCH" else "ALERT"
     direction = alert.direction or "MOMENTUM"
     detected = alert.timestamp.astimezone(ET).strftime("%-I:%M %p ET")
     parts = [
+        f"Tier {alert.alert_tier}",
         f"{level} {alert.symbol} {direction}",
         f"${alert.price:.2f}",
         f"at {detected}",
@@ -1877,6 +1969,7 @@ def compact_alert_message(alert: Alert) -> str:
 
 
 def phase3_heads_up_message(alert: Alert) -> str:
+    assign_professional_alert_tier(alert)
     scenario = alert.scenario_top or {}
     scenario_name = scenario.get("scenario_name") or alert.primary_setup or "Scenario"
     stage = alert.scenario_stage or scenario.get("stage") or ""
@@ -2027,12 +2120,15 @@ def phase3_heads_up_dedupe_decision(
 
 
 def format_alert_message(alert: Alert, markdown: bool = True) -> str:
+    assign_professional_alert_tier(alert)
     if not markdown:
         return compact_alert_message(alert)
 
     bold = "**" if markdown else ""
     body_lines = [
         f"{bold}{alert.symbol}{bold} @ {bold}${alert.price:.2f}{bold}",
+        f"Alert tier: {bold}{alert.alert_tier}{bold}",
+        f"Tier reason: {alert.alert_tier_reason}",
         f"Category: {bold}{alert.category}{bold}",
     ]
     if alert.setup_level:
@@ -2128,6 +2224,33 @@ def format_alert_message(alert: Alert, markdown: bool = True) -> str:
         body_lines.append(f"Text alert filter: {alert.text_alert_reason}")
     body_lines.append("Confirm in Webull before taking action.")
     return "\n".join(body_lines)
+
+
+def professional_telegram_message(alert: Alert, alert_type: str) -> str:
+    assign_professional_alert_tier(alert)
+    scenario = alert.scenario_top or {}
+    setup = scenario.get("scenario_name") or alert.primary_setup or alert.category
+    stage = alert.scenario_stage or scenario.get("stage") or alert.entry_quality_label or "UNKNOWN"
+    direction = alert.scenario_direction or alert.direction or alert.strategy_direction or "MOMENTUM"
+    score = alert.scenario_score if alert.scenario_score is not None else alert.alert_score or 0
+    risk = alert.risk_label or alert.scenario_risk_label or "UNKNOWN"
+    option_quality = alert.option_quality or alert.option_feed_status or "UNAVAILABLE"
+    base_message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else compact_alert_message(alert)
+    return "\n".join(
+        [
+            f"Tier: {alert.alert_tier}",
+            f"Setup: {setup}",
+            f"Direction: {str(direction).upper()}",
+            f"Stage: {stage}",
+            f"Score: {score}",
+            f"Risk: {risk}",
+            f"Option quality: {option_quality}",
+            f"Confirmation required: {confirmation_required_for_tier(alert)}",
+            "",
+            base_message,
+            "Heads-up only — not a buy/sell signal.",
+        ]
+    )
 
 
 class DiscordNotifier:
@@ -2295,6 +2418,9 @@ def append_notification_status(
     dedupe_blocked: bool = False,
     alert_source: Optional[str] = None,
     chat_id: Optional[str] = None,
+    alert_tier: Optional[str] = None,
+    alert_tier_reason: Optional[str] = None,
+    message_source_path: Optional[str] = None,
 ) -> None:
     identity = scanner_identity(load_config(None))
     payload = {
@@ -2303,7 +2429,9 @@ def append_notification_status(
         "channel": channel,
         "alert_type": alert_type,
         "alert_source": alert_source or alert_type,
-        "message_source_path": alert_source or alert_type,
+        "message_source_path": message_source_path or alert_source or alert_type,
+        "alert_tier": alert_tier,
+        "alert_tier_reason": alert_tier_reason,
         "symbol": symbol,
         "sent": bool(sent),
         "sms_sent": sms_sent,
@@ -2334,11 +2462,15 @@ def send_telegram_message(
     symbol: str,
     sms_sent: Optional[bool] = None,
     dedupe_blocked: bool = False,
+    alert_tier: Optional[str] = None,
+    alert_tier_reason: Optional[str] = None,
+    message_source_path: Optional[str] = None,
 ) -> Tuple[bool, str]:
     if not token or not chat_id:
         error = "Telegram bot token or chat ID is missing"
         append_notification_status(
-            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id
+            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id,
+            alert_tier, alert_tier_reason, message_source_path,
         )
         return False, error
     try:
@@ -2349,13 +2481,15 @@ def send_telegram_message(
         )
         response.raise_for_status()
         append_notification_status(
-            "telegram", alert_type, symbol, True, "", message, sms_sent, dedupe_blocked, alert_source, chat_id
+            "telegram", alert_type, symbol, True, "", message, sms_sent, dedupe_blocked, alert_source, chat_id,
+            alert_tier, alert_tier_reason, message_source_path,
         )
         return True, ""
     except Exception as exc:
         error = redact_notification_error(exc, [token, chat_id])
         append_notification_status(
-            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id
+            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id,
+            alert_tier, alert_tier_reason, message_source_path,
         )
         return False, error
 
@@ -2491,9 +2625,14 @@ def claim_telegram_delivery(
 
 
 def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
+    assign_professional_alert_tier(alert)
     payload = {
         "timestamp": now_utc().isoformat(),
         "symbol": alert.symbol,
+        "alert_tier": alert.alert_tier,
+        "alert_tier_reason": alert.alert_tier_reason,
+        "alert_source": alert.alert_source,
+        "message_source_path": alert.message_source_path,
         "direction": alert.scenario_direction or alert.direction,
         "top_scenario": alert.scenario_top,
         "scenario_stage": alert.scenario_stage,
@@ -2530,9 +2669,14 @@ def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -
         return
     alert.phase3_heads_up_final_decision = "SENT" if sent else "TELEGRAM_FAILED"
     alert.phase3_heads_up_final_block_reason = "" if sent else redact_notification_error(error)
+    assign_professional_alert_tier(alert)
     payload = {
         "timestamp": now_utc().isoformat(),
         "symbol": alert.symbol,
+        "alert_tier": alert.alert_tier,
+        "alert_tier_reason": alert.alert_tier_reason,
+        "alert_source": alert.alert_source,
+        "message_source_path": alert.message_source_path,
         "phase3_heads_up_final_decision": "SENT" if sent else "TELEGRAM_FAILED",
         "phase3_heads_up_final_block_reason": "" if sent else redact_notification_error(error),
         "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
@@ -2603,20 +2747,24 @@ class TelegramNotifier:
             return
         if self.aapl_only and alert.symbol.upper() != "AAPL":
             return
+        assign_professional_alert_tier(alert)
+        message = professional_telegram_message(alert, alert_type)
         if not self.bot_token or not self.chat_id:
             _, error = send_telegram_message(
                 token=self.bot_token,
                 chat_id=self.chat_id,
-                message=phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False),
+                message=message,
                 timeout_seconds=self.timeout_seconds,
                 alert_type=alert_type,
-                alert_source=alert_type,
+                alert_source=alert.alert_source or alert_type,
                 symbol=alert.symbol,
                 sms_sent=alert.sms_sent,
+                alert_tier=alert.alert_tier,
+                alert_tier_reason=alert.alert_tier_reason,
+                message_source_path=alert.message_source_path,
             )
             append_phase3_telegram_delivery(alert, False, error)
             return
-        message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
         if alert_type == "PHASE3_HEADS_UP":
             allowed, reason, last_sent = claim_phase3_telegram_delivery(
                 alert,
@@ -2641,6 +2789,10 @@ class TelegramNotifier:
                     message,
                     sms_sent=alert.sms_sent,
                     dedupe_blocked=True,
+                    alert_source=alert.alert_source,
+                    alert_tier=alert.alert_tier,
+                    alert_tier_reason=alert.alert_tier_reason,
+                    message_source_path=alert.message_source_path,
                 )
                 append_phase3_telegram_delivery(alert, False, reason)
                 return
@@ -2661,6 +2813,10 @@ class TelegramNotifier:
                 message,
                 sms_sent=alert.sms_sent,
                 dedupe_blocked=True,
+                alert_source=alert.alert_source,
+                alert_tier=alert.alert_tier,
+                alert_tier_reason=alert.alert_tier_reason,
+                message_source_path=alert.message_source_path,
             )
             append_phase3_telegram_delivery(alert, False, reason)
             return
@@ -2675,9 +2831,12 @@ class TelegramNotifier:
             message=message,
             timeout_seconds=self.timeout_seconds,
             alert_type=alert_type,
-            alert_source=alert_source,
+            alert_source=alert.alert_source or alert_source,
             symbol=alert.symbol,
             sms_sent=alert.sms_sent,
+            alert_tier=alert.alert_tier,
+            alert_tier_reason=alert.alert_tier_reason,
+            message_source_path=alert.message_source_path,
         )
         if sent:
             append_phase3_telegram_delivery(alert, True)
@@ -5270,6 +5429,7 @@ class EliteScanner:
             text_key = self.phase3_heads_up_state_key(alert)
         if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
             return False
+        assign_professional_alert_tier(alert)
         logger.info(alert.short_summary())
         self.writer.write(alert)
         self.notifier.send(alert)
@@ -5846,6 +6006,77 @@ def run_tests() -> int:
                 for i in range(12)
             ]
             return SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)
+
+        def test_professional_alert_tier_assigns_all_five_tiers_without_changing_approvals(self) -> None:
+            context = self.make_phase3_heads_up_alert(
+                category="WATCH PREMARKET HIGH BREAK",
+                primary_setup=None,
+                scenario_top=None,
+                scenario_stage=None,
+                phase3_heads_up_type=None,
+                watch_allowed=False,
+            )
+            forming = self.make_phase3_heads_up_alert(scenario_stage="FORMING", phase3_heads_up_type="EARLY_WATCH")
+            confirmed = self.make_phase3_heads_up_alert(scenario_stage="CONFIRMED", phase3_heads_up_type="GOOD_POSITION")
+            trade_quality = self.make_phase3_heads_up_alert(
+                sms_allowed=True,
+                option_tradable=True,
+                option_quality="Tradable",
+                scenario_stage="CONFIRMED",
+            )
+            risk = self.make_phase3_heads_up_alert(risk_label="DO_NOT_CHASE", scenario_stage="LATE")
+            before = [(item.sms_allowed, item.watch_allowed, item.phase3_heads_up_sent) for item in (context, forming, confirmed, trade_quality, risk)]
+            for item in (context, forming, confirmed, trade_quality, risk):
+                assign_professional_alert_tier(item)
+            self.assertEqual(
+                [context.alert_tier, forming.alert_tier, confirmed.alert_tier, trade_quality.alert_tier, risk.alert_tier],
+                ["CONTEXT", "SETUP_FORMING", "SETUP_CONFIRMED", "TRADE_QUALITY_WATCH", "RISK_WARNING"],
+            )
+            after = [(item.sms_allowed, item.watch_allowed, item.phase3_heads_up_sent) for item in (context, forming, confirmed, trade_quality, risk)]
+            self.assertEqual(before, after)
+
+        def test_professional_alert_tier_maps_phase3_stock_warning_and_normal_watch(self) -> None:
+            phase3 = self.make_phase3_heads_up_alert(phase3_heads_up_sent=True, phase3_heads_up_type="GOOD_POSITION")
+            stock_warning = self.make_phase3_heads_up_alert(
+                phase3_heads_up_sent=True,
+                phase3_heads_up_type="STOCK_ONLY_WARNING",
+                risk_label="HIGH",
+            )
+            normal_watch = self.make_phase3_heads_up_alert(
+                scenario_top=None,
+                scenario_stage=None,
+                phase3_heads_up_type=None,
+                primary_setup="VWAP Reclaim",
+                watch_allowed=True,
+            )
+            assign_professional_alert_tier(phase3)
+            assign_professional_alert_tier(stock_warning)
+            assign_professional_alert_tier(normal_watch)
+            self.assertEqual(phase3.alert_tier, "SETUP_CONFIRMED")
+            self.assertEqual(stock_warning.alert_tier, "RISK_WARNING")
+            self.assertEqual(normal_watch.alert_tier, "SETUP_FORMING")
+            self.assertEqual(phase3.alert_source, "PHASE3_HEADS_UP")
+            self.assertEqual(normal_watch.alert_source, "NORMAL_WATCH")
+
+        def test_professional_telegram_message_has_required_decision_support_fields(self) -> None:
+            alert = self.make_phase3_heads_up_alert(
+                phase3_heads_up_sent=True,
+                phase3_heads_up_type="GOOD_POSITION",
+                option_quality="Tradable",
+            )
+            message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
+            for label in (
+                "Tier:",
+                "Setup:",
+                "Direction:",
+                "Stage:",
+                "Score:",
+                "Risk:",
+                "Option quality:",
+                "Confirmation required:",
+                "Heads-up only — not a buy/sell signal.",
+            ):
+                self.assertIn(label, message)
 
         def with_env(self, values: Dict[str, str]) -> Dict[str, Optional[str]]:
             old = {key: os.environ.get(key) for key in values}
@@ -6761,6 +6992,8 @@ def run_tests() -> int:
             alert = self.make_phase3_heads_up_alert()
             alert.sms_allowed = True
             alert.sms_sent = True
+            alert.option_tradable = True
+            alert.option_quality = "Tradable"
             with patch("requests.post") as post:
                 notifier.send(alert)
             post.assert_not_called()
@@ -6810,6 +7043,8 @@ def run_tests() -> int:
             alert = self.make_phase3_heads_up_alert()
             alert.sms_allowed = True
             alert.sms_sent = True
+            alert.option_tradable = True
+            alert.option_quality = "Tradable"
             response = Mock()
             response.raise_for_status.return_value = None
             try:
@@ -6824,6 +7059,9 @@ def run_tests() -> int:
                 self.assertIn('"telegram_sent": true', text)
                 self.assertIn('"telegram_chat_id": "[REDACTED]"', text)
                 self.assertIn('"sms_sent": true', text)
+                self.assertIn('"alert_tier": "TRADE_QUALITY_WATCH"', text)
+                self.assertIn('"alert_tier_reason":', text)
+                self.assertIn('"message_source_path": "format_alert_message"', text)
                 self.assertIn("[REDACTED]", text)
                 self.assertNotIn(token, text)
             finally:

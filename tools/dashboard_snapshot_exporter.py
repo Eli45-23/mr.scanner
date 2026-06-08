@@ -189,7 +189,7 @@ def _symbol_key_lookup(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, An
 
 
 def _alert_tier(row: Dict[str, Any]) -> Any:
-    return _pick(row, "scenario_alert_tier", "alert_tier", "alert_grade", "grade", default=None)
+    return _pick(row, "alert_tier", "scenario_alert_tier", "alert_grade", "grade", default=None)
 
 
 def _symbol_summary_row(row: Dict[str, Any]) -> Dict[str, Any]:
