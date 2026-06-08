@@ -6840,17 +6840,45 @@ def run_tests() -> int:
                     "SCANNER_MACHINE_ROLE": "backup",
                     "SCANNER_ALERT_PROFILE": "AAPL_TESTING",
                     "TELEGRAM_CHAT_ID": "-5213422925",
+                    "TELEGRAM_BOT_TOKEN": "startup-secret-token",
+                    "ALPACA_API_KEY": "startup-secret-key",
+                    "ALPACA_SECRET_KEY": "startup-secret-value",
                 }
             )
             try:
                 payload = log_scanner_startup_status(load_config(None), {"stock_feed_status": "SIP", "options_feed_status": "OPRA"})
                 logged = SCANNER_STARTUP_STATUS_LOG.read_text()
                 self.assertEqual(payload["scanner_instance_name"], "TestMac")
+                self.assertEqual(payload["scanner_alert_profile"], "AAPL_TESTING")
+                self.assertEqual(payload["alert_symbols"], ["AAPL"])
+                self.assertEqual(payload["context_symbols"], ["SPY", "QQQ"])
                 self.assertIn('"telegram_chat_id_last4": "2925"', logged)
                 self.assertNotIn("-5213422925", logged)
+                self.assertNotIn("startup-secret-token", logged)
+                self.assertNotIn("startup-secret-key", logged)
+                self.assertNotIn("startup-secret-value", logged)
             finally:
                 self.restore_env(previous)
                 SCANNER_STARTUP_STATUS_LOG = original_log
+
+        def test_official_aapl_testing_profile_loads_with_context_only_symbols(self) -> None:
+            previous = self.with_env(
+                {
+                    "SCANNER_ALERT_PROFILE": "AAPL_TESTING",
+                    "ALERT_SYMBOLS": "AAPL",
+                    "MARKET_CONTEXT_SYMBOLS": "SPY,QQQ",
+                }
+            )
+            try:
+                config = load_config(None)
+                identity = scanner_identity(config)
+                self.assertEqual(identity["scanner_alert_profile"], "AAPL_TESTING")
+                self.assertEqual(identity["alert_symbols"], ["AAPL"])
+                self.assertEqual(identity["context_symbols"], ["SPY", "QQQ"])
+                self.assertNotIn("SPY", config["symbols"])
+                self.assertNotIn("QQQ", config["symbols"])
+            finally:
+                self.restore_env(previous)
 
         def test_telegram_only_sends_approved_phase3_or_normal_sms(self) -> None:
             from unittest.mock import patch

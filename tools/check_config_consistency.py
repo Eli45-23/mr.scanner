@@ -30,7 +30,7 @@ def build_report() -> dict:
             market = json.loads(path.read_text(encoding="utf-8", errors="replace").splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
             market = {}
-    return {
+    report = {
         **identity,
         "telegram_enabled": bool(config.get("notifications", {}).get("telegram_enabled")),
         "stock_feed": str(config.get("market_data", {}).get("stock_feed", "unknown")).upper(),
@@ -41,11 +41,26 @@ def build_report() -> dict:
         "scanner_running": running("elite_momentum_scanner.py --mode live"),
         "dashboard_running": running("scanner_dashboard.py"),
     }
+    report["official_profile_valid"] = (
+        report["scanner_alert_profile"] == "AAPL_TESTING"
+        and report["alert_symbols"] == ["AAPL"]
+        and set(report["context_symbols"]) == {"SPY", "QQQ"}
+        and report["stock_feed"] == "SIP"
+        and report["options_feed"] == "OPRA"
+    )
+    return report
 
 
 def main() -> int:
     report = build_report()
-    print("Scanner Config Consistency")
+    print("Official Scanner Profile")
+    print("------------------------")
+    print(f"profile: {report['scanner_alert_profile']}")
+    print(f"alert scope: {','.join(report['alert_symbols'])} alert-only")
+    print(f"market context: {','.join(report['context_symbols'])} context-only")
+    print(f"feeds: {report['stock_feed']} / {report['options_feed']}")
+    print(f"official profile valid: {'YES' if report['official_profile_valid'] else 'NO'}")
+    print("\nScanner Config Consistency")
     print("--------------------------")
     for key, value in report.items():
         if isinstance(value, list):

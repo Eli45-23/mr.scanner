@@ -49,6 +49,7 @@ class DashboardState:
         config = scanner_app.load_config(self.config_path)
         market_data_status = scanner_app.latest_market_data_status(config)
         notification_status = scanner_app.latest_notification_status(config)
+        scanner_identity = scanner_app.scanner_identity(config)
         with self.lock:
             return {
                 "running": self.running,
@@ -74,6 +75,7 @@ class DashboardState:
                 "has_desktop_alerts": bool(config.get("notifications", {}).get("mac_desktop_enabled", True)),
                 "market_data_status": market_data_status,
                 "notification_status": notification_status,
+                "scanner_identity": scanner_identity,
             }
 
 
@@ -1717,6 +1719,11 @@ INDEX_HTML = r"""<!doctype html>
         <div class="value" id="marketDataStatusValue">Unknown</div>
         <div class="health-grid" id="marketDataStatusDetails"></div>
       </div>
+      <div class="health" id="scannerIdentityStatus">
+        <div class="label">Official Scanner Profile</div>
+        <div class="value" id="scannerIdentityStatusValue">Unknown</div>
+        <div class="health-grid" id="scannerIdentityStatusDetails"></div>
+      </div>
       <div class="health" id="notificationStatus">
         <div class="label">Notification Status</div>
         <div class="value" id="notificationStatusValue">Unknown</div>
@@ -1772,6 +1779,9 @@ INDEX_HTML = r"""<!doctype html>
       marketDataStatus: document.getElementById('marketDataStatus'),
       marketDataStatusValue: document.getElementById('marketDataStatusValue'),
       marketDataStatusDetails: document.getElementById('marketDataStatusDetails'),
+      scannerIdentityStatus: document.getElementById('scannerIdentityStatus'),
+      scannerIdentityStatusValue: document.getElementById('scannerIdentityStatusValue'),
+      scannerIdentityStatusDetails: document.getElementById('scannerIdentityStatusDetails'),
       notificationStatus: document.getElementById('notificationStatus'),
       notificationStatusValue: document.getElementById('notificationStatusValue'),
       notificationStatusDetails: document.getElementById('notificationStatusDetails'),
@@ -2031,7 +2041,29 @@ INDEX_HTML = r"""<!doctype html>
       els.error.textContent = data.last_error || '';
       els.symbols.innerHTML = (data.symbols || []).map((s) => `<span class="chip">${s}</span>`).join('');
       renderMarketDataStatus(data.market_data_status || {});
+      renderScannerIdentityStatus(data.scanner_identity || {}, data.market_data_status || {});
       renderNotificationStatus(data.notification_status || {});
+    }
+
+    function renderScannerIdentityStatus(identity, market) {
+      const profile = identity.scanner_alert_profile || 'unknown';
+      const alerts = identity.alert_symbols || [];
+      const context = identity.context_symbols || [];
+      const stock = market.stock_feed_status || market.stock_feed_requested || 'unknown';
+      const options = market.options_feed_status || market.options_feed_requested || 'unknown';
+      const official = profile === 'AAPL_TESTING'
+        && alerts.length === 1 && alerts[0] === 'AAPL'
+        && context.includes('SPY') && context.includes('QQQ');
+      els.scannerIdentityStatus.className = `health ${official ? 'good' : 'warn'}`;
+      els.scannerIdentityStatusValue.textContent = profile;
+      els.scannerIdentityStatusDetails.innerHTML = `
+        <div>Machine: <strong>${esc(identity.scanner_instance_name || identity.hostname || 'unknown')}</strong></div>
+        <div>Commit: <strong>${esc(identity.git_commit || 'unknown')}</strong></div>
+        <div>Alerts: <strong>${esc(alerts.join(', ') || 'none')} alert-only</strong></div>
+        <div>Context: <strong>${esc(context.join(', ') || 'none')} context-only</strong></div>
+        <div>Telegram: <strong>${esc(identity.telegram_destination_type || 'unknown')} ${identity.telegram_chat_id_last4 ? `/*${esc(identity.telegram_chat_id_last4)}` : ''}</strong></div>
+        <div>Feeds: <strong>${esc(stock)} / ${esc(options)}</strong></div>
+      `;
     }
 
     function renderNotificationStatus(status) {
@@ -2626,6 +2658,10 @@ def run_tests() -> int:
             self.assertIn("Telegram configured", INDEX_HTML)
             self.assertIn("Duplicate blocked", INDEX_HTML)
             self.assertIn("Active channels", INDEX_HTML)
+            self.assertIn("Official Scanner Profile", INDEX_HTML)
+            self.assertIn("renderScannerIdentityStatus", INDEX_HTML)
+            self.assertIn("alert-only", INDEX_HTML)
+            self.assertIn("context-only", INDEX_HTML)
 
         def test_dashboard_status_includes_telegram_without_exposing_token(self) -> None:
             old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -2663,6 +2699,50 @@ def run_tests() -> int:
             self.assertIn("Market Data Status", INDEX_HTML)
             self.assertIn("renderMarketDataStatus", INDEX_HTML)
             self.assertIn("OPRA agreement", INDEX_HTML)
+
+        def test_dashboard_status_includes_official_scanner_identity_without_secrets(self) -> None:
+            previous = {
+                name: os.environ.get(name)
+                for name in (
+                    "SCANNER_ALERT_PROFILE",
+                    "ALERT_SYMBOLS",
+                    "MARKET_CONTEXT_SYMBOLS",
+                    "TELEGRAM_BOT_TOKEN",
+                    "TELEGRAM_CHAT_ID",
+                    "ALPACA_API_KEY",
+                    "ALPACA_SECRET_KEY",
+                )
+            }
+            os.environ.update(
+                {
+                    "SCANNER_ALERT_PROFILE": "AAPL_TESTING",
+                    "ALERT_SYMBOLS": "AAPL",
+                    "MARKET_CONTEXT_SYMBOLS": "SPY,QQQ",
+                    "TELEGRAM_BOT_TOKEN": "dashboard-profile-secret-token",
+                    "TELEGRAM_CHAT_ID": "-5213422925",
+                    "ALPACA_API_KEY": "dashboard-profile-secret-key",
+                    "ALPACA_SECRET_KEY": "dashboard-profile-secret-value",
+                }
+            )
+            try:
+                snapshot = STATE.snapshot()
+                identity = snapshot["scanner_identity"]
+                self.assertEqual(identity["scanner_alert_profile"], "AAPL_TESTING")
+                self.assertEqual(identity["alert_symbols"], ["AAPL"])
+                self.assertEqual(identity["context_symbols"], ["SPY", "QQQ"])
+                self.assertEqual(identity["telegram_destination_type"], "group")
+                self.assertEqual(identity["telegram_chat_id_last4"], "2925")
+                serialized = json.dumps(snapshot)
+                self.assertNotIn("dashboard-profile-secret-token", serialized)
+                self.assertNotIn("dashboard-profile-secret-key", serialized)
+                self.assertNotIn("dashboard-profile-secret-value", serialized)
+                self.assertNotIn("-5213422925", serialized)
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
         def test_dashboard_snapshot_export_handles_missing_state_and_redacts_secrets(self) -> None:
             with tempfile.TemporaryDirectory() as temp_dir:
