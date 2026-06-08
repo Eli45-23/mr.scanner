@@ -892,7 +892,10 @@ def build_symbol_rows(
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     lookback = int(app.config["lookback_minutes_fast_move"])
-    for snap in snapshots.values():
+    for symbol in app.symbols:
+        snap = snapshots.get(symbol)
+        if not snap:
+            continue
         latest = snap.latest_bar
         bars = snap.recent_bars
         fast_move = None
@@ -1071,10 +1074,18 @@ def scan_once(app: scanner_app.EliteScanner, source_map: Dict[str, str]) -> tupl
         return 0, []
     snapshots = app.build_snapshots()
     market_context = app.build_market_context(snapshots)
+    market_bars = {
+        symbol: snap.recent_bars
+        for symbol, snap in snapshots.items()
+        if symbol in {"SPY", "QQQ"} and snap.recent_bars
+    }
     rows = build_symbol_rows(app, snapshots, source_map, market_context)
     count = 0
-    for snap in snapshots.values():
-        for alert in app.evaluate_symbol(snap, market_context):
+    for symbol in app.symbols:
+        snap = snapshots.get(symbol)
+        if not snap:
+            continue
+        for alert in app.evaluate_symbol(snap, market_context, market_bars):
             if app.process_alert(alert):
                 count += 1
     return count, rows

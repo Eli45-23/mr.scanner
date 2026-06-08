@@ -549,6 +549,13 @@ class Alert:
     market_confirmation_status: Optional[str] = None
     context_symbols_available: List[str] = field(default_factory=list)
     phase3_heads_up_message_preview: Optional[str] = None
+    stock_only_heads_up_allowed: Optional[bool] = None
+    stock_only_heads_up_reason: Optional[str] = None
+    phase3_heads_up_final_decision: Optional[str] = None
+    phase3_heads_up_final_block_reason: Optional[str] = None
+    market_context_missing_warning: Optional[bool] = None
+    option_stale_did_not_block_heads_up: Optional[bool] = None
+    context_symbols_expected: List[str] = field(default_factory=list)
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -1478,7 +1485,14 @@ class AlertWriter:
                 "phase3_heads_up_last_sent_time": alert.phase3_heads_up_last_sent_time,
                 "phase3_heads_up_next_eligible_time": alert.phase3_heads_up_next_eligible_time,
                 "market_confirmation_status": alert.market_confirmation_status,
+                "context_symbols_expected": alert.context_symbols_expected,
                 "context_symbols_available": alert.context_symbols_available,
+                "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
+                "stock_only_heads_up_reason": alert.stock_only_heads_up_reason,
+                "phase3_heads_up_final_decision": alert.phase3_heads_up_final_decision,
+                "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
+                "market_context_missing_warning": alert.market_context_missing_warning,
+                "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
             },
         )
         self._append_jsonl(
@@ -1530,7 +1544,17 @@ class AlertWriter:
                 "next_eligible_time": alert.phase3_heads_up_next_eligible_time,
                 "dedupe_minutes_remaining": alert.phase3_heads_up_dedupe_minutes_remaining,
                 "market_confirmation_status": alert.market_confirmation_status,
+                "context_symbols_expected": alert.context_symbols_expected,
                 "context_symbols_available": alert.context_symbols_available,
+                "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
+                "stock_only_heads_up_reason": alert.stock_only_heads_up_reason,
+                "phase3_heads_up_final_decision": alert.phase3_heads_up_final_decision,
+                "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
+                "market_context_missing_warning": alert.market_context_missing_warning,
+                "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
+                "telegram_attempted": False,
+                "telegram_sent": False,
+                "telegram_error": "",
                 "message_preview": alert.phase3_heads_up_message_preview,
                 "scenario_reasons": alert.scenario_reasons,
                 "scenario_warnings": alert.scenario_warnings,
@@ -1618,8 +1642,16 @@ def phase3_heads_up_message(alert: Alert) -> str:
     reasons = list(alert.scenario_reasons or alert.strategy_reasons or [])
     reason_text = ", ".join(reasons[:3]) if reasons else "Strong Phase 3 scenario read."
     early = alert.phase3_heads_up_type == "EARLY_WATCH"
-    title = "Phase 3 Early Heads-Up" if early else "Phase 3 Heads-Up"
-    reminder = "Early heads-up only — watch chart, do not enter yet." if early else "Possible setup — confirm manually on chart."
+    stock_only = alert.phase3_heads_up_type == "STOCK_ONLY_WARNING"
+    title = "Phase 3 Stock Heads-Up" if stock_only else "Phase 3 Early Heads-Up" if early else "Phase 3 Heads-Up"
+    display_stage = f"{stage} WARNING" if stock_only and stage in {"LATE", "DO_NOT_CHASE"} else stage
+    reminder = (
+        "Heads-up only — not a buy/sell signal."
+        if stock_only
+        else "Early heads-up only — watch chart, do not enter yet."
+        if early
+        else "Possible setup — confirm manually on chart."
+    )
     watch_text = (
         "next candle hold / break above recent high"
         if direction == "BULLISH"
@@ -1633,7 +1665,7 @@ def phase3_heads_up_message(alert: Alert) -> str:
         warnings.append("Legacy/Phase 2 conflict present — confirm manually.")
     lines = [
         f"{alert.symbol} {title}",
-        f"{direction_text} {scenario_name} — {stage}".strip(),
+        f"{direction_text} {scenario_name} — {display_stage}".strip(),
         reminder,
         f"Score {alert.scenario_score or 0} | Stock {alert.stock_setup_score or 0} | Confirm {alert.confirmation_score or 0}",
         f"Reason: {reason_text}",
@@ -1641,7 +1673,12 @@ def phase3_heads_up_message(alert: Alert) -> str:
     ]
     if invalidation:
         lines.append(f"Invalidation: {invalidation}.")
-    lines.append(f"Reminder: {' '.join(warnings)}")
+    if stock_only:
+        warning_text = " ".join(alert.scenario_warnings[-5:] or warnings)
+        lines.append(f"Warning: {warning_text}")
+        lines.append("Heads-up only — not a buy/sell signal.")
+    else:
+        lines.append(f"Reminder: {' '.join(warnings)}")
     return "\n".join(lines)
 
 
@@ -2155,6 +2192,31 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
         logger.warning("Phase 3 dedupe log failed: %s", redact_notification_error(exc))
 
 
+def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -> None:
+    if not alert.phase3_heads_up_eligible:
+        return
+    payload = {
+        "timestamp": now_utc().isoformat(),
+        "symbol": alert.symbol,
+        "phase3_heads_up_final_decision": alert.phase3_heads_up_final_decision,
+        "phase3_heads_up_final_block_reason": alert.phase3_heads_up_final_block_reason,
+        "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
+        "stock_only_heads_up_reason": alert.stock_only_heads_up_reason,
+        "market_context_missing_warning": alert.market_context_missing_warning,
+        "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
+        "context_symbols_expected": alert.context_symbols_expected,
+        "context_symbols_available": alert.context_symbols_available,
+        "telegram_attempted": True,
+        "telegram_sent": bool(sent),
+        "telegram_error": redact_notification_error(error),
+    }
+    try:
+        with (LOG_DIR / "phase3_heads_up.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        logger.warning("Phase 3 Telegram delivery log failed: %s", redact_notification_error(exc))
+
+
 class TelegramNotifier:
     def __init__(
         self,
@@ -2211,6 +2273,7 @@ class TelegramNotifier:
                 "Telegram bot token or chat ID is missing",
                 sms_sent=alert.sms_sent,
             )
+            append_phase3_telegram_delivery(alert, False, "Telegram bot token or chat ID is missing")
             return
         message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
         if alert_type == "PHASE3_HEADS_UP":
@@ -2238,6 +2301,7 @@ class TelegramNotifier:
                     sms_sent=alert.sms_sent,
                     dedupe_blocked=True,
                 )
+                append_phase3_telegram_delivery(alert, False, reason)
                 return
         allowed, reason, _ = claim_telegram_delivery(
             alert_type,
@@ -2257,6 +2321,7 @@ class TelegramNotifier:
                 sms_sent=alert.sms_sent,
                 dedupe_blocked=True,
             )
+            append_phase3_telegram_delivery(alert, False, reason)
             return
         try:
             response = requests.post(
@@ -2273,6 +2338,7 @@ class TelegramNotifier:
                 message_preview=message,
                 sms_sent=alert.sms_sent,
             )
+            append_phase3_telegram_delivery(alert, True)
         except Exception as exc:
             redacted = redact_notification_error(exc, [self.bot_token])
             append_notification_status(
@@ -2284,6 +2350,7 @@ class TelegramNotifier:
                 message,
                 sms_sent=alert.sms_sent,
             )
+            append_phase3_telegram_delivery(alert, False, redacted)
             logger.warning("Telegram send failed for %s: %s", alert.symbol, redacted)
 
 
@@ -2676,18 +2743,20 @@ class EliteScanner:
         if config.get("only_symbols_with_options", True):
             eligible = set(config.get("symbols_with_options", []))
             self.symbols = [s for s in self.symbols if s in eligible]
+        self.context_symbols = [symbol for symbol in self.market_context_symbols() if symbol not in self.symbols]
+        self.data_symbols = list(dict.fromkeys(self.symbols + self.context_symbols))
 
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
         start = session_history_start(self.config)
-        latest = self.provider.get_latest_bars(self.symbols)
+        latest = self.provider.get_latest_bars(self.data_symbols)
         recent: Dict[str, List[Bar]] = {}
         minutes_requested = max(1, int((end - start).total_seconds() // 60) + 1)
         api_safe_batch_size = max(1, 9000 // minutes_requested)
         configured_batch_size = max(1, int(self.config.get("discovery", {}).get("batch_size", 150)))
         batch_size = min(configured_batch_size, api_safe_batch_size)
-        for i in range(0, len(self.symbols), batch_size):
-            batch_symbols = self.symbols[i:i + batch_size]
+        for i in range(0, len(self.data_symbols), batch_size):
+            batch_symbols = self.data_symbols[i:i + batch_size]
             recent.update(self.provider.get_recent_bars(batch_symbols, start, end))
         news = self.provider.get_news(self.symbols)
 
@@ -2699,7 +2768,7 @@ class EliteScanner:
                 latest_news_map[item.symbol] = item
 
         snapshots: Dict[str, SymbolSnapshot] = {}
-        for symbol in self.symbols:
+        for symbol in self.data_symbols:
             rbars = recent.get(symbol, [])
             latest_bar = latest.get(symbol)
             pm_high = None
@@ -2730,7 +2799,7 @@ class EliteScanner:
                 or_15_low = min(b.l for b in or_15_bars)
 
             option_chain: List[OptionContractSnapshot] = []
-            if self.config.get("options", {}).get("enabled", True) and latest_bar:
+            if symbol in self.symbols and self.config.get("options", {}).get("enabled", True) and latest_bar:
                 try:
                     option_chain = self.provider.get_option_chain(symbol, self.config)
                 except Exception as exc:
@@ -3272,6 +3341,7 @@ class EliteScanner:
         alert.phase3_heads_up_next_eligible_time = None
         alert.phase3_heads_up_dedupe_minutes_remaining = None
         context_symbols = self.market_context_symbols()
+        alert.context_symbols_expected = list(context_symbols)
         alert.context_symbols_available = [
             symbol for symbol in context_symbols if (market_context or {}).get(symbol, "UNKNOWN") != "UNKNOWN"
         ]
@@ -3279,12 +3349,21 @@ class EliteScanner:
             "AVAILABLE" if len(alert.context_symbols_available) == len(context_symbols) else "UNAVAILABLE"
         )
         if alert.market_confirmation_status == "UNAVAILABLE":
-            warning = "Market confirmation unavailable — SPY/QQQ data missing."
+            alert.market_context_missing_warning = True
+            warning = "Market confirmation unavailable — check SPY/QQQ manually."
             if warning not in alert.scenario_warnings:
                 alert.scenario_warnings.append(warning)
+        else:
+            alert.market_context_missing_warning = False
+        alert.stock_only_heads_up_allowed = False
+        alert.stock_only_heads_up_reason = ""
+        alert.phase3_heads_up_final_decision = "BLOCKED"
+        alert.phase3_heads_up_final_block_reason = ""
+        alert.option_stale_did_not_block_heads_up = False
 
         def block(reason: str) -> None:
             alert.phase3_heads_up_block_reason = reason
+            alert.phase3_heads_up_final_block_reason = reason
             alert.phase3_heads_up_message_preview = phase3_heads_up_message(alert)
 
         if not config.get("enable_phase3_heads_up_alerts", True):
@@ -3306,6 +3385,8 @@ class EliteScanner:
             "Bearish VWAP/EMA Rejection Continuation",
             "Bullish Trend Continuation",
             "Bearish Trend Continuation",
+            "Breakout Continuation",
+            "Failed VWAP/EMA Reclaim",
         }
         if scenario_name not in allowed_scenarios:
             block(f"scenario {scenario_name or 'unknown'} is not heads-up eligible")
@@ -3316,44 +3397,71 @@ class EliteScanner:
             block("top scenario has no bullish/bearish direction")
             return
 
-        stage = str(alert.scenario_stage or scenario.get("stage") or "").upper()
-        if stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}:
-            block(f"Blocked: scenario stage is {stage}")
-            return
-        if stage not in {"FORMING", "CONFIRMED", "GOOD_POSITION"}:
-            block(f"scenario stage is {stage or 'UNKNOWN'}")
-            return
-
         if (data_quality or snapshot_data_quality(snap, self.config)) != "Fresh":
             block("Blocked: stale data")
             return
 
+        stage = str(alert.scenario_stage or scenario.get("stage") or "").upper()
         min_scenario = int(config.get("phase3_heads_up_min_scenario_score", 80))
         min_stock = int(config.get("phase3_heads_up_min_stock_score", 65))
         min_confirmation = int(config.get("phase3_heads_up_min_confirmation_score", 55))
-        if int(alert.scenario_score or scenario.get("score") or 0) < min_scenario:
-            block("scenario score below heads-up threshold")
-            return
-        if int(alert.stock_setup_score or alert.strategy_confidence_score or 0) < min_stock:
-            block("stock setup score below heads-up threshold")
-            return
-        if int(alert.confirmation_score or 0) < min_confirmation:
-            block(f"Blocked: confirmation below {min_confirmation}")
-            return
+        scenario_score = int(alert.scenario_score or scenario.get("score") or 0)
+        stock_score = int(alert.stock_setup_score or alert.strategy_confidence_score or 0)
+        confirmation_score = int(alert.confirmation_score or 0)
         risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
-        if risk in {"HIGH", "DO_NOT_CHASE"}:
-            block(f"Blocked: risk is {risk}")
-            return
         entry_quality = str(alert.entry_quality_label or "").upper()
-        if entry_quality in {"LATE", "DO_NOT_CHASE"}:
-            block(f"Blocked: entry quality is {entry_quality}")
+        failure_or_rejection = any(term in scenario_name.lower() for term in ("reject", "fail"))
+        candle_opposes = self.phase2_candle_contradicts(alert, scenario_direction)
+        stock_only_allowed = (
+            alert.symbol.upper() == "AAPL"
+            and scenario_score >= 75
+            and confirmation_score >= 55
+            and risk != "HIGH"
+            and (not alert.scenario_conflict or failure_or_rejection)
+            and (not candle_opposes or failure_or_rejection)
+            and stage not in {"INVALIDATED"}
+        )
+
+        normal_block_reason = ""
+        if stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}:
+            normal_block_reason = f"Blocked: scenario stage is {stage}"
+        elif stage not in {"FORMING", "CONFIRMED", "GOOD_POSITION"}:
+            normal_block_reason = f"scenario stage is {stage or 'UNKNOWN'}"
+        elif scenario_score < min_scenario:
+            normal_block_reason = "scenario score below heads-up threshold"
+        elif stock_score < min_stock:
+            normal_block_reason = "stock setup score below heads-up threshold"
+        elif confirmation_score < min_confirmation:
+            normal_block_reason = f"Blocked: confirmation below {min_confirmation}"
+        elif risk in {"HIGH", "DO_NOT_CHASE"}:
+            normal_block_reason = f"Blocked: risk is {risk}"
+        elif entry_quality in {"LATE", "DO_NOT_CHASE"}:
+            normal_block_reason = f"Blocked: entry quality is {entry_quality}"
+        elif alert.scenario_conflict:
+            normal_block_reason = "Blocked: scenario conflict"
+        elif alert.extension_label in {"VERY_EXTENDED", "DO_NOT_CHASE"}:
+            normal_block_reason = "Blocked: price is extremely extended"
+
+        if normal_block_reason and not stock_only_allowed:
+            block(normal_block_reason)
             return
-        if alert.scenario_conflict:
-            block("Blocked: scenario conflict")
-            return
-        if alert.extension_label in {"VERY_EXTENDED", "DO_NOT_CHASE"}:
-            block("Blocked: price is extremely extended")
-            return
+        if normal_block_reason:
+            alert.stock_only_heads_up_allowed = True
+            alert.stock_only_heads_up_reason = normal_block_reason
+            alert.phase3_heads_up_type = "STOCK_ONLY_WARNING"
+            if alert.option_quality in {"Stale quote", "Missing quote", "Unavailable"} or not alert.option_tradable:
+                alert.option_stale_did_not_block_heads_up = True
+                warning = "Option quote stale/missing — stock setup only."
+                if warning not in alert.scenario_warnings:
+                    alert.scenario_warnings.append(warning)
+            if stage == "LATE" or entry_quality == "LATE":
+                for warning in ("Late warning — do not chase.", "Wait for pullback/retest before entry."):
+                    if warning not in alert.scenario_warnings:
+                        alert.scenario_warnings.append(warning)
+            if risk == "DO_NOT_CHASE" or stage == "DO_NOT_CHASE" or entry_quality == "DO_NOT_CHASE":
+                warning = "Do Not Chase — watch only."
+                if warning not in alert.scenario_warnings:
+                    alert.scenario_warnings.append(warning)
 
         direction_conflict = self.phase2_direction_conflict(alert, scenario_direction)
         alert_direction = str(alert.direction or "").upper()
@@ -3379,7 +3487,8 @@ class EliteScanner:
             and entry_quality in {"GOOD_POSITION", "EARLY"}
             and alert.extension_label not in {"EXTENDED", "VERY_EXTENDED", "DO_NOT_CHASE"}
         )
-        alert.phase3_heads_up_type = "GOOD_POSITION" if good_position else "EARLY_WATCH"
+        if not alert.stock_only_heads_up_allowed:
+            alert.phase3_heads_up_type = "GOOD_POSITION" if good_position else "EARLY_WATCH"
         alert.phase3_heads_up_eligible = True
         if not config.get("phase3_heads_up_sms_enabled", True):
             block("Phase 3 heads-up SMS disabled")
@@ -3418,6 +3527,10 @@ class EliteScanner:
 
         alert.phase3_heads_up_sent = True
         alert.phase3_heads_up_block_reason = ""
+        alert.phase3_heads_up_final_decision = (
+            "STOCK_ONLY_PHASE3_HEADS_UP" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
+        )
+        alert.phase3_heads_up_final_block_reason = ""
         alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
         alert.notes.append("Phase 3 heads-up only: confirm on chart")
         alert.phase3_heads_up_message_preview = phase3_heads_up_message(alert)
@@ -4688,7 +4801,10 @@ class EliteScanner:
             if symbol in {"SPY", "QQQ"} and snap.recent_bars
         }
         count = 0
-        for snap in snapshots.values():
+        for symbol in self.symbols:
+            snap = snapshots.get(symbol)
+            if not snap:
+                continue
             for alert in self.evaluate_symbol(snap, market_context, market_bars):
                 if self.process_alert(alert):
                     count += 1
@@ -5742,13 +5858,15 @@ def run_tests() -> int:
             self.assertIn("Legacy/Phase 2 conflict present — confirm manually.", alert.scenario_warnings)
             self.assertIn("Legacy/Phase 2 conflict present", phase3_heads_up_message(alert))
 
-        def test_phase3_heads_up_do_not_chase_blocks(self) -> None:
+        def test_phase3_heads_up_do_not_chase_sends_stock_only_warning(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
             alert = self.make_phase3_heads_up_alert(risk_label="DO_NOT_CHASE")
             snap = self.make_phase3_heads_up_snapshot()
             scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
-            self.assertFalse(alert.phase3_heads_up_sent)
-            self.assertIn("DO_NOT_CHASE", alert.phase3_heads_up_block_reason)
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertTrue(alert.stock_only_heads_up_allowed)
+            self.assertEqual(alert.phase3_heads_up_type, "STOCK_ONLY_WARNING")
+            self.assertIn("Do Not Chase — watch only.", alert.scenario_warnings)
 
         def test_phase3_heads_up_high_risk_blocks(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
@@ -5764,12 +5882,13 @@ def run_tests() -> int:
             self.assertFalse(alert.phase3_heads_up_sent)
             self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: confirmation below 55")
 
-        def test_phase3_heads_up_late_entry_blocks(self) -> None:
+        def test_phase3_heads_up_late_entry_sends_stock_only_warning(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
             alert = self.make_phase3_heads_up_alert(entry_quality_label="LATE")
             scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
-            self.assertFalse(alert.phase3_heads_up_sent)
-            self.assertEqual(alert.phase3_heads_up_block_reason, "Blocked: entry quality is LATE")
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertTrue(alert.stock_only_heads_up_allowed)
+            self.assertEqual(alert.phase3_heads_up_type, "STOCK_ONLY_WARNING")
 
         def test_phase3_heads_up_scenario_conflict_blocks(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
@@ -5793,8 +5912,96 @@ def run_tests() -> int:
             )
             snap = self.make_phase3_heads_up_snapshot()
             scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
-            self.assertFalse(alert.phase3_heads_up_sent)
-            self.assertIn("scenario stage is LATE", alert.phase3_heads_up_block_reason)
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertTrue(alert.stock_only_heads_up_allowed)
+            self.assertEqual(alert.phase3_heads_up_type, "STOCK_ONLY_WARNING")
+            self.assertIn("Late warning — do not chase.", alert.scenario_warnings)
+            self.assertIn("not a buy/sell signal", phase3_heads_up_message(alert))
+
+        def test_stock_only_phase3_late_pullback_holding_sends_warning(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                scenario_stage="LATE",
+                scenario_score=83,
+                stock_setup_score=63,
+                confirmation_score=60,
+                entry_quality_label="LATE",
+                option_quality="Stale quote",
+                option_tradable=False,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 83},
+            )
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh", {})
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertEqual(alert.phase3_heads_up_final_decision, "STOCK_ONLY_PHASE3_HEADS_UP")
+            self.assertTrue(alert.market_context_missing_warning)
+            self.assertTrue(alert.option_stale_did_not_block_heads_up)
+            message = phase3_heads_up_message(alert)
+            self.assertIn("AAPL Phase 3 Stock Heads-Up", message)
+            self.assertIn("LATE WARNING", message)
+            self.assertIn("Option quote stale/missing", message)
+
+        def test_stock_only_phase3_do_not_chase_is_warning_only(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                risk_label="DO_NOT_CHASE",
+                entry_quality_label="DO_NOT_CHASE",
+                scenario_stage="DO_NOT_CHASE",
+                scenario_score=90,
+                confirmation_score=65,
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "DO_NOT_CHASE", "score": 90},
+            )
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertFalse(alert.sms_allowed)
+            self.assertIn("Do Not Chase — watch only.", alert.scenario_warnings)
+
+        def test_stock_only_phase3_duplicate_is_deduped(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            kwargs = {
+                "scenario_stage": "LATE",
+                "entry_quality_label": "LATE",
+                "scenario_score": 83,
+                "confirmation_score": 60,
+                "scenario_top": {"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 83},
+            }
+            first = self.make_phase3_heads_up_alert(**kwargs)
+            second = self.make_phase3_heads_up_alert(**kwargs)
+            scanner.evaluate_phase3_heads_up(first, self.make_phase3_heads_up_snapshot(), "Fresh")
+            scanner.evaluate_phase3_heads_up(second, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(first.phase3_heads_up_sent)
+            self.assertFalse(second.phase3_heads_up_sent)
+            self.assertTrue(second.phase3_heads_up_dedupe_blocked)
+
+        def test_stock_only_phase3_conflict_blocks_except_rejection(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            conflicted = self.make_phase3_heads_up_alert(
+                scenario_conflict=True,
+                scenario_stage="LATE",
+                scenario_top={"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "LATE", "score": 85},
+            )
+            scanner.evaluate_phase3_heads_up(conflicted, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertFalse(conflicted.phase3_heads_up_sent)
+            rejection = self.make_phase3_heads_up_alert(
+                direction="BEARISH",
+                strategy_direction="bearish",
+                scenario_direction="bearish",
+                scenario_conflict=True,
+                scenario_stage="LATE",
+                candle_label="SELLER_CONTROL",
+                scenario_top={"scenario_name": "Pullback Rejecting", "direction": "bearish", "stage": "LATE", "score": 85},
+            )
+            scanner.evaluate_phase3_heads_up(rejection, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(rejection.phase3_heads_up_sent)
+            self.assertTrue(rejection.stock_only_heads_up_allowed)
+
+        def test_context_symbols_are_collected_but_not_alert_symbols(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            snapshots = scanner.build_snapshots()
+            self.assertEqual(scanner.symbols, ["AAPL"])
+            self.assertEqual(scanner.context_symbols, ["SPY", "QQQ"])
+            self.assertEqual(set(snapshots), {"AAPL", "SPY", "QQQ"})
+            context = scanner.build_market_context(snapshots)
+            self.assertEqual(set(context), {"SPY", "QQQ"})
 
         def test_phase3_heads_up_stale_data_blocks(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
@@ -5913,7 +6120,7 @@ def run_tests() -> int:
             alert = self.make_phase3_heads_up_alert()
             scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh", {})
             self.assertEqual(alert.market_confirmation_status, "UNAVAILABLE")
-            self.assertIn("Market confirmation unavailable — SPY/QQQ data missing.", alert.scenario_warnings)
+            self.assertIn("Market confirmation unavailable — check SPY/QQQ manually.", alert.scenario_warnings)
 
         def test_phase3_heads_up_indicative_options_do_not_block(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
