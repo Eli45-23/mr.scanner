@@ -434,6 +434,7 @@ def export_review_package(
     options = records_for_day(read_jsonl(log_dir / "option_quality_decisions.jsonl"), day_text)
     market_data = records_for_day(read_jsonl(log_dir / "market_data_status.jsonl"), day_text)
     notifications = records_for_day(read_jsonl(log_dir / "notification_status.jsonl"), day_text)
+    startup_status = records_for_day(read_jsonl(log_dir / "scanner_startup_status.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -441,6 +442,7 @@ def export_review_package(
     write_jsonl(logs_out / "option_quality_decisions.jsonl", options)
     write_jsonl(logs_out / "market_data_status.jsonl", market_data)
     write_jsonl(logs_out / "notification_status.jsonl", notifications)
+    write_jsonl(logs_out / "scanner_startup_status.jsonl", startup_status)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))

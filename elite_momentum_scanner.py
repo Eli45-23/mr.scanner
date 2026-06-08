@@ -54,6 +54,8 @@ import json
 import logging
 import os
 import random
+import platform
+import socket
 import subprocess
 import tempfile
 import time
@@ -77,6 +79,7 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
 NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
+SCANNER_STARTUP_STATUS_LOG = LOG_DIR / "scanner_startup_status.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 
@@ -137,7 +140,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "messages_enabled": True,
         "messages_watch_enabled": True,
         "telegram_enabled": False,
-        "telegram_alert_types": ["PHASE3_HEADS_UP", "NORMAL_SMS", "NORMAL_WATCH"],
+        "telegram_alert_types": ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
         "telegram_aapl_only": True,
         "telegram_send_test_on_start": False,
         "telegram_timeout_seconds": 8,
@@ -358,6 +361,61 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_chain_contracts": 1000,
     },
 }
+
+
+def git_value(*args: str) -> str:
+    try:
+        git_dir = APP_DIR / ".git"
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if args == ("branch", "--show-current"):
+            return head.rsplit("/", 1)[-1] if head.startswith("ref: ") else "detached"
+        if args == ("rev-parse", "--short", "HEAD"):
+            if head.startswith("ref: "):
+                ref = head.split(" ", 1)[1]
+                ref_path = git_dir / ref
+                if ref_path.exists():
+                    return ref_path.read_text(encoding="utf-8").strip()[:7]
+                for line in (git_dir / "packed-refs").read_text(encoding="utf-8").splitlines():
+                    if line.endswith(f" {ref}"):
+                        return line.split(" ", 1)[0][:7]
+            return head[:7]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def telegram_destination_metadata(chat_id: Optional[str] = None) -> Dict[str, str]:
+    value = str(chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    destination_type = "group" if value.startswith("-") else "private" if value else "unknown"
+    return {
+        "telegram_destination_type": destination_type,
+        "telegram_chat_id_last4": value[-4:] if value else "",
+    }
+
+
+def scanner_identity(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config or {}
+    notifications = config.get("notifications", {})
+    alert_types = notifications.get(
+        "telegram_alert_types",
+        ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
+    )
+    if isinstance(alert_types, str):
+        alert_types = [part.strip().upper() for part in alert_types.split(",") if part.strip()]
+    return {
+        "scanner_instance_name": os.getenv("SCANNER_INSTANCE_NAME", "").strip() or socket.gethostname(),
+        "scanner_machine_role": os.getenv("SCANNER_MACHINE_ROLE", "").strip() or "unspecified",
+        "scanner_alert_profile": os.getenv("SCANNER_ALERT_PROFILE", "").strip() or "AAPL_TESTING",
+        "hostname": socket.gethostname(),
+        "git_commit": git_value("rev-parse", "--short", "HEAD"),
+        "git_branch": git_value("branch", "--show-current"),
+        "project_path": str(APP_DIR),
+        "python_version": platform.python_version(),
+        "alert_types_enabled": list(alert_types),
+        "alert_symbols": list(config.get("symbols") or ["AAPL"]),
+        "context_symbols": list(config.get("scenario_engine", {}).get("market_context_symbols") or ["SPY", "QQQ"]),
+        **telegram_destination_metadata(),
+    }
 
 
 # ------------------------------------------------------------
@@ -2051,16 +2109,23 @@ def append_notification_status(
     message_preview: str = "",
     sms_sent: Optional[bool] = None,
     dedupe_blocked: bool = False,
+    alert_source: Optional[str] = None,
+    chat_id: Optional[str] = None,
 ) -> None:
+    identity = scanner_identity(load_config(None))
     payload = {
         "timestamp": now_utc().isoformat(),
+        **identity,
         "channel": channel,
         "alert_type": alert_type,
+        "alert_source": alert_source or alert_type,
+        "message_source_path": alert_source or alert_type,
         "symbol": symbol,
         "sent": bool(sent),
         "sms_sent": sms_sent,
         "telegram_sent": bool(sent) if channel == "telegram" else None,
         "telegram_chat_id": "[REDACTED]" if channel == "telegram" else None,
+        **(telegram_destination_metadata(chat_id) if channel == "telegram" else {}),
         "telegram_error": redact_notification_error(error) if channel == "telegram" else "",
         "dedupe_blocked": bool(dedupe_blocked),
         "error": redact_notification_error(error),
@@ -2072,6 +2137,43 @@ def append_notification_status(
             handle.write(json.dumps(payload) + "\n")
     except Exception as exc:
         logger.warning("Notification status log failed: %s", redact_notification_error(exc))
+
+
+def send_telegram_message(
+    *,
+    token: str,
+    chat_id: str,
+    message: str,
+    timeout_seconds: int,
+    alert_type: str,
+    alert_source: str,
+    symbol: str,
+    sms_sent: Optional[bool] = None,
+    dedupe_blocked: bool = False,
+) -> Tuple[bool, str]:
+    if not token or not chat_id:
+        error = "Telegram bot token or chat ID is missing"
+        append_notification_status(
+            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id
+        )
+        return False, error
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        append_notification_status(
+            "telegram", alert_type, symbol, True, "", message, sms_sent, dedupe_blocked, alert_source, chat_id
+        )
+        return True, ""
+    except Exception as exc:
+        error = redact_notification_error(exc, [token, chat_id])
+        append_notification_status(
+            "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id
+        )
+        return False, error
 
 
 def latest_notification_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2303,6 +2405,8 @@ class TelegramNotifier:
         return None
 
     def alert_type_enabled(self, alert_type: str) -> bool:
+        if alert_type == "PHASE3_HEADS_UP" and "STOCK_ONLY_WARNING" in self.alert_types:
+            return "PHASE3_HEADS_UP" in self.alert_types or "STOCK_ONLY_WARNING" in self.alert_types
         if alert_type == "NORMAL_WATCH":
             return "NORMAL_WATCH" in self.alert_types or "NORMAL_SMS" in self.alert_types
         return alert_type in self.alert_types
@@ -2316,15 +2420,17 @@ class TelegramNotifier:
         if self.aapl_only and alert.symbol.upper() != "AAPL":
             return
         if not self.bot_token or not self.chat_id:
-            append_notification_status(
-                "telegram",
-                alert_type,
-                alert.symbol,
-                False,
-                "Telegram bot token or chat ID is missing",
+            _, error = send_telegram_message(
+                token=self.bot_token,
+                chat_id=self.chat_id,
+                message=phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False),
+                timeout_seconds=self.timeout_seconds,
+                alert_type=alert_type,
+                alert_source=alert_type,
+                symbol=alert.symbol,
                 sms_sent=alert.sms_sent,
             )
-            append_phase3_telegram_delivery(alert, False, "Telegram bot token or chat ID is missing")
+            append_phase3_telegram_delivery(alert, False, error)
             return
         message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else format_alert_message(alert, markdown=False)
         if alert_type == "PHASE3_HEADS_UP":
@@ -2374,35 +2480,26 @@ class TelegramNotifier:
             )
             append_phase3_telegram_delivery(alert, False, reason)
             return
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": message, "disable_web_page_preview": True},
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            append_notification_status(
-                "telegram",
-                alert_type,
-                alert.symbol,
-                True,
-                message_preview=message,
-                sms_sent=alert.sms_sent,
-            )
+        alert_source = (
+            "STOCK_ONLY_WARNING"
+            if alert_type == "PHASE3_HEADS_UP" and alert.stock_only_heads_up_allowed
+            else alert_type
+        )
+        sent, error = send_telegram_message(
+            token=self.bot_token,
+            chat_id=self.chat_id,
+            message=message,
+            timeout_seconds=self.timeout_seconds,
+            alert_type=alert_type,
+            alert_source=alert_source,
+            symbol=alert.symbol,
+            sms_sent=alert.sms_sent,
+        )
+        if sent:
             append_phase3_telegram_delivery(alert, True)
-        except Exception as exc:
-            redacted = redact_notification_error(exc, [self.bot_token])
-            append_notification_status(
-                "telegram",
-                alert_type,
-                alert.symbol,
-                False,
-                redacted,
-                message,
-                sms_sent=alert.sms_sent,
-            )
-            append_phase3_telegram_delivery(alert, False, redacted)
-            logger.warning("Telegram send failed for %s: %s", alert.symbol, redacted)
+        else:
+            append_phase3_telegram_delivery(alert, False, error)
+            logger.warning("Telegram send failed for %s: %s", alert.symbol, error)
 
 
 def send_telegram_test_message(config: Optional[Dict[str, Any]] = None) -> bool:
@@ -2411,23 +2508,18 @@ def send_telegram_test_message(config: Optional[Dict[str, Any]] = None) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     message = "Test alert from AAPL scanner — Telegram notifications are working."
-    if not token or not chat_id:
-        append_notification_status("telegram", "TEST", "AAPL", False, "Telegram bot token or chat ID is missing", message)
-        return False
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
-            timeout=int(notification_config.get("telegram_timeout_seconds", 8)),
-        )
-        response.raise_for_status()
-        append_notification_status("telegram", "TEST", "AAPL", True, message_preview=message)
-        return True
-    except Exception as exc:
-        redacted = redact_notification_error(exc)
-        append_notification_status("telegram", "TEST", "AAPL", False, redacted, message)
-        logger.warning("Telegram test failed: %s", redacted)
-        return False
+    sent, error = send_telegram_message(
+        token=token,
+        chat_id=chat_id,
+        message=message,
+        timeout_seconds=int(notification_config.get("telegram_timeout_seconds", 8)),
+        alert_type="TEST",
+        alert_source="TEST",
+        symbol="AAPL",
+    )
+    if not sent:
+        logger.warning("Telegram test failed: %s", error)
+    return sent
 
 
 class CompositeNotifier:
@@ -2445,7 +2537,10 @@ def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
     pushover_token = os.getenv("PUSHOVER_APP_TOKEN")
     pushover_user = os.getenv("PUSHOVER_USER_KEY")
     notification_config = config.get("notifications", {})
-    telegram_alert_types = notification_config.get("telegram_alert_types", ["PHASE3_HEADS_UP", "NORMAL_SMS", "NORMAL_WATCH"])
+    telegram_alert_types = notification_config.get(
+        "telegram_alert_types",
+        ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
+    )
     if isinstance(telegram_alert_types, str):
         telegram_alert_types = [part.strip() for part in telegram_alert_types.split(",") if part.strip()]
     return CompositeNotifier([
@@ -4975,6 +5070,12 @@ def env_float(name: str, default: float) -> float:
 
 
 def apply_strategy_env_config(config: Dict[str, Any]) -> None:
+    raw_alert_symbols = os.getenv("ALERT_SYMBOLS")
+    if raw_alert_symbols is not None:
+        symbols = [part.strip().upper() for part in raw_alert_symbols.split(",") if part.strip()]
+        if symbols:
+            config["symbols"] = symbols
+            config["symbols_with_options"] = list(symbols)
     notifications = config.setdefault("notifications", {})
     notifications["telegram_enabled"] = env_bool(
         "ENABLE_TELEGRAM_ALERTS",
@@ -6385,7 +6486,11 @@ def run_tests() -> int:
                 with patch("requests.post", return_value=response) as post:
                     self.assertTrue(send_telegram_test_message(load_config(None)))
                 self.assertEqual(post.call_args.kwargs["json"]["chat_id"], "-5213422925")
-                self.assertIn('"alert_type": "TEST"', NOTIFICATION_STATUS_LOG.read_text())
+                logged = NOTIFICATION_STATUS_LOG.read_text()
+                self.assertIn('"alert_type": "TEST"', logged)
+                self.assertIn('"telegram_destination_type": "group"', logged)
+                self.assertIn('"telegram_chat_id_last4": "2925"', logged)
+                self.assertNotIn("-5213422925", logged)
             finally:
                 self.restore_env(previous)
                 NOTIFICATION_STATUS_LOG = original_log
@@ -6425,6 +6530,29 @@ def run_tests() -> int:
                 self.assertNotIn(token, text)
             finally:
                 NOTIFICATION_STATUS_LOG = original_log
+
+        def test_scanner_identity_appears_in_startup_status_log(self) -> None:
+            global SCANNER_STARTUP_STATUS_LOG
+            original_log = SCANNER_STARTUP_STATUS_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            SCANNER_STARTUP_STATUS_LOG = temp_dir / "scanner_startup_status.jsonl"
+            previous = self.with_env(
+                {
+                    "SCANNER_INSTANCE_NAME": "TestMac",
+                    "SCANNER_MACHINE_ROLE": "backup",
+                    "SCANNER_ALERT_PROFILE": "AAPL_TESTING",
+                    "TELEGRAM_CHAT_ID": "-5213422925",
+                }
+            )
+            try:
+                payload = log_scanner_startup_status(load_config(None), {"stock_feed_status": "SIP", "options_feed_status": "OPRA"})
+                logged = SCANNER_STARTUP_STATUS_LOG.read_text()
+                self.assertEqual(payload["scanner_instance_name"], "TestMac")
+                self.assertIn('"telegram_chat_id_last4": "2925"', logged)
+                self.assertNotIn("-5213422925", logged)
+            finally:
+                self.restore_env(previous)
+                SCANNER_STARTUP_STATUS_LOG = original_log
 
         def test_telegram_only_sends_approved_phase3_or_normal_sms(self) -> None:
             from unittest.mock import patch
@@ -8634,6 +8762,40 @@ def log_market_data_startup_status(provider: DataProvider, config: Dict[str, Any
     return status
 
 
+def log_scanner_startup_status(config: Dict[str, Any], market_status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "timestamp": now_utc().isoformat(),
+        **scanner_identity(config),
+        "stock_feed": (market_status or {}).get("stock_feed_status")
+        or str(config.get("market_data", {}).get("stock_feed", "unknown")).upper(),
+        "options_feed": (market_status or {}).get("options_feed_status")
+        or str(config.get("options", {}).get("feed", "unknown")).upper(),
+        "opra_status": (market_status or {}).get("opra_status", "unknown"),
+    }
+    try:
+        with SCANNER_STARTUP_STATUS_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        logger.warning("Scanner startup status log failed: %s", redact_notification_error(exc))
+    logger.info(
+        "Scanner identity | instance=%s role=%s profile=%s host=%s commit=%s branch=%s",
+        payload["scanner_instance_name"],
+        payload["scanner_machine_role"],
+        payload["scanner_alert_profile"],
+        payload["hostname"],
+        payload["git_commit"],
+        payload["git_branch"],
+    )
+    logger.info(
+        "Scanner identity | alerts=%s context=%s Telegram=%s/*%s",
+        ",".join(payload["alert_symbols"]),
+        ",".join(payload["context_symbols"]),
+        payload["telegram_destination_type"],
+        payload["telegram_chat_id_last4"],
+    )
+    return payload
+
+
 def main() -> int:
     load_dotenv()
 
@@ -8668,7 +8830,8 @@ def main() -> int:
         logger.info("Running live scanner. Press Ctrl+C to stop.")
     if config.get("notifications", {}).get("telegram_send_test_on_start", False):
         send_telegram_test_message(config)
-    log_market_data_startup_status(provider, config, symbol=(config.get("symbols") or ["AAPL"])[0])
+    market_status = log_market_data_startup_status(provider, config, symbol=(config.get("symbols") or ["AAPL"])[0])
+    log_scanner_startup_status(config, market_status)
     scanner.run_forever()
     return 0
 
