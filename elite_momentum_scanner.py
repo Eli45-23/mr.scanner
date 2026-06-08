@@ -1591,8 +1591,10 @@ class AlertWriter:
             self.option_jsonl_path,
             {
                 "timestamp": alert.timestamp.isoformat(),
+                "timestamp_utc": alert.timestamp.astimezone(UTC).isoformat(),
                 **scanner_identity(),
                 "symbol": alert.symbol,
+                "underlying_symbol": alert.symbol,
                 "selected_option_symbol": alert.option_contract,
                 "underlying_price": alert.price,
                 "strike": alert.option_strike,
@@ -1608,12 +1610,14 @@ class AlertWriter:
                 "quote_age_seconds": alert.option_quote_age_seconds,
                 "max_allowed_quote_age_seconds": alert.option_max_quote_age_seconds,
                 "stale_reason": alert.option_stale_reason,
+                "invalid_reason": "missing_bid_or_ask" if alert.option_quality == "Invalid quote" else "",
                 "opra_feed_requested": latest_market_data_status().get("options_feed_requested"),
                 "opra_status": latest_market_data_status().get("opra_status"),
                 "data_source": alert.option_data_source,
                 "fallback_used": alert.option_fallback_used,
                 "option_quality_label": alert.option_quality,
                 "option_quality_score": alert.options_score,
+                "market_session_status": "active" if options_session_active(alert.timestamp) else "session_closed_or_inactive",
                 "alert_score": alert.alert_score,
                 "option_feed_status": alert.option_feed_status,
                 "option_tradability_score": alert.option_tradability_score,
@@ -2830,28 +2834,31 @@ def option_freshness_details(
     max_age = float(config.get("options", {}).get("max_quote_age_seconds", 60))
     age = option_quote_age_seconds(contract, current)
     reason = ""
+    invalid_reason = ""
     status = "recent"
     if contract.bid is None or contract.ask is None or contract.bid <= 0 or contract.ask <= 0 or contract.ask <= contract.bid:
         status = "invalid"
-        reason = "missing_bid_ask"
+        invalid_reason = "missing_bid_or_ask"
     elif quote_time is None:
         status = "stale"
         reason = "missing_timestamp"
     elif age is not None and age > max_age:
         status = "stale"
-        reason = "options_session_inactive" if not options_session_active(current) else "quote_age_exceeded"
+        reason = "session_closed_or_inactive" if not options_session_active(current) else "quote_age_exceeded"
     elif contract.spread_pct is None or contract.spread_pct > float(config.get("options", {}).get("max_spread_pct", 12)):
         status = "poor_quality"
         reason = "wide_spread"
     return {
         "status": status,
         "stale_reason": reason,
+        "invalid_reason": invalid_reason,
         "quote_timestamp_raw": str(contract.quote_time) if contract.quote_time is not None else None,
         "quote_timestamp_utc": quote_time.isoformat() if quote_time else None,
         "scanner_timestamp_utc": current.isoformat(),
         "quote_age_seconds": round(age, 3) if age is not None else None,
         "max_allowed_quote_age_seconds": max_age,
         "options_session_active": options_session_active(current),
+        "market_session_status": "active" if options_session_active(current) else "session_closed_or_inactive",
     }
 
 
@@ -2872,7 +2879,7 @@ def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, 
     reasons: List[str] = []
     freshness = option_freshness_details(contract, config)
     if freshness["status"] == "invalid":
-        return "Invalid quote", [freshness["stale_reason"]]
+        return "Invalid quote", [freshness["invalid_reason"]]
     if freshness["status"] == "stale":
         return "Stale quote", [freshness["stale_reason"]]
     if freshness["status"] == "poor_quality":
@@ -7849,7 +7856,8 @@ def run_tests() -> int:
             zero_bid = self.option_contract(bid=0.0)
             details = option_freshness_details(zero_bid, config)
             self.assertEqual(details["status"], "invalid")
-            self.assertEqual(details["stale_reason"], "missing_bid_ask")
+            self.assertEqual(details["stale_reason"], "")
+            self.assertEqual(details["invalid_reason"], "missing_bid_or_ask")
             self.assertEqual(option_contract_quality(zero_bid, config)[0], "Invalid quote")
 
         def test_option_freshness_wide_spread_is_poor_quality_not_stale(self) -> None:

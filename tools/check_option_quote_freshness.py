@@ -29,6 +29,10 @@ def main() -> int:
     call, put = scanner.select_option_contracts(chain, latest.c, config)
     market = scanner.latest_market_data_status(config)
     records = []
+    identity = scanner.scanner_identity(config)
+    print(f"Scanner instance: {identity['scanner_instance_name']}")
+    print(f"Hostname: {identity['hostname']}")
+    print(f"Git commit: {identity['git_commit']}")
     print(f"Stock feed requested: {scanner.stock_feed_from_config(config).upper()}")
     print(f"Options feed requested: {scanner.options_feed_from_config(config).upper()}")
     print(f"OPRA status: {market.get('opra_status', 'unknown')}")
@@ -48,13 +52,23 @@ def main() -> int:
     for label, selection in (("CALL", call), ("PUT", put)):
         contract = selection.contract
         if contract is None:
-            record = {"timestamp": scanner.now_utc().isoformat(), "symbol": symbol, "option_type": label, "stale_reason": "no_contract"}
+            record = {
+                "timestamp": scanner.now_utc().isoformat(),
+                **identity,
+                "symbol": symbol,
+                "underlying_symbol": symbol,
+                "option_type": label,
+                "status": "invalid",
+                "invalid_reason": "no_contract",
+                "stale_reason": "",
+            }
         else:
             details = scanner.option_freshness_details(contract, config)
             record = {
                 "timestamp": scanner.now_utc().isoformat(),
-                **scanner.scanner_identity(config),
+                **identity,
                 "symbol": symbol,
+                "underlying_symbol": symbol,
                 "selected_option_symbol": contract.symbol,
                 "option_type": label,
                 "underlying_price": latest.c,
@@ -67,12 +81,22 @@ def main() -> int:
                 "data_source": contract.feed,
                 "option_quality_label": selection.quality,
                 "option_quality_score": selection.score,
+                "opra_feed_requested": scanner.options_feed_from_config(config).upper(),
+                "opra_status": market.get("opra_status", "unknown"),
+                "fallback_used": contract.feed == "indicative",
                 **details,
             }
         records.append(record)
         print(f"\n{label}: {record.get('selected_option_symbol', 'unavailable')}")
-        for key in ("bid", "ask", "mid", "quote_timestamp_raw", "quote_timestamp_utc", "scanner_timestamp_utc", "quote_age_seconds", "max_allowed_quote_age_seconds", "status", "stale_reason", "option_quality_label"):
+        for key in ("bid", "ask", "mid", "spread_pct", "quote_timestamp_raw", "quote_timestamp_utc", "scanner_timestamp_utc", "quote_age_seconds", "max_allowed_quote_age_seconds", "market_session_status", "status", "stale_reason", "invalid_reason", "option_quality_label"):
             print(f"  {key}: {record.get(key)}")
+        final_decision = {
+            "recent": "TRADABLE",
+            "stale": "STALE",
+            "invalid": "INVALID",
+            "poor_quality": "POOR_QUALITY",
+        }.get(str(record.get("status", "")).lower(), "UNKNOWN")
+        print(f"  final_decision: {final_decision}")
     path = ROOT / "logs" / "option_freshness_diagnostic.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:

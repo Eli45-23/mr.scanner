@@ -150,15 +150,44 @@ def main() -> int:
         )
         ages = [float(row["quote_age_seconds"]) for row in rows if isinstance(row.get("quote_age_seconds"), (int, float))]
         reasons = Counter(str(row.get("stale_reason") or "none") for row in rows)
+        symbols = Counter(str(row.get("selected_option_symbol")) for row in rows if row.get("selected_option_symbol"))
+        stale_count = sum(count for quality, count in qualities.items() if "stale" in quality.lower())
+        tradable_count = sum(count for quality, count in qualities.items() if "tradable" in quality.lower())
+        invalid_count = sum(count for quality, count in qualities.items() if "invalid" in quality.lower())
+        poor_quality_count = sum(
+            count for quality, count in qualities.items()
+            if "wide spread" in quality.lower() or "poor_quality" in quality.lower()
+        )
+        latest = rows[-1] if rows else {}
         return {
             "quality_counts": dict(qualities),
+            "stale_quote_count": stale_count,
+            "tradable_count": tradable_count,
+            "invalid_quote_count": invalid_count,
+            "poor_quality_count": poor_quality_count,
             "average_quote_age_seconds": round(sum(ages) / len(ages), 2) if ages else None,
             "max_quote_age_seconds": max(ages) if ages else None,
-            "option_symbols": sorted({str(row.get("selected_option_symbol")) for row in rows if row.get("selected_option_symbol")}),
+            "most_common_option_symbols": symbols.most_common(5),
             "stale_reasons": dict(reasons),
+            "opra_feed_requested": latest.get("opra_feed_requested"),
+            "opra_status": latest.get("opra_status"),
+            "scanner_instance_name": latest.get("scanner_instance_name"),
+            "git_commit": latest.get("git_commit"),
         }
     left_options = option_summary(left["options"])
     right_options = option_summary(right["options"])
+    left_total = left_options["stale_quote_count"] + left_options["tradable_count"]
+    right_total = right_options["stale_quote_count"] + right_options["tradable_count"]
+    mostly_stale_mismatch = bool(
+        left_total
+        and right_total
+        and (
+            left_options["stale_quote_count"] / left_total >= 0.8
+            and right_options["tradable_count"] / right_total >= 0.8
+            or right_options["stale_quote_count"] / right_total >= 0.8
+            and left_options["tradable_count"] / left_total >= 0.8
+        )
+    )
     summary = {
         "left_name": args.left_name,
         "right_name": args.right_name,
@@ -172,6 +201,7 @@ def main() -> int:
         "decision_differences": decision_differences,
         "left_option_data": left_options,
         "right_option_data": right_options,
+        "option_data_problem_flagged": mostly_stale_mismatch,
     }
     json_path = output.with_suffix(".json")
     csv_path = output.with_suffix(".csv")
@@ -195,6 +225,11 @@ def main() -> int:
         f"- {args.right_name} average/max quote age: {right_options['average_quote_age_seconds']} / {right_options['max_quote_age_seconds']}",
         f"- {args.left_name} stale reasons: {left_options['stale_reasons']}",
         f"- {args.right_name} stale reasons: {right_options['stale_reasons']}",
+        f"- Mostly-stale vs mostly-tradable mismatch flagged: {'YES' if mostly_stale_mismatch else 'No'}",
+        f"- {args.left_name} common option symbols: {left_options['most_common_option_symbols']}",
+        f"- {args.right_name} common option symbols: {right_options['most_common_option_symbols']}",
+        f"- {args.left_name} OPRA requested/status: {left_options['opra_feed_requested']} / {left_options['opra_status']}",
+        f"- {args.right_name} OPRA requested/status: {right_options['opra_feed_requested']} / {right_options['opra_status']}",
         "- Likely cause when only one machine is mostly stale: timezone/config/code-version mismatch or cached old quote timestamps.",
         "- Recommended check: run `tools/check_option_quote_freshness.py --symbol AAPL` on both machines using the same commit and profile.",
         "", "## Timeline and Decisions", "",
