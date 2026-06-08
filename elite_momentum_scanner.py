@@ -459,6 +459,15 @@ class OptionContractSnapshot:
     implied_volatility: Optional[float] = None
     feed: str = ""
     is_simulated: bool = False
+    quote_raw_data: Dict[str, Any] = field(default_factory=dict)
+    quote_raw_type: Optional[str] = None
+    quote_timestamp_raw: Optional[str] = None
+    quote_timestamp_source_field: Optional[str] = None
+    timestamp_available_fields: List[str] = field(default_factory=list)
+    timestamp_extraction_failed: bool = False
+    timestamp_fallback_used: bool = False
+    timestamp_fallback_type: Optional[str] = None
+    timestamp_fallback_time: Optional[datetime] = None
 
     @property
     def mid(self) -> Optional[float]:
@@ -536,6 +545,11 @@ class Alert:
     option_stale_reason: Optional[str] = None
     option_data_source: Optional[str] = None
     option_fallback_used: Optional[bool] = None
+    option_timestamp_source_field: Optional[str] = None
+    option_timestamp_extraction_failed: Optional[bool] = None
+    option_timestamp_available_fields: List[str] = field(default_factory=list)
+    option_timestamp_fallback_type: Optional[str] = None
+    option_fallback_timestamp_utc: Optional[str] = None
     option_quality: Optional[str] = None
     options_score: Optional[int] = None
     direction: Optional[str] = None
@@ -730,6 +744,69 @@ def parse_optional_dt(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def safe_market_data_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    for method_name in ("model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                result = method()
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+    raw = getattr(value, "raw_data", None) or getattr(value, "raw", None)
+    if isinstance(raw, dict):
+        return dict(raw)
+    attrs = getattr(value, "__dict__", None)
+    return dict(attrs) if isinstance(attrs, dict) else {}
+
+
+def extract_quote_timestamp(quote: Any, symbol: Optional[str] = None) -> Dict[str, Any]:
+    candidate_names = ("timestamp", "t", "time", "updated_at", "created_at", "quote_timestamp")
+    available_fields: List[str] = []
+    visited: set[int] = set()
+
+    def walk(value: Any, path: str = "quote", depth: int = 0) -> Tuple[Any, Optional[str]]:
+        if value is None or depth > 4 or id(value) in visited:
+            return None, None
+        visited.add(id(value))
+        mapping = safe_market_data_mapping(value)
+        available_fields.extend(f"{path}.{key}" for key in mapping.keys())
+        for name in candidate_names:
+            candidate = getattr(value, name, None)
+            if candidate is None:
+                candidate = mapping.get(name)
+            if parse_optional_dt(candidate):
+                return candidate, f"{path}.{name}"
+        nested_names = ("quotes", "latestQuote", "latest_quote", "quote", "raw", "raw_data")
+        if symbol:
+            nested_names = (*nested_names, symbol)
+        for name in nested_names:
+            nested = mapping.get(name)
+            if nested is None:
+                nested = getattr(value, name, None)
+            if nested is not None:
+                candidate, source = walk(nested, f"{path}.{name}", depth + 1)
+                if source:
+                    return candidate, source
+        if symbol and symbol in mapping:
+            return walk(mapping[symbol], f"{path}.{symbol}", depth + 1)
+        return None, None
+
+    raw, source = walk(quote)
+    parsed = parse_optional_dt(raw)
+    return {
+        "quote_timestamp_raw": str(raw) if raw is not None else None,
+        "quote_timestamp_utc": parsed,
+        "timestamp_source_field": source,
+        "timestamp_extraction_failed": parsed is None,
+        "timestamp_available_fields": sorted(set(available_fields)),
+        "safe_raw_data": safe_market_data_mapping(quote),
+    }
 
 
 def parse_option_symbol(contract_symbol: str, underlying_symbol: str) -> Optional[Tuple[str, date, float]]:
@@ -1008,6 +1085,10 @@ class AlpacaProvider:
                     quote = item.get("latestQuote") or item.get("latest_quote") or item.get("q") or {}
                     trade = item.get("latestTrade") or item.get("latest_trade") or item.get("t") or {}
                     greeks = item.get("greeks") or {}
+                    quote_timestamp = extract_quote_timestamp(quote, contract_symbol)
+                    trade_timestamp = extract_quote_timestamp(trade, contract_symbol)
+                    quote_data = safe_market_data_mapping(quote)
+                    trade_data = safe_market_data_mapping(trade)
                     snapshots.append(
                         OptionContractSnapshot(
                             symbol=contract_symbol,
@@ -1015,16 +1096,37 @@ class AlpacaProvider:
                             option_type=option_type,
                             expiration_date=expiration_date,
                             strike=strike,
-                            bid=optional_float(first_present(quote, ["bp", "bid_price", "bidPrice", "bid"])),
-                            ask=optional_float(first_present(quote, ["ap", "ask_price", "askPrice", "ask"])),
-                            last=optional_float(first_present(trade, ["p", "price"])),
-                            quote_time=parse_optional_dt(first_present(quote, ["t", "timestamp"])),
-                            trade_time=parse_optional_dt(first_present(trade, ["t", "timestamp"])),
+                            bid=optional_float(first_present(quote_data, ["bp", "bid_price", "bidPrice", "bid"])),
+                            ask=optional_float(first_present(quote_data, ["ap", "ask_price", "askPrice", "ask"])),
+                            last=optional_float(first_present(trade_data, ["p", "price"])),
+                            quote_time=quote_timestamp["quote_timestamp_utc"],
+                            trade_time=trade_timestamp["quote_timestamp_utc"],
                             volume=optional_int(first_present(item, ["volume", "day_volume", "dailyVolume"])),
                             open_interest=optional_int(first_present(item, ["open_interest", "openInterest"])),
                             delta=optional_float(first_present(greeks, ["delta"])),
                             implied_volatility=optional_float(first_present(item, ["impliedVolatility", "implied_volatility", "iv"])),
                             feed=feed,
+                            quote_raw_data=quote_timestamp["safe_raw_data"],
+                            quote_raw_type=type(quote).__name__,
+                            quote_timestamp_raw=quote_timestamp["quote_timestamp_raw"],
+                            quote_timestamp_source_field=quote_timestamp["timestamp_source_field"],
+                            timestamp_available_fields=quote_timestamp["timestamp_available_fields"],
+                            timestamp_extraction_failed=quote_timestamp["timestamp_extraction_failed"],
+                            timestamp_fallback_used=bool(
+                                quote_timestamp["timestamp_extraction_failed"]
+                                and trade_timestamp["quote_timestamp_utc"]
+                            ),
+                            timestamp_fallback_type=(
+                                "latest_trade"
+                                if quote_timestamp["timestamp_extraction_failed"]
+                                and trade_timestamp["quote_timestamp_utc"]
+                                else None
+                            ),
+                            timestamp_fallback_time=(
+                                trade_timestamp["quote_timestamp_utc"]
+                                if quote_timestamp["timestamp_extraction_failed"]
+                                else None
+                            ),
                         )
                     )
 
@@ -1606,6 +1708,9 @@ class AlertWriter:
                 "spread": alert.option_spread_pct,
                 "quote_timestamp_raw": alert.option_quote_timestamp_raw,
                 "quote_timestamp_utc": alert.option_quote_timestamp_utc,
+                "timestamp_source_field": alert.option_timestamp_source_field,
+                "timestamp_extraction_failed": alert.option_timestamp_extraction_failed,
+                "timestamp_available_fields": alert.option_timestamp_available_fields,
                 "scanner_timestamp_utc": alert.timestamp.astimezone(UTC).isoformat(),
                 "quote_age_seconds": alert.option_quote_age_seconds,
                 "max_allowed_quote_age_seconds": alert.option_max_quote_age_seconds,
@@ -1615,6 +1720,8 @@ class AlertWriter:
                 "opra_status": latest_market_data_status().get("opra_status"),
                 "data_source": alert.option_data_source,
                 "fallback_used": alert.option_fallback_used,
+                "fallback_type": alert.option_timestamp_fallback_type,
+                "fallback_timestamp_utc": alert.option_fallback_timestamp_utc,
                 "option_quality_label": alert.option_quality,
                 "option_quality_score": alert.options_score,
                 "market_session_status": "active" if options_session_active(alert.timestamp) else "session_closed_or_inactive",
@@ -2831,34 +2938,47 @@ def option_freshness_details(
 ) -> Dict[str, Any]:
     current = parse_optional_dt(scanner_time or now_utc()) or now_utc()
     quote_time = parse_optional_dt(contract.quote_time)
+    fallback_time = parse_optional_dt(contract.timestamp_fallback_time or contract.trade_time) if quote_time is None else None
     max_age = float(config.get("options", {}).get("max_quote_age_seconds", 60))
     age = option_quote_age_seconds(contract, current)
+    fallback_age = max(0.0, (current - fallback_time).total_seconds()) if fallback_time else None
     reason = ""
     invalid_reason = ""
     status = "recent"
     if contract.bid is None or contract.ask is None or contract.bid <= 0 or contract.ask <= 0 or contract.ask <= contract.bid:
         status = "invalid"
         invalid_reason = "missing_bid_or_ask"
-    elif quote_time is None:
-        status = "stale"
-        reason = "missing_timestamp"
-    elif age is not None and age > max_age:
-        status = "stale"
-        reason = "session_closed_or_inactive" if not options_session_active(current) else "quote_age_exceeded"
     elif contract.spread_pct is None or contract.spread_pct > float(config.get("options", {}).get("max_spread_pct", 12)):
         status = "poor_quality"
         reason = "wide_spread"
+    elif quote_time is None:
+        if fallback_age is not None and fallback_age <= max_age:
+            status = "diagnostic"
+            reason = "quote_timestamp_missing_recent_activity_fallback"
+        else:
+            status = "stale"
+            reason = "missing_timestamp"
+    elif age is not None and age > max_age:
+        status = "stale"
+        reason = "session_closed_or_inactive" if not options_session_active(current) else "quote_age_exceeded"
     return {
         "status": status,
         "stale_reason": reason,
         "invalid_reason": invalid_reason,
-        "quote_timestamp_raw": str(contract.quote_time) if contract.quote_time is not None else None,
+        "quote_timestamp_raw": contract.quote_timestamp_raw or (str(contract.quote_time) if contract.quote_time is not None else None),
         "quote_timestamp_utc": quote_time.isoformat() if quote_time else None,
         "scanner_timestamp_utc": current.isoformat(),
         "quote_age_seconds": round(age, 3) if age is not None else None,
         "max_allowed_quote_age_seconds": max_age,
         "options_session_active": options_session_active(current),
         "market_session_status": "active" if options_session_active(current) else "session_closed_or_inactive",
+        "timestamp_source_field": contract.quote_timestamp_source_field,
+        "timestamp_extraction_failed": contract.timestamp_extraction_failed,
+        "timestamp_available_fields": contract.timestamp_available_fields,
+        "fallback_used": quote_time is None and fallback_time is not None,
+        "fallback_type": contract.timestamp_fallback_type or ("latest_trade" if quote_time is None and fallback_time else None),
+        "fallback_timestamp_utc": fallback_time.isoformat() if fallback_time else None,
+        "fallback_age_seconds": round(fallback_age, 3) if fallback_age is not None else None,
     }
 
 
@@ -2884,6 +3004,8 @@ def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, 
         return "Stale quote", [freshness["stale_reason"]]
     if freshness["status"] == "poor_quality":
         return "Wide spread", [freshness["stale_reason"]]
+    if freshness["status"] == "diagnostic":
+        return "Tradable diagnostic", [freshness["stale_reason"]]
 
     min_volume = int(options_config.get("min_option_volume", 100))
     min_oi = int(options_config.get("min_open_interest", 250))
@@ -4702,6 +4824,12 @@ class EliteScanner:
             alert.option_stale_reason = freshness["stale_reason"]
             alert.option_data_source = contract.feed or "unknown"
             alert.option_fallback_used = contract.feed == "indicative"
+            alert.option_timestamp_source_field = freshness["timestamp_source_field"]
+            alert.option_timestamp_extraction_failed = freshness["timestamp_extraction_failed"]
+            alert.option_timestamp_available_fields = list(freshness["timestamp_available_fields"])
+            alert.option_fallback_used = bool(alert.option_fallback_used or freshness["fallback_used"])
+            alert.option_timestamp_fallback_type = freshness["fallback_type"]
+            alert.option_fallback_timestamp_utc = freshness["fallback_timestamp_utc"]
             alert.notes.append(
                 f"suggested option: {contract.symbol} ({selection.quality}, score {selection.score})"
             )
@@ -7865,6 +7993,49 @@ def run_tests() -> int:
             details = option_freshness_details(self.option_contract(bid=1.0, ask=1.5), config)
             self.assertEqual(details["status"], "poor_quality")
             self.assertEqual(details["stale_reason"], "wide_spread")
+
+        def test_extract_quote_timestamp_handles_objects_dicts_and_nested_quotes(self) -> None:
+            class TimestampQuote:
+                timestamp = "2026-06-08T15:00:00Z"
+
+            class TQuote:
+                t = "2026-06-08T15:00:01Z"
+
+            cases = [
+                (TimestampQuote(), "quote.timestamp"),
+                (TQuote(), "quote.t"),
+                ({"t": "2026-06-08T15:00:02Z"}, "quote.t"),
+                ({"quotes": {"AAPLTEST": {"t": "2026-06-08T15:00:03Z"}}}, "quote.quotes.AAPLTEST.t"),
+            ]
+            for raw, expected_source in cases:
+                extracted = extract_quote_timestamp(raw, "AAPLTEST")
+                self.assertIsNotNone(extracted["quote_timestamp_utc"])
+                self.assertEqual(extracted["timestamp_source_field"], expected_source)
+                self.assertFalse(extracted["timestamp_extraction_failed"])
+
+        def test_option_missing_quote_timestamp_recent_trade_is_diagnostic_only(self) -> None:
+            config = load_config(None)
+            contract = self.option_contract()
+            contract.quote_time = None
+            contract.trade_time = now_utc() - timedelta(seconds=5)
+            contract.timestamp_extraction_failed = True
+            contract.timestamp_fallback_type = "latest_trade"
+            contract.timestamp_fallback_time = contract.trade_time
+            details = option_freshness_details(contract, config)
+            self.assertEqual(details["status"], "diagnostic")
+            self.assertTrue(details["fallback_used"])
+            self.assertEqual(details["fallback_type"], "latest_trade")
+            self.assertEqual(option_contract_quality(contract, config)[0], "Tradable diagnostic")
+            self.assertFalse(OptionSelection(contract, "Tradable diagnostic", 0).is_tradable())
+
+        def test_option_missing_quote_timestamp_without_fallback_is_stale(self) -> None:
+            config = load_config(None)
+            contract = self.option_contract()
+            contract.quote_time = None
+            contract.trade_time = None
+            details = option_freshness_details(contract, config)
+            self.assertEqual(details["status"], "stale")
+            self.assertEqual(details["stale_reason"], "missing_timestamp")
 
         def test_mixed_signal_and_news_are_explained_as_context_only(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()

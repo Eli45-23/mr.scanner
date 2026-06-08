@@ -81,6 +81,13 @@ def main() -> int:
                 "data_source": contract.feed,
                 "option_quality_label": selection.quality,
                 "option_quality_score": selection.score,
+                "quote_object_type": contract.quote_raw_type,
+                "quote_repr": repr(contract.quote_raw_data)[:2000],
+                "quote_dict": contract.quote_raw_data,
+                "quote___dict__": contract.quote_raw_data if contract.quote_raw_type != "dict" else None,
+                "quote_model_dump": contract.quote_raw_data if contract.quote_raw_type != "dict" else None,
+                "quote_raw_data": contract.quote_raw_data,
+                "quote_top_level_keys": sorted(contract.quote_raw_data.keys()),
                 "opra_feed_requested": scanner.options_feed_from_config(config).upper(),
                 "opra_status": market.get("opra_status", "unknown"),
                 "fallback_used": contract.feed == "indicative",
@@ -88,8 +95,11 @@ def main() -> int:
             }
         records.append(record)
         print(f"\n{label}: {record.get('selected_option_symbol', 'unavailable')}")
-        for key in ("bid", "ask", "mid", "spread_pct", "quote_timestamp_raw", "quote_timestamp_utc", "scanner_timestamp_utc", "quote_age_seconds", "max_allowed_quote_age_seconds", "market_session_status", "status", "stale_reason", "invalid_reason", "option_quality_label"):
+        for key in ("bid", "ask", "mid", "spread_pct", "quote_object_type", "quote_top_level_keys", "timestamp_source_field", "timestamp_available_fields", "timestamp_extraction_failed", "quote_timestamp_raw", "quote_timestamp_utc", "scanner_timestamp_utc", "quote_age_seconds", "max_allowed_quote_age_seconds", "fallback_used", "fallback_type", "fallback_timestamp_utc", "market_session_status", "status", "stale_reason", "invalid_reason", "option_quality_label"):
             print(f"  {key}: {record.get(key)}")
+        print(f"  quote_repr: {record.get('quote_repr')}")
+        print(f"  quote_dict: {record.get('quote_dict')}")
+        print(f"  quote_raw_data: {record.get('quote_raw_data')}")
         final_decision = {
             "recent": "TRADABLE",
             "stale": "STALE",
