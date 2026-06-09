@@ -8099,12 +8099,26 @@ def run_tests() -> int:
                 "title": facts["title"],
                 "bias": "BEARISH structure with conflicting signals",
                 "why": facts["why"],
+                "market": facts["market"],
+                "structure": facts["structure"],
                 "risk": facts["risk"],
                 "wait_for": facts["wait_for"],
                 "invalidation": facts["invalidation"],
                 "option": facts["option"],
                 "reminder": preview_alert_text.DISCLAIMER,
-                "final_message": rule,
+                "final_message": "\n\n".join(
+                    [
+                        facts["title"],
+                        f"Why:\n{facts['why']}",
+                        f"Market:\n{facts['market']}",
+                        f"Structure:\n{facts['structure']}",
+                        f"Risk:\n{facts['risk']}",
+                        f"Wait for:\n{facts['wait_for']}",
+                        f"Invalidation:\n{facts['invalidation']}",
+                        f"Option:\n{facts['option']}",
+                        preview_alert_text.DISCLAIMER,
+                    ]
+                ),
             }
             forbidden = dict(valid_output, final_message=rule.replace("Why:", "Why: Buy now."))
             changed = dict(
@@ -8115,6 +8129,33 @@ def run_tests() -> int:
             )
             self.assertFalse(preview_alert_text.validate_openai_output("mixed", forbidden, facts)[0])
             self.assertFalse(preview_alert_text.validate_openai_output("mixed", changed, facts)[0])
+
+        def test_preview_openai_rejects_paragraph_and_missing_sections(self) -> None:
+            from tools import preview_alert_text
+
+            alert = preview_alert_text.sample_alerts()["mixed"]
+            rule = preview_alert_text.render_cases("mixed")["mixed"]
+            facts = preview_alert_text.extract_rule_facts("mixed", alert, rule)
+            output = {
+                "title": facts["title"],
+                "bias": "BEARISH",
+                "why": facts["why"],
+                "market": facts["market"],
+                "structure": facts["structure"],
+                "risk": facts["risk"],
+                "wait_for": facts["wait_for"],
+                "invalidation": facts["invalidation"],
+                "option": facts["option"],
+                "reminder": preview_alert_text.DISCLAIMER,
+                "final_message": (
+                    f"{facts['title']}. {facts['why']} {facts['risk']} "
+                    f"Invalidation: {facts['invalidation']}. Option: {facts['option']}. "
+                    f"{preview_alert_text.DISCLAIMER}"
+                ),
+            }
+            valid, reason = preview_alert_text.validate_openai_output("mixed", output, facts)
+            self.assertFalse(valid)
+            self.assertIn("labeled sections", reason)
 
         def test_preview_openai_failure_redacts_key_and_logs_fallback(self) -> None:
             from tools import preview_alert_text

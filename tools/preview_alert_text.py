@@ -33,6 +33,8 @@ OPENAI_SCHEMA_FIELDS = (
     "title",
     "bias",
     "why",
+    "market",
+    "structure",
     "risk",
     "wait_for",
     "invalidation",
@@ -48,6 +50,17 @@ FORBIDDEN_PHRASES = (
     "take this trade",
     "guaranteed",
     "must trade",
+    "considering any action",
+)
+OPENAI_MAX_CHARS = 750
+REQUIRED_SECTION_LABELS = (
+    "Why:",
+    "Market:",
+    "Structure:",
+    "Risk:",
+    "Wait for:",
+    "Invalidation:",
+    "Option:",
 )
 
 
@@ -265,6 +278,22 @@ def parse_openai_json(data: Dict[str, Any]) -> Dict[str, Any]:
     return parsed
 
 
+def assemble_openai_message(output: Dict[str, Any], facts: Dict[str, str]) -> str:
+    return "\n\n".join(
+        [
+            facts["title"],
+            f"Why:\n{str(output.get('why') or '').strip()}",
+            f"Market:\n{str(output.get('market') or facts['market']).strip()}",
+            f"Structure:\n{str(output.get('structure') or facts['structure']).strip()}",
+            f"Risk:\n{str(output.get('risk') or '').strip()}",
+            f"Wait for:\n{str(output.get('wait_for') or '').strip()}",
+            f"Invalidation:\n{facts['invalidation']}",
+            f"Option:\n{facts['option']}",
+            DISCLAIMER,
+        ]
+    )
+
+
 def validate_openai_output(name: str, output: Dict[str, Any], facts: Dict[str, str]) -> Tuple[bool, str]:
     failures = []
     for field in OPENAI_SCHEMA_FIELDS:
@@ -274,11 +303,24 @@ def validate_openai_output(name: str, output: Dict[str, Any], facts: Dict[str, s
         return False, "; ".join(failures)
 
     message = output["final_message"].strip()
+    sections = message.split("\n\n")
+    expected_sections = 1 + len(REQUIRED_SECTION_LABELS) + 1
+    if len(sections) != expected_sections:
+        failures.append("must use title, labeled sections, and disclaimer separated by blank lines")
+    else:
+        if sections[0].strip() != facts["title"]:
+            failures.append("title must be its own section")
+        for section, label in zip(sections[1:-1], REQUIRED_SECTION_LABELS):
+            lines = section.splitlines()
+            if len(lines) != 2 or lines[0].strip() != label or not lines[1].strip():
+                failures.append(f"{label} must have exactly one short content line")
+        if sections[-1].strip() != DISCLAIMER:
+            failures.append("disclaimer must be its own final section")
     if output["title"].strip() != facts["title"] or not message.startswith(facts["title"]):
         failures.append("changed locked title/conclusion")
-    if output["invalidation"].strip() != facts["invalidation"] or facts["invalidation"] not in message:
+    if output["invalidation"].strip() != facts["invalidation"] or f"Invalidation:\n{facts['invalidation']}" not in message:
         failures.append("changed or omitted invalidation")
-    if output["option"].strip() != facts["option"] or facts["option"] not in message:
+    if output["option"].strip() != facts["option"] or f"Option:\n{facts['option']}" not in message:
         failures.append("changed or omitted option quality")
     if output["reminder"].strip() != DISCLAIMER or DISCLAIMER not in message:
         failures.append("changed or omitted disclaimer")
@@ -294,8 +336,8 @@ def validate_openai_output(name: str, output: Dict[str, Any], facts: Dict[str, s
     for phrase in FORBIDDEN_PHRASES:
         if re.search(rf"\b{re.escape(phrase)}\b", actionable_text, flags=re.IGNORECASE):
             failures.append(f"forbidden language: {phrase}")
-    if len(message) > 900:
-        failures.append("message exceeds 900 characters")
+    if len(message) > OPENAI_MAX_CHARS:
+        failures.append(f"message exceeds {OPENAI_MAX_CHARS} characters")
     base_valid, base_reason = validate_message(name, message)
     if not base_valid:
         failures.append(base_reason)
@@ -357,17 +399,23 @@ def format_with_openai(
         return {"message": rule_message, "success": False, "fallback_used": True, "error": error, "model": model}
 
     system_prompt = (
-        "You rewrite scanner alert text for phone readability only. Never change facts, direction, conclusion, "
-        "setup, risk, option quality, invalidation, or reminder. Never give trading advice or use promotional language. "
+        "You are a strict phone-alert copy editor. Rewrite wording inside labeled sections only. "
+        "Never change facts, direction, conclusion, setup, risk, option quality, invalidation, or reminder. "
+        "Never soften risk. Never give trading advice or use promotional language. No paragraph-style output. "
+        "Each labeled section must contain exactly one short plain-English sentence. No repeated facts. "
         "Return JSON only with exactly: title, bias, why, risk, wait_for, invalidation, option, reminder, final_message."
     )
     user_prompt = (
         "Rewrite the alert using the locked facts below. The title, direction, setup, invalidation, option, and reminder "
-        "are immutable. Keep final_message under 900 characters. Do not use buy, sell, enter now, get in, take this trade, "
-        "guaranteed, or must trade. Preserve MIXED / NO TRADE exactly when present. "
-        "final_message must begin with title and include these exact labeled lines: "
-        "'Invalidation: <invalidation>', 'Option: <option>', and the exact reminder. "
-        "Use the locked direction in bias. Keep the locked setup name in final_message when one exists.\n\nLOCKED FACTS:\n"
+        f"are immutable. Keep final_message at or below {OPENAI_MAX_CHARS} characters. "
+        "Do not use buy, sell, enter now, get in, take this trade, guaranteed, must trade, or considering any action. "
+        "Preserve MIXED / NO TRADE, DO NOT CHASE, and CONTEXT ONLY exactly when present. "
+        "Use exactly this multiline format, including blank lines and labels:\n\n"
+        "<title>\n\nWhy:\n<one short sentence>\n\nMarket:\n<one short sentence>\n\n"
+        "Structure:\n<one short sentence>\n\nRisk:\n<one short sentence>\n\n"
+        "Wait for:\n<one short sentence>\n\nInvalidation:\n<exact locked invalidation>\n\n"
+        "Option:\n<exact locked option>\n\n<exact locked reminder>\n\n"
+        "Use the locked direction in bias and keep the locked setup name when one exists.\n\nLOCKED FACTS:\n"
         + json.dumps(facts, separators=(",", ":"))
     )
     schema_properties = {field: {"type": "string"} for field in OPENAI_SCHEMA_FIELDS}
@@ -400,6 +448,7 @@ def format_with_openai(
         )
         response.raise_for_status()
         output = parse_openai_json(response.json())
+        output["final_message"] = assemble_openai_message(output, facts)
         valid, reason = validate_openai_output(name, output, facts)
         if not valid:
             raise ValueError(f"OpenAI output rejected: {reason}")
