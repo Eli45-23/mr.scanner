@@ -8042,6 +8042,40 @@ def run_tests() -> int:
                 self.restore_env(previous)
                 NOTIFICATION_STATUS_LOG = original_log
 
+        def test_preview_alert_tool_renders_all_cases_without_market_data_or_secrets(self) -> None:
+            from tools import preview_alert_text
+
+            rendered = preview_alert_text.render_cases("all")
+            self.assertEqual(set(rendered), set(preview_alert_text.CASE_NAMES))
+            for name, message in rendered.items():
+                valid, reason = preview_alert_text.validate_message(name, message)
+                self.assertTrue(valid, reason)
+                self.assertIn("Invalidation:", message)
+                self.assertIn("Option:", message)
+                self.assertLessEqual(len(message), 900)
+
+        def test_preview_alert_tool_only_sends_with_explicit_flag(self) -> None:
+            import sys
+            from unittest.mock import patch
+            from tools import preview_alert_text
+
+            with patch.object(sys, "argv", ["preview_alert_text.py", "--case", "mixed"]), patch.object(
+                preview_alert_text.scanner, "send_telegram_message"
+            ) as send:
+                self.assertEqual(preview_alert_text.main(), 0)
+                send.assert_not_called()
+            with patch.object(
+                sys,
+                "argv",
+                ["preview_alert_text.py", "--case", "mixed", "--send-telegram"],
+            ), patch.object(
+                preview_alert_text.scanner,
+                "send_telegram_message",
+                return_value=(True, ""),
+            ) as send:
+                self.assertEqual(preview_alert_text.main(), 0)
+                send.assert_called_once()
+
         def test_telegram_success_and_failure_are_logged_without_token(self) -> None:
             from unittest.mock import Mock, patch
             global NOTIFICATION_STATUS_LOG
