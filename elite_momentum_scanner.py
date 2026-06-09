@@ -2256,6 +2256,55 @@ def confirmation_required_for_tier(alert: Alert) -> str:
     return "Context only; wait for a valid setup."
 
 
+def telegram_risk_warning_reason(alert: Alert) -> Optional[str]:
+    if alert.alert_tier != "RISK_WARNING":
+        return None
+
+    reasons: List[str] = []
+    regime = str(alert.market_regime or "").upper()
+    risk = str(alert.setup_risk_label or alert.risk_label or alert.scenario_risk_label or "").upper()
+    entry = str(alert.entry_timing_label or alert.entry_quality_label or "").upper()
+    option_quality = normalize_option_quality_label(alert.option_quality or alert.option_feed_status)
+    candle = str(alert.candle_label or "").upper()
+
+    if regime in {"CHOPPY", "RANGE_BOUND"}:
+        reasons.append(f"{regime.lower().replace('_', '-')} market")
+    if risk in {"HIGH", "DO_NOT_CHASE"}:
+        reasons.append(f"setup risk {risk}")
+    if entry in {"LATE", "DO_NOT_CHASE"}:
+        reasons.append(f"entry timing {entry}")
+    if option_quality in {"WIDE_SPREAD", "POOR_QUALITY", "STALE", "INVALID", "TOO_RISKY_0DTE", "LOW_LIQUIDITY"}:
+        reasons.append(f"option {option_quality.lower().replace('_', ' ')}")
+    if alert.confirmation_score is not None and alert.confirmation_score < 60:
+        reasons.append("confirmation below 60")
+    if alert.mixed_signal_detected or alert.scenario_conflict:
+        reasons.append("mixed/direction conflict")
+    if candle in {"INDECISION", "REJECTION"}:
+        reasons.append(f"candle {candle.lower()}")
+    if not reasons:
+        reasons.append(alert.alert_tier_reason or "manual risk review required")
+    return ", ".join(dict.fromkeys(reasons[:4]))
+
+
+def _telegram_title(symbol: str, alert_type: str) -> str:
+    titles = {
+        "PHASE3_HEADS_UP": "Phase 3 Heads-Up",
+        "NORMAL_SMS": "Scanner Alert",
+        "NORMAL_WATCH": "Watch Alert",
+        "STOCK_ONLY_WARNING": "Watch-Only Warning",
+    }
+    return f"{symbol} {titles.get(str(alert_type).upper(), 'Scanner Alert')}"
+
+
+def _telegram_reason(alert: Alert, scenario: Dict[str, Any]) -> str:
+    if alert.setup_reason:
+        return alert.setup_reason
+    reasons = scenario.get("reasons") or alert.scenario_reasons or alert.strategy_reasons
+    if reasons:
+        return "; ".join(str(reason) for reason in reasons[:2])
+    return "No clear setup reason"
+
+
 def compact_alert_message(alert: Alert) -> str:
     apply_risk_invalidation(alert)
     assign_professional_alert_tier(alert)
@@ -2640,46 +2689,43 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
     score = alert.setup_score if alert.setup_score is not None else alert.scenario_score if alert.scenario_score is not None else alert.alert_score or 0
     risk = alert.setup_risk_label or alert.risk_label or alert.scenario_risk_label or "UNKNOWN"
     option_quality = alert.option_quality_message or option_quality_message(alert.option_quality or alert.option_feed_status)
+    market_bits = [str(alert.market_regime or "UNKNOWN")]
+    if alert.spy_alignment:
+        market_bits.append(f"SPY {alert.spy_alignment}")
+    if alert.qqq_alignment:
+        market_bits.append(f"QQQ {alert.qqq_alignment}")
+    structure_bits = [
+        f"1m {alert.trend_1m or 'UNKNOWN'}",
+        f"5m {alert.trend_5m or 'UNKNOWN'}",
+        f"15m {alert.trend_15m or 'UNKNOWN'}",
+    ]
+    if alert.current_structure_bias:
+        structure_bits.append(f"bias {alert.current_structure_bias}")
     invalidation = (
         f"{alert.invalidation_level:.2f} — {alert.invalidation_reason}"
         if alert.invalidation_level is not None
         else alert.invalidation_reason or "No clean invalidation — watch only"
     )
-    risk_warning = (
-        "DO NOT CHASE. Wait for pullback/retest."
-        if alert.do_not_chase_warning
-        else "Pullback/retest required."
-        if alert.pullback_required
-        else "Confirm invalidation and timing manually."
-    )
-    base_message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else compact_alert_message(alert)
-    return "\n".join(
-        [
-            f"Tier: {alert.alert_tier}",
-            f"Setup: {setup}",
-            f"Direction: {str(direction).upper()}",
-            f"Stage: {stage}",
-            f"Score: {score}",
-            f"Risk: {risk}",
-            f"Market regime: {alert.market_regime or 'UNKNOWN'} — {alert.regime_reason or 'No clear regime reason'}",
-            f"Structure: 1m {alert.trend_1m or 'UNKNOWN'} | 5m {alert.trend_5m or 'UNKNOWN'} | 15m {alert.trend_15m or 'UNKNOWN'} | bias {alert.current_structure_bias or 'UNKNOWN'}",
-            f"Entry timing: {alert.entry_timing_label}",
-            f"Option quality: {option_quality}",
-            f"Invalidation: {invalidation}",
-            f"Setup reason: {alert.setup_reason or 'No clear setup reason'}",
-            f"Watch: {alert.setup_watch_text or 'Confirm manually on chart.'}",
-            f"Risk warning: {risk_warning}",
-            f"Confirmation required: {confirmation_required_for_tier(alert)}",
-            *(
-                ["Fresh AAPL news present — context only. Confirm price reaction."]
-                if alert.news_context_present
-                else []
-            ),
-            "",
-            base_message,
-            "Heads-up only — not a buy/sell signal.",
-        ]
-    )
+    watch = alert.setup_watch_text or confirmation_required_for_tier(alert)
+    if alert.news_context_present:
+        watch = f"{watch} Fresh AAPL news present — context only. Confirm price reaction."
+    lines = [
+        _telegram_title(alert.symbol, alert_type),
+        f"Tier: {alert.alert_tier} | Setup risk: {risk}",
+        f"Setup: {setup}",
+        f"{str(direction).upper()} | {stage} | Score {score}",
+        f"Market: {' | '.join(market_bits)}",
+        f"Structure: {' | '.join(structure_bits)}",
+        f"Reason: {_telegram_reason(alert, scenario)}",
+        f"Watch: {watch}",
+        f"Invalidation: {invalidation}",
+        f"Option: {option_quality}",
+    ]
+    tier_risk_reason = telegram_risk_warning_reason(alert)
+    if tier_risk_reason:
+        lines.append(f"Risk warning reason: {tier_risk_reason}.")
+    lines.append("Reminder: Heads-up only — confirm on chart. Not a buy/sell signal.")
+    return "\n".join(lines)
 
 
 class DiscordNotifier:
@@ -6775,17 +6821,36 @@ def run_tests() -> int:
             )
             message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
             for label in (
+                "AAPL Phase 3 Heads-Up",
                 "Tier:",
                 "Setup:",
-                "Direction:",
-                "Stage:",
-                "Score:",
-                "Risk:",
-                "Option quality:",
-                "Confirmation required:",
-                "Heads-up only — not a buy/sell signal.",
+                "BULLISH | CONFIRMED | Score",
+                "Market:",
+                "Structure:",
+                "Reason:",
+                "Watch:",
+                "Invalidation:",
+                "Option:",
+                "Reminder: Heads-up only — confirm on chart. Not a buy/sell signal.",
             ):
                 self.assertIn(label, message)
+            self.assertEqual(message.count("Setup:"), 1)
+            self.assertNotIn("Phase 3 Early Heads-Up", message)
+
+        def test_professional_telegram_risk_warning_explains_low_setup_risk(self) -> None:
+            alert = self.make_phase3_heads_up_alert(
+                risk_label="LOW",
+                setup_risk_label="LOW",
+                market_regime="RANGE_BOUND",
+                option_quality="STALE",
+                confirmation_score=55,
+            )
+            message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
+            self.assertIn("Tier: RISK_WARNING | Setup risk: LOW", message)
+            self.assertIn(
+                "Risk warning reason: range-bound market, option stale, confirmation below 60.",
+                message,
+            )
 
         def test_risk_engine_generates_bullish_and_bearish_invalidation(self) -> None:
             bullish = self.make_phase3_heads_up_alert(
@@ -6838,7 +6903,8 @@ def run_tests() -> int:
             self.assertEqual(alert.entry_timing_label, "DO_NOT_CHASE")
             self.assertTrue(alert.pullback_required)
             self.assertTrue(alert.do_not_chase_warning)
-            self.assertIn("Risk warning: DO NOT CHASE", message)
+            self.assertIn("Risk warning reason:", message)
+            self.assertIn("setup risk DO_NOT_CHASE", message)
             self.assertIn("Invalidation:", message)
 
         def with_env(self, values: Dict[str, str]) -> Dict[str, Optional[str]]:
