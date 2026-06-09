@@ -157,6 +157,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "telegram_aapl_only": True,
         "telegram_send_test_on_start": False,
         "telegram_timeout_seconds": 8,
+        "openai_alert_formatter_enabled": True,
+        "openai_alert_formatter_style": "section",
+        "openai_alert_formatter_fallback": True,
+        "openai_alert_formatter_max_chars": 900,
     },
     "outputs": {
         "csv_log": str(LOG_DIR / "alerts.csv"),
@@ -3304,6 +3308,10 @@ class TelegramNotifier:
         phase3_dedupe_state_path: Path = PHASE3_TELEGRAM_DEDUPE_STATE,
         delivery_dedupe_minutes: int = 15,
         delivery_dedupe_state_path: Path = TELEGRAM_DELIVERY_DEDUPE_STATE,
+        openai_formatter_enabled: bool = False,
+        openai_formatter_style: str = "section",
+        openai_formatter_fallback: bool = True,
+        openai_formatter_max_chars: int = 900,
     ) -> None:
         self.bot_token = (bot_token or "").strip()
         self.chat_id = (chat_id or "").strip()
@@ -3315,6 +3323,37 @@ class TelegramNotifier:
         self.phase3_dedupe_state_path = phase3_dedupe_state_path
         self.delivery_dedupe_minutes = delivery_dedupe_minutes
         self.delivery_dedupe_state_path = delivery_dedupe_state_path
+        self.openai_formatter_enabled = openai_formatter_enabled
+        self.openai_formatter_style = str(openai_formatter_style or "section").lower()
+        self.openai_formatter_fallback = openai_formatter_fallback
+        self.openai_formatter_max_chars = max(300, min(900, int(openai_formatter_max_chars)))
+
+    def format_message(self, alert: Alert, alert_type: str, rule_message: Optional[str] = None) -> str:
+        rule_message = rule_message or professional_telegram_message(alert, alert_type)
+        if not self.openai_formatter_enabled or self.openai_formatter_style != "section":
+            return rule_message
+        try:
+            from tools import preview_alert_text
+
+            conclusion_cases = {
+                "MIXED / NO TRADE": "mixed",
+                "DO NOT CHASE": "do_not_chase",
+                "WATCH ONLY": "watch_only",
+                "TRADE QUALITY WATCH": "trade_quality",
+                "CONTEXT ONLY": "context",
+                "RISK WARNING": "risk_warning",
+            }
+            case_name = conclusion_cases.get(str(alert.phone_conclusion or "").upper(), "watch_only")
+            result = preview_alert_text.format_with_openai(
+                case_name,
+                alert,
+                rule_message,
+                max_chars=self.openai_formatter_max_chars,
+            )
+            return str(result.get("message") or rule_message)
+        except Exception as exc:
+            logger.warning("OpenAI alert formatter failed safely: %s", redact_notification_error(exc))
+            return rule_message
 
     def alert_type_for(self, alert: Alert) -> Optional[str]:
         if alert.phase3_heads_up_sent:
@@ -3341,7 +3380,8 @@ class TelegramNotifier:
         if self.aapl_only and alert.symbol.upper() != "AAPL":
             return
         assign_professional_alert_tier(alert)
-        message = professional_telegram_message(alert, alert_type)
+        rule_message = professional_telegram_message(alert, alert_type)
+        message = self.format_message(alert, alert_type, rule_message)
         if not self.bot_token or not self.chat_id:
             _, error = send_telegram_message(
                 token=self.bot_token,
@@ -3400,7 +3440,7 @@ class TelegramNotifier:
         allowed, reason, _ = claim_telegram_delivery(
             alert_type,
             alert,
-            message,
+            rule_message,
             self.delivery_dedupe_minutes,
             self.delivery_dedupe_state_path,
         )
@@ -3519,6 +3559,10 @@ def make_notifier(config: Dict[str, Any]) -> CompositeNotifier:
             timeout_seconds=int(notification_config.get("telegram_timeout_seconds", 8)),
             phase3_dedupe_minutes=int(config.get("scenario_engine", {}).get("phase3_heads_up_dedupe_minutes", 15)),
             delivery_dedupe_minutes=int(config.get("scenario_engine", {}).get("phase3_heads_up_dedupe_minutes", 15)),
+            openai_formatter_enabled=bool(notification_config.get("openai_alert_formatter_enabled", True)),
+            openai_formatter_style=str(notification_config.get("openai_alert_formatter_style", "section")),
+            openai_formatter_fallback=bool(notification_config.get("openai_alert_formatter_fallback", True)),
+            openai_formatter_max_chars=int(notification_config.get("openai_alert_formatter_max_chars", 900)),
         ),
     ])
 
@@ -6420,6 +6464,22 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
         "TELEGRAM_TIMEOUT_SECONDS",
         int(notifications.get("telegram_timeout_seconds", 8)),
     )
+    notifications["openai_alert_formatter_enabled"] = env_bool(
+        "ENABLE_OPENAI_ALERT_FORMATTER",
+        bool(notifications.get("openai_alert_formatter_enabled", True)),
+    )
+    notifications["openai_alert_formatter_style"] = os.getenv(
+        "OPENAI_ALERT_FORMATTER_STYLE",
+        str(notifications.get("openai_alert_formatter_style", "section")),
+    ).strip().lower() or "section"
+    notifications["openai_alert_formatter_fallback"] = env_bool(
+        "OPENAI_ALERT_FORMATTER_FALLBACK",
+        bool(notifications.get("openai_alert_formatter_fallback", True)),
+    )
+    notifications["openai_alert_formatter_max_chars"] = env_int(
+        "OPENAI_ALERT_FORMATTER_MAX_CHARS",
+        int(notifications.get("openai_alert_formatter_max_chars", 900)),
+    )
 
     market_data = config.setdefault("market_data", {})
     market_data["stock_feed"] = normalize_feed(
@@ -8157,6 +8217,83 @@ def run_tests() -> int:
             self.assertFalse(valid)
             self.assertIn("labeled sections", reason)
 
+        def test_preview_openai_rejects_missing_locked_sections_and_disclaimer(self) -> None:
+            from tools import preview_alert_text
+
+            alert = preview_alert_text.sample_alerts()["do_not_chase"]
+            rule = preview_alert_text.render_cases("do_not_chase")["do_not_chase"]
+            facts = preview_alert_text.extract_rule_facts("do_not_chase", alert, rule)
+            output = {
+                "title": facts["title"],
+                "bias": "BEARISH",
+                "why": facts["why"],
+                "market": facts["market"],
+                "structure": facts["structure"],
+                "risk": facts["risk"],
+                "wait_for": facts["wait_for"],
+                "invalidation": facts["invalidation"],
+                "option": facts["option"],
+                "reminder": preview_alert_text.DISCLAIMER,
+                "final_message": preview_alert_text.assemble_openai_message(
+                    {
+                        "why": facts["why"],
+                        "market": facts["market"],
+                        "structure": facts["structure"],
+                        "risk": facts["risk"],
+                        "wait_for": facts["wait_for"],
+                    },
+                    facts,
+                ),
+            }
+            for missing in ("Invalidation:\n", "Option:\n", preview_alert_text.DISCLAIMER):
+                changed = dict(output, final_message=output["final_message"].replace(missing, ""))
+                self.assertFalse(preview_alert_text.validate_openai_output("do_not_chase", changed, facts)[0])
+
+        def test_live_telegram_openai_formatter_enabled_disabled_and_fallback(self) -> None:
+            from unittest.mock import patch
+            from tools import preview_alert_text
+
+            alert = self.make_phase3_heads_up_alert()
+            assign_professional_alert_tier(alert)
+            rule = professional_telegram_message(alert, "PHASE3_HEADS_UP")
+            edited = rule.replace("Why:", "Why:\nEdited wording.\n\nOriginal why:")
+            enabled = TelegramNotifier("", "", openai_formatter_enabled=True)
+            disabled = TelegramNotifier("", "", openai_formatter_enabled=False)
+            with patch.object(
+                preview_alert_text,
+                "format_with_openai",
+                return_value={"message": edited, "success": True, "fallback_used": False, "error": "", "model": "test"},
+            ) as formatter:
+                self.assertEqual(enabled.format_message(alert, "PHASE3_HEADS_UP"), edited)
+                formatter.assert_called_once()
+            with patch.object(preview_alert_text, "format_with_openai") as formatter:
+                self.assertEqual(disabled.format_message(alert, "PHASE3_HEADS_UP"), rule)
+                formatter.assert_not_called()
+            with patch.object(
+                preview_alert_text,
+                "format_with_openai",
+                return_value={"message": rule, "success": False, "fallback_used": True, "error": "rejected", "model": "test"},
+            ):
+                self.assertEqual(enabled.format_message(alert, "PHASE3_HEADS_UP"), rule)
+
+        def test_openai_alert_formatter_env_config(self) -> None:
+            previous = self.with_env(
+                {
+                    "ENABLE_OPENAI_ALERT_FORMATTER": "false",
+                    "OPENAI_ALERT_FORMATTER_STYLE": "section",
+                    "OPENAI_ALERT_FORMATTER_FALLBACK": "true",
+                    "OPENAI_ALERT_FORMATTER_MAX_CHARS": "850",
+                }
+            )
+            try:
+                notifications = load_config(None)["notifications"]
+                self.assertFalse(notifications["openai_alert_formatter_enabled"])
+                self.assertEqual(notifications["openai_alert_formatter_style"], "section")
+                self.assertTrue(notifications["openai_alert_formatter_fallback"])
+                self.assertEqual(notifications["openai_alert_formatter_max_chars"], 850)
+            finally:
+                self.restore_env(previous)
+
         def test_preview_openai_failure_redacts_key_and_logs_fallback(self) -> None:
             from tools import preview_alert_text
 
@@ -8178,6 +8315,9 @@ def run_tests() -> int:
                 self.assertNotIn(secret, result["error"])
                 logged = preview_alert_text.OPENAI_FORMATTER_LOG.read_text(encoding="utf-8")
                 self.assertIn('"fallback_used": true', logged)
+                self.assertIn('"fallback_reason":', logged)
+                self.assertIn('"validation_passed": false', logged)
+                self.assertIn('"setup": "Mixed Signal"', logged)
                 self.assertNotIn(secret, logged)
             finally:
                 preview_alert_text.OPENAI_FORMATTER_LOG = original_log

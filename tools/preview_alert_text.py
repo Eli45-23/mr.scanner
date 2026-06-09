@@ -336,8 +336,9 @@ def validate_openai_output(name: str, output: Dict[str, Any], facts: Dict[str, s
     for phrase in FORBIDDEN_PHRASES:
         if re.search(rf"\b{re.escape(phrase)}\b", actionable_text, flags=re.IGNORECASE):
             failures.append(f"forbidden language: {phrase}")
-    if len(message) > OPENAI_MAX_CHARS:
-        failures.append(f"message exceeds {OPENAI_MAX_CHARS} characters")
+    max_chars = int(facts.get("max_chars") or OPENAI_MAX_CHARS)
+    if len(message) > max_chars:
+        failures.append(f"message exceeds {max_chars} characters")
     base_valid, base_reason = validate_message(name, message)
     if not base_valid:
         failures.append(base_reason)
@@ -354,6 +355,9 @@ def append_formatter_log(
     model: str,
     latency_ms: int,
     output_char_count: int,
+    setup: str = "",
+    fallback_reason: str = "",
+    validation_passed: bool = False,
 ) -> None:
     payload = {
         "timestamp": scanner.now_utc().isoformat(),
@@ -364,6 +368,9 @@ def append_formatter_log(
         "model": model,
         "latency_ms": latency_ms,
         "case": case_name,
+        "setup": setup,
+        "fallback_reason": scanner.redact_notification_error(fallback_reason),
+        "validation_passed": bool(validation_passed),
         "output_char_count": output_char_count,
     }
     try:
@@ -385,16 +392,20 @@ def format_with_openai(
     *,
     api_key: Optional[str] = None,
     request_fn: Callable[..., Any] = requests.post,
+    model: Optional[str] = None,
+    max_chars: int = OPENAI_MAX_CHARS,
 ) -> Dict[str, Any]:
-    model = openai_model_name()
+    model = model or openai_model_name()
     key = api_key if api_key is not None else os.getenv("OPENAI_API_KEY", "").strip()
     started = time.monotonic()
     facts = extract_rule_facts(name, alert, rule_message)
+    facts["max_chars"] = str(max_chars)
     if not key:
         error = "OPENAI_API_KEY is missing — using rule-based fallback."
         append_formatter_log(
             case_name=name, attempted=False, success=False, fallback_used=True, error=error,
-            model=model, latency_ms=0, output_char_count=len(rule_message),
+            model=model, latency_ms=0, output_char_count=len(rule_message), setup=facts["setup"],
+            fallback_reason=error, validation_passed=False,
         )
         return {"message": rule_message, "success": False, "fallback_used": True, "error": error, "model": model}
 
@@ -407,7 +418,7 @@ def format_with_openai(
     )
     user_prompt = (
         "Rewrite the alert using the locked facts below. The title, direction, setup, invalidation, option, and reminder "
-        f"are immutable. Keep final_message at or below {OPENAI_MAX_CHARS} characters. "
+        f"are immutable. Keep final_message at or below {max_chars} characters. "
         "Do not use buy, sell, enter now, get in, take this trade, guaranteed, must trade, or considering any action. "
         "Preserve MIXED / NO TRADE, DO NOT CHASE, and CONTEXT ONLY exactly when present. "
         "Use exactly this multiline format, including blank lines and labels:\n\n"
@@ -456,7 +467,8 @@ def format_with_openai(
         latency_ms = int((time.monotonic() - started) * 1000)
         append_formatter_log(
             case_name=name, attempted=True, success=True, fallback_used=False, error="",
-            model=model, latency_ms=latency_ms, output_char_count=len(message),
+            model=model, latency_ms=latency_ms, output_char_count=len(message), setup=facts["setup"],
+            fallback_reason="", validation_passed=True,
         )
         return {"message": message, "success": True, "fallback_used": False, "error": "", "model": model}
     except Exception as exc:
@@ -464,7 +476,8 @@ def format_with_openai(
         latency_ms = int((time.monotonic() - started) * 1000)
         append_formatter_log(
             case_name=name, attempted=True, success=False, fallback_used=True, error=error,
-            model=model, latency_ms=latency_ms, output_char_count=len(rule_message),
+            model=model, latency_ms=latency_ms, output_char_count=len(rule_message), setup=facts["setup"],
+            fallback_reason=error, validation_passed=False,
         )
         return {"message": rule_message, "success": False, "fallback_used": True, "error": error, "model": model}
 

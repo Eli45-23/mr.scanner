@@ -23,7 +23,11 @@
     "telegram_alert_types": ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
     "telegram_aapl_only": true,
     "telegram_send_test_on_start": false,
-    "telegram_timeout_seconds": 8
+    "telegram_timeout_seconds": 8,
+    "openai_alert_formatter_enabled": true,
+    "openai_alert_formatter_style": "section",
+    "openai_alert_formatter_fallback": true,
+    "openai_alert_formatter_max_chars": 900
   },
   "filters": {
     "min_price": 2.0,

@@ -33,6 +33,10 @@ def build_report() -> dict:
     report = {
         **identity,
         "telegram_enabled": bool(config.get("notifications", {}).get("telegram_enabled")),
+        "openai_alert_formatter_enabled": bool(config.get("notifications", {}).get("openai_alert_formatter_enabled", True)),
+        "openai_alert_formatter_style": config.get("notifications", {}).get("openai_alert_formatter_style", "section"),
+        "openai_alert_formatter_fallback": bool(config.get("notifications", {}).get("openai_alert_formatter_fallback", True)),
+        "openai_alert_formatter_max_chars": config.get("notifications", {}).get("openai_alert_formatter_max_chars", 900),
         "stock_feed": str(config.get("market_data", {}).get("stock_feed", "unknown")).upper(),
         "options_feed": str(config.get("options", {}).get("feed", "unknown")).upper(),
         "max_option_quote_age_seconds": config.get("options", {}).get("max_quote_age_seconds", 60),
