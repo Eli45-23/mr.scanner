@@ -1002,6 +1002,10 @@ def build_symbol_rows(
             "scenario_alert_tier": strategy_summary.get("scenario_alert_tier"),
             "alert_tier": heads_up_alert.alert_tier if heads_up_alert else None,
             "alert_tier_reason": heads_up_alert.alert_tier_reason if heads_up_alert else None,
+            "phone_conclusion": heads_up_alert.phone_conclusion if heads_up_alert else None,
+            "phone_conclusion_reason": heads_up_alert.phone_conclusion_reason if heads_up_alert else None,
+            "alert_decision_label": heads_up_alert.alert_decision_label if heads_up_alert else None,
+            "mixed_signal_no_trade": heads_up_alert.mixed_signal_no_trade if heads_up_alert else None,
             "alert_source": heads_up_alert.alert_source if heads_up_alert else None,
             "message_source_path": heads_up_alert.message_source_path if heads_up_alert else None,
             "invalidation_level": heads_up_alert.invalidation_level if heads_up_alert else None,
@@ -2021,6 +2025,7 @@ INDEX_HTML = r"""<!doctype html>
           Phase 3: Scenario ${esc(scenario)} ${esc(stage)} | Stock ${item.stock_setup_score ?? item.strategy_confidence_score ?? ''} |
           Scenario ${item.scenario_score ?? ''} | Option ${item.option_tradability_score ?? ''} ${esc(optionFeed)} |
           Alert Tier ${esc(item.alert_tier || '')} | ${esc(item.alert_tier_reason || '')} |
+          Decision ${esc(item.phone_conclusion || '')} | ${esc(item.phone_conclusion_reason || '')} |
           Tier ${esc(item.scenario_alert_tier || '')} | Alert Block ${esc(item.scenario_alert_block_reason || '')} | Eligible ${item.scenario_alert_eligible ? 'Yes' : 'No'} | Would SMS ${item.scenario_would_sms ? 'Yes' : 'No'} |
           Heads-Up ${esc(item.phase3_heads_up_type || 'BLOCKED')} / ${item.phase3_heads_up_eligible ? 'Eligible' : 'No'} / Sent ${item.phase3_heads_up_sent ? 'Yes' : 'No'} |
           ${esc(item.phase3_heads_up_block_reason || '')} |
@@ -2104,6 +2109,8 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="muted">Scenario Tier</span> ${esc(item.scenario_alert_tier || '')}</div>
           <div><span class="muted">Professional Alert Tier</span> ${esc(item.alert_tier || '')}</div>
           <div><span class="muted">Alert Tier Reason</span> ${esc(item.alert_tier_reason || '')}</div>
+          <div><span class="muted">Phone Conclusion</span> ${esc(item.phone_conclusion || '')}</div>
+          <div><span class="muted">Decision Explanation</span> ${esc(item.phone_conclusion_reason || '')}</div>
           <div><span class="muted">Scenario Eligible</span> ${item.scenario_alert_eligible ? 'Yes' : 'No'}</div>
           <div><span class="muted">Would SMS</span> ${item.scenario_would_sms ? 'Yes' : 'No'}</div>
           <div><span class="muted">Scenario Alert Block</span> ${esc(item.scenario_alert_block_reason || '')}</div>
@@ -2245,6 +2252,7 @@ INDEX_HTML = r"""<!doctype html>
         <div>Commit: <strong>${esc(identity.git_commit || 'unknown')}</strong></div>
         <div>Alerts: <strong>${esc(alerts.join(', ') || 'none')} alert-only</strong></div>
         <div>Context: <strong>${esc(context.join(', ') || 'none')} context-only</strong></div>
+        <div>Alert types: <strong>${esc((identity.alert_types_enabled || []).join(', ') || 'none')}</strong></div>
         <div>Telegram: <strong>${esc(identity.telegram_destination_type || 'unknown')} ${identity.telegram_chat_id_last4 ? `/*${esc(identity.telegram_chat_id_last4)}` : ''}</strong></div>
         <div>Feeds: <strong>${esc(stock)} / ${esc(options)}</strong></div>
       `;

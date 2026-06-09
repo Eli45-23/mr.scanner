@@ -315,6 +315,21 @@ def build_review_summary(
         for record in alert_window + scenario_window + option_window
         if record_has_text(record, ["stale", "feed warning", "indicative", "opra agreement"])
     ]
+    phone_conclusions = [
+        str(record.get("phone_conclusion") or record.get("alert_decision_label") or "").upper()
+        for record in alert_window
+    ]
+    conclusion_counts = {
+        label: phone_conclusions.count(label)
+        for label in (
+            "MIXED / NO TRADE",
+            "DO NOT CHASE",
+            "WATCH ONLY",
+            "TRADE QUALITY WATCH",
+            "CONTEXT ONLY",
+            "RISK WARNING",
+        )
+    }
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -363,6 +378,15 @@ def build_review_summary(
 - Phase 3 heads-up messages sent: {sum(1 for record in heads_up_window if record.get("phase3_heads_up_sent"))}
 - GOOD_POSITION scenario records: {len(good_position)}
 - LATE / DO_NOT_CHASE records: {len(late_or_chase)}
+
+## Phone Conclusions
+- Active alert types: PHASE3_HEADS_UP, STOCK_ONLY_WARNING, NORMAL_WATCH, NORMAL_SMS
+- Mixed / No Trade: {conclusion_counts["MIXED / NO TRADE"]}
+- Do Not Chase: {conclusion_counts["DO NOT CHASE"]}
+- Watch Only: {conclusion_counts["WATCH ONLY"]}
+- Trade Quality Watch: {conclusion_counts["TRADE QUALITY WATCH"]}
+- Context Only: {conclusion_counts["CONTEXT ONLY"]}
+- Risk Warning: {conclusion_counts["RISK WARNING"]}
 
 ### Premarket
 {markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(premarket))}

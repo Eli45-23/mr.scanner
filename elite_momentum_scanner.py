@@ -413,15 +413,14 @@ def telegram_destination_metadata(chat_id: Optional[str] = None) -> Dict[str, st
     }
 
 
+def resolve_active_alert_types(config: Optional[Dict[str, Any]] = None) -> List[str]:
+    # These are the scanner's supported user-facing alert paths. Telegram route
+    # selection remains separately configurable and is not changed here.
+    return ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"]
+
+
 def scanner_identity(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = config or {}
-    notifications = config.get("notifications", {})
-    alert_types = notifications.get(
-        "telegram_alert_types",
-        ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
-    )
-    if isinstance(alert_types, str):
-        alert_types = [part.strip().upper() for part in alert_types.split(",") if part.strip()]
     return {
         "scanner_instance_name": os.getenv("SCANNER_INSTANCE_NAME", "").strip() or socket.gethostname(),
         "machine_name": os.getenv("SCANNER_INSTANCE_NAME", "").strip() or socket.gethostname(),
@@ -432,7 +431,7 @@ def scanner_identity(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "git_branch": git_value("branch", "--show-current"),
         "project_path": str(APP_DIR),
         "python_version": platform.python_version(),
-        "alert_types_enabled": list(alert_types),
+        "alert_types_enabled": resolve_active_alert_types(config),
         "alert_symbols": list(config.get("symbols") or ["AAPL"]),
         "context_symbols": list(config.get("scenario_engine", {}).get("market_context_symbols") or ["SPY", "QQQ"]),
         **telegram_destination_metadata(),
@@ -590,6 +589,15 @@ class Alert:
     alert_tier_reason: Optional[str] = None
     alert_source: Optional[str] = None
     message_source_path: Optional[str] = None
+    phone_conclusion: Optional[str] = None
+    phone_conclusion_reason: Optional[str] = None
+    plain_english_conclusion: Optional[str] = None
+    alert_decision_label: Optional[str] = None
+    alert_decision_explanation: Optional[str] = None
+    no_trade_reason: Optional[str] = None
+    mixed_signal_no_trade: bool = False
+    telegram_message_version: Optional[str] = None
+    old_format_removed: bool = False
     invalidation_level: Optional[float] = None
     invalidation_reason: Optional[str] = None
     stop_logic_description: Optional[str] = None
@@ -1850,6 +1858,15 @@ class AlertWriter:
                 "primary_setup_direction": alert.primary_setup_direction,
                 "phase3_scenario_direction": alert.phase3_scenario_direction,
                 "mixed_signal_reason": alert.mixed_signal_reason,
+                "mixed_signal_no_trade": alert.mixed_signal_no_trade,
+                "no_trade_reason": alert.no_trade_reason,
+                "phone_conclusion": alert.phone_conclusion,
+                "phone_conclusion_reason": alert.phone_conclusion_reason,
+                "plain_english_conclusion": alert.plain_english_conclusion,
+                "alert_decision_label": alert.alert_decision_label,
+                "alert_decision_explanation": alert.alert_decision_explanation,
+                "telegram_message_version": alert.telegram_message_version,
+                "old_format_removed": alert.old_format_removed,
                 "conflict_warning_added": alert.conflict_warning_added,
                 "news_context_present": alert.news_context_present,
                 "news_used_for_context_only": alert.news_used_for_context_only,
@@ -2241,6 +2258,61 @@ def assign_professional_alert_tier(alert: Alert) -> Alert:
     else:
         alert.alert_source = "SCANNER_CONTEXT"
         alert.message_source_path = "format_alert_message"
+    assign_phone_conclusion(alert)
+    return alert
+
+
+def assign_phone_conclusion(alert: Alert) -> Alert:
+    setup = str(alert.setup_name or alert.primary_setup or (alert.scenario_top or {}).get("scenario_name") or "").upper()
+    stage = str(alert.setup_stage or alert.scenario_stage or (alert.scenario_top or {}).get("stage") or "").upper()
+    entry = str(alert.entry_timing_label or alert.entry_quality_label or "").upper()
+    risk = str(alert.setup_risk_label or alert.risk_label or alert.scenario_risk_label or "").upper()
+    option_quality = normalize_option_quality_label(alert.option_quality or alert.option_feed_status)
+    mixed = bool(alert.mixed_signal_detected or alert.scenario_conflict or setup == "MIXED SIGNAL")
+    context_only = (
+        alert.alert_tier == "CONTEXT"
+        or (
+            not setup
+            and stage not in {"FORMING", "CONFIRMED", "GOOD_POSITION"}
+        )
+    )
+    specific_risks: List[str] = []
+    if str(alert.market_regime or "").upper() in {"CHOPPY", "RANGE_BOUND", "LOW_VOLUME_FAKE_MOVE"}:
+        specific_risks.append(f"{str(alert.market_regime).lower().replace('_', '-')} market")
+    if option_quality in {"WIDE_SPREAD", "POOR_QUALITY", "STALE", "INVALID", "TOO_RISKY_0DTE", "LOW_LIQUIDITY"}:
+        specific_risks.append(f"option {option_quality.lower().replace('_', ' ')}")
+    if alert.confirmation_score is not None and alert.confirmation_score < 60:
+        specific_risks.append("confirmation below 60")
+
+    if mixed:
+        conclusion = "MIXED / NO TRADE"
+        reason = "Signals conflict. Wait for a cleaner setup."
+        alert.mixed_signal_detected = True
+        alert.mixed_signal_no_trade = True
+        alert.no_trade_reason = alert.mixed_signal_reason or reason
+    elif stage in {"LATE", "DO_NOT_CHASE"} or entry in {"LATE", "DO_NOT_CHASE"} or risk == "DO_NOT_CHASE":
+        conclusion = "DO NOT CHASE"
+        reason = "Move is late or extended. Wait for a pullback/retest."
+    elif context_only:
+        conclusion = "CONTEXT ONLY"
+        reason = "No clean setup is confirmed yet."
+    elif alert.alert_tier == "TRADE_QUALITY_WATCH" and not mixed:
+        conclusion = "TRADE QUALITY WATCH"
+        reason = "Confirmed setup, supportive context, tradable option, and a defined invalidation."
+    elif alert.alert_tier == "RISK_WARNING" and specific_risks:
+        conclusion = "RISK WARNING"
+        reason = ", ".join(dict.fromkeys(specific_risks[:3]))
+    else:
+        conclusion = "WATCH ONLY"
+        reason = "Setup is interesting but still needs manual confirmation."
+
+    alert.phone_conclusion = conclusion
+    alert.phone_conclusion_reason = reason
+    alert.plain_english_conclusion = reason
+    alert.alert_decision_label = conclusion
+    alert.alert_decision_explanation = reason
+    alert.telegram_message_version = "CONCLUSION_FIRST_V2"
+    alert.old_format_removed = True
     return alert
 
 
@@ -2297,12 +2369,19 @@ def _telegram_title(symbol: str, alert_type: str) -> str:
 
 
 def _telegram_reason(alert: Alert, scenario: Dict[str, Any]) -> str:
+    if alert.mixed_signal_no_trade:
+        return alert.phone_conclusion_reason or "Signals conflict. Wait for a cleaner setup."
     if alert.setup_reason:
         return alert.setup_reason
     reasons = scenario.get("reasons") or alert.scenario_reasons or alert.strategy_reasons
     if reasons:
         return "; ".join(str(reason) for reason in reasons[:2])
     return "No clear setup reason"
+
+
+def _short_phone_text(value: Any, limit: int = 150) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def compact_alert_message(alert: Alert) -> str:
@@ -2684,12 +2763,9 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
     assign_professional_alert_tier(alert)
     scenario = alert.scenario_top or {}
     setup = alert.setup_name or scenario.get("scenario_name") or alert.primary_setup or alert.category
-    stage = alert.setup_stage or alert.scenario_stage or scenario.get("stage") or alert.entry_quality_label or "UNKNOWN"
     direction = alert.setup_direction or alert.scenario_direction or alert.direction or alert.strategy_direction or "MOMENTUM"
-    score = alert.setup_score if alert.setup_score is not None else alert.scenario_score if alert.scenario_score is not None else alert.alert_score or 0
-    risk = alert.setup_risk_label or alert.risk_label or alert.scenario_risk_label or "UNKNOWN"
     option_quality = alert.option_quality_message or option_quality_message(alert.option_quality or alert.option_feed_status)
-    market_bits = [str(alert.market_regime or "UNKNOWN")]
+    market_bits = [str(alert.market_regime or "UNKNOWN").replace("_", " ")]
     if alert.spy_alignment:
         market_bits.append(f"SPY {alert.spy_alignment}")
     if alert.qqq_alignment:
@@ -2709,23 +2785,29 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
     watch = alert.setup_watch_text or confirmation_required_for_tier(alert)
     if alert.news_context_present:
         watch = f"{watch} Fresh AAPL news present — context only. Confirm price reaction."
+    main_risk = telegram_risk_warning_reason(alert)
+    if not main_risk:
+        main_risk = "none major; confirm manually"
+    title_detail = setup
+    if alert.phone_conclusion == "MIXED / NO TRADE":
+        bias = str(alert.current_structure_bias or direction or "mixed").title()
+        title_detail = f"{bias} bias, signals conflict"
+    elif alert.phone_conclusion in {"DO NOT CHASE", "CONTEXT ONLY"}:
+        title_detail = f"{str(direction).title()} Bias" if str(direction).upper() in {"BULLISH", "BEARISH"} else setup
     lines = [
-        _telegram_title(alert.symbol, alert_type),
-        f"Tier: {alert.alert_tier} | Setup risk: {risk}",
-        f"Setup: {setup}",
-        f"{str(direction).upper()} | {stage} | Score {score}",
+        f"{alert.symbol} {alert.phone_conclusion} — {_short_phone_text(title_detail, 80)}",
+        "",
+        f"Why: {_short_phone_text(_telegram_reason(alert, scenario), 170)}",
         f"Market: {' | '.join(market_bits)}",
         f"Structure: {' | '.join(structure_bits)}",
-        f"Reason: {_telegram_reason(alert, scenario)}",
-        f"Watch: {watch}",
-        f"Invalidation: {invalidation}",
+        f"Risk: {_short_phone_text(main_risk, 140)}",
+        f"Wait for: {_short_phone_text(watch, 170)}",
+        f"Invalidation: {_short_phone_text(invalidation, 170)}",
         f"Option: {option_quality}",
+        "",
+        "Heads-up only — confirm manually. Not a buy/sell signal.",
     ]
-    tier_risk_reason = telegram_risk_warning_reason(alert)
-    if tier_risk_reason:
-        lines.append(f"Risk warning reason: {tier_risk_reason}.")
-    lines.append("Reminder: Heads-up only — confirm on chart. Not a buy/sell signal.")
-    return "\n".join(lines)
+    return "\n".join(lines)[:900]
 
 
 class DiscordNotifier:
@@ -2896,6 +2978,10 @@ def append_notification_status(
     alert_tier: Optional[str] = None,
     alert_tier_reason: Optional[str] = None,
     message_source_path: Optional[str] = None,
+    phone_conclusion: Optional[str] = None,
+    phone_conclusion_reason: Optional[str] = None,
+    mixed_signal_no_trade: bool = False,
+    no_trade_reason: Optional[str] = None,
 ) -> None:
     identity = scanner_identity(load_config(None))
     payload = {
@@ -2905,6 +2991,13 @@ def append_notification_status(
         "alert_type": alert_type,
         "alert_source": alert_source or alert_type,
         "message_source_path": message_source_path or alert_source or alert_type,
+        "phone_conclusion": phone_conclusion,
+        "phone_conclusion_reason": phone_conclusion_reason,
+        "alert_decision_label": phone_conclusion,
+        "mixed_signal_no_trade": bool(mixed_signal_no_trade),
+        "no_trade_reason": no_trade_reason,
+        "telegram_message_version": "CONCLUSION_FIRST_V2" if channel == "telegram" else None,
+        "old_format_removed": channel == "telegram",
         "alert_tier": alert_tier,
         "alert_tier_reason": alert_tier_reason,
         "symbol": symbol,
@@ -2940,12 +3033,17 @@ def send_telegram_message(
     alert_tier: Optional[str] = None,
     alert_tier_reason: Optional[str] = None,
     message_source_path: Optional[str] = None,
+    phone_conclusion: Optional[str] = None,
+    phone_conclusion_reason: Optional[str] = None,
+    mixed_signal_no_trade: bool = False,
+    no_trade_reason: Optional[str] = None,
 ) -> Tuple[bool, str]:
     if not token or not chat_id:
         error = "Telegram bot token or chat ID is missing"
         append_notification_status(
             "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id,
-            alert_tier, alert_tier_reason, message_source_path,
+            alert_tier, alert_tier_reason, message_source_path, phone_conclusion, phone_conclusion_reason,
+            mixed_signal_no_trade, no_trade_reason,
         )
         return False, error
     try:
@@ -2957,14 +3055,16 @@ def send_telegram_message(
         response.raise_for_status()
         append_notification_status(
             "telegram", alert_type, symbol, True, "", message, sms_sent, dedupe_blocked, alert_source, chat_id,
-            alert_tier, alert_tier_reason, message_source_path,
+            alert_tier, alert_tier_reason, message_source_path, phone_conclusion, phone_conclusion_reason,
+            mixed_signal_no_trade, no_trade_reason,
         )
         return True, ""
     except Exception as exc:
         error = redact_notification_error(exc, [token, chat_id])
         append_notification_status(
             "telegram", alert_type, symbol, False, error, message, sms_sent, dedupe_blocked, alert_source, chat_id,
-            alert_tier, alert_tier_reason, message_source_path,
+            alert_tier, alert_tier_reason, message_source_path, phone_conclusion, phone_conclusion_reason,
+            mixed_signal_no_trade, no_trade_reason,
         )
         return False, error
 
@@ -3108,6 +3208,15 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
         "alert_tier_reason": alert.alert_tier_reason,
         "alert_source": alert.alert_source,
         "message_source_path": alert.message_source_path,
+        "phone_conclusion": alert.phone_conclusion,
+        "phone_conclusion_reason": alert.phone_conclusion_reason,
+        "plain_english_conclusion": alert.plain_english_conclusion,
+        "alert_decision_label": alert.alert_decision_label,
+        "alert_decision_explanation": alert.alert_decision_explanation,
+        "mixed_signal_no_trade": alert.mixed_signal_no_trade,
+        "no_trade_reason": alert.no_trade_reason,
+        "telegram_message_version": alert.telegram_message_version,
+        "old_format_removed": alert.old_format_removed,
         "direction": alert.scenario_direction or alert.direction,
         "top_scenario": alert.scenario_top,
         "scenario_stage": alert.scenario_stage,
@@ -3152,6 +3261,15 @@ def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -
         "alert_tier_reason": alert.alert_tier_reason,
         "alert_source": alert.alert_source,
         "message_source_path": alert.message_source_path,
+        "phone_conclusion": alert.phone_conclusion,
+        "phone_conclusion_reason": alert.phone_conclusion_reason,
+        "plain_english_conclusion": alert.plain_english_conclusion,
+        "alert_decision_label": alert.alert_decision_label,
+        "alert_decision_explanation": alert.alert_decision_explanation,
+        "mixed_signal_no_trade": alert.mixed_signal_no_trade,
+        "no_trade_reason": alert.no_trade_reason,
+        "telegram_message_version": alert.telegram_message_version,
+        "old_format_removed": alert.old_format_removed,
         "phase3_heads_up_final_decision": "SENT" if sent else "TELEGRAM_FAILED",
         "phase3_heads_up_final_block_reason": "" if sent else redact_notification_error(error),
         "stock_only_heads_up_allowed": alert.stock_only_heads_up_allowed,
@@ -3237,6 +3355,10 @@ class TelegramNotifier:
                 alert_tier=alert.alert_tier,
                 alert_tier_reason=alert.alert_tier_reason,
                 message_source_path=alert.message_source_path,
+                phone_conclusion=alert.phone_conclusion,
+                phone_conclusion_reason=alert.phone_conclusion_reason,
+                mixed_signal_no_trade=alert.mixed_signal_no_trade,
+                no_trade_reason=alert.no_trade_reason,
             )
             append_phase3_telegram_delivery(alert, False, error)
             return
@@ -3268,6 +3390,10 @@ class TelegramNotifier:
                     alert_tier=alert.alert_tier,
                     alert_tier_reason=alert.alert_tier_reason,
                     message_source_path=alert.message_source_path,
+                    phone_conclusion=alert.phone_conclusion,
+                    phone_conclusion_reason=alert.phone_conclusion_reason,
+                    mixed_signal_no_trade=alert.mixed_signal_no_trade,
+                    no_trade_reason=alert.no_trade_reason,
                 )
                 append_phase3_telegram_delivery(alert, False, reason)
                 return
@@ -3292,6 +3418,10 @@ class TelegramNotifier:
                 alert_tier=alert.alert_tier,
                 alert_tier_reason=alert.alert_tier_reason,
                 message_source_path=alert.message_source_path,
+                phone_conclusion=alert.phone_conclusion,
+                phone_conclusion_reason=alert.phone_conclusion_reason,
+                mixed_signal_no_trade=alert.mixed_signal_no_trade,
+                no_trade_reason=alert.no_trade_reason,
             )
             append_phase3_telegram_delivery(alert, False, reason)
             return
@@ -3312,6 +3442,10 @@ class TelegramNotifier:
             alert_tier=alert.alert_tier,
             alert_tier_reason=alert.alert_tier_reason,
             message_source_path=alert.message_source_path,
+            phone_conclusion=alert.phone_conclusion,
+            phone_conclusion_reason=alert.phone_conclusion_reason,
+            mixed_signal_no_trade=alert.mixed_signal_no_trade,
+            no_trade_reason=alert.no_trade_reason,
         )
         if sent:
             append_phase3_telegram_delivery(alert, True)
@@ -6821,23 +6955,21 @@ def run_tests() -> int:
             )
             message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
             for label in (
-                "AAPL Phase 3 Heads-Up",
-                "Tier:",
-                "Setup:",
-                "BULLISH | CONFIRMED | Score",
+                "AAPL WATCH ONLY",
+                "Why:",
                 "Market:",
                 "Structure:",
-                "Reason:",
-                "Watch:",
+                "Risk:",
+                "Wait for:",
                 "Invalidation:",
                 "Option:",
-                "Reminder: Heads-up only — confirm on chart. Not a buy/sell signal.",
+                "Heads-up only — confirm manually. Not a buy/sell signal.",
             ):
                 self.assertIn(label, message)
-            self.assertEqual(message.count("Setup:"), 1)
             self.assertNotIn("Phase 3 Early Heads-Up", message)
+            self.assertLessEqual(len(message), 900)
 
-        def test_professional_telegram_risk_warning_explains_low_setup_risk(self) -> None:
+        def test_professional_telegram_specific_risk_explains_low_setup_risk(self) -> None:
             alert = self.make_phase3_heads_up_alert(
                 risk_label="LOW",
                 setup_risk_label="LOW",
@@ -6846,10 +6978,53 @@ def run_tests() -> int:
                 confirmation_score=55,
             )
             message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
-            self.assertIn("Tier: RISK_WARNING | Setup risk: LOW", message)
-            self.assertIn(
-                "Risk warning reason: range-bound market, option stale, confirmation below 60.",
-                message,
+            self.assertIn("AAPL RISK WARNING", message)
+            self.assertIn("Risk: range-bound market, option stale, confirmation below 60", message)
+
+        def test_phone_conclusions_cover_mixed_late_forming_context_and_trade_quality(self) -> None:
+            mixed = self.make_phase3_heads_up_alert(
+                setup_name="Mixed Signal",
+                scenario_conflict=True,
+                mixed_signal_reason="Bullish sweep but failed reclaim",
+                sms_allowed=True,
+                option_tradable=True,
+                option_quality="TRADABLE",
+            )
+            late = self.make_phase3_heads_up_alert(scenario_stage="LATE", entry_quality_label="LATE")
+            forming = self.make_phase3_heads_up_alert(scenario_stage="FORMING", entry_quality_label="EARLY")
+            context = self.make_phase3_heads_up_alert(
+                category="WATCH KEY LEVEL APPROACHING",
+                scenario_top=None,
+                scenario_stage=None,
+                primary_setup=None,
+                setup_name=None,
+            )
+            trade_quality = self.make_phase3_heads_up_alert(
+                sms_allowed=True,
+                option_tradable=True,
+                option_quality="TRADABLE",
+            )
+            for item in (mixed, late, forming, context, trade_quality):
+                apply_risk_invalidation(item)
+                assign_professional_alert_tier(item)
+            self.assertEqual(mixed.phone_conclusion, "MIXED / NO TRADE")
+            self.assertTrue(mixed.mixed_signal_no_trade)
+            self.assertNotEqual(mixed.alert_tier, "TRADE_QUALITY_WATCH")
+            self.assertEqual(late.phone_conclusion, "DO NOT CHASE")
+            self.assertEqual(forming.phone_conclusion, "WATCH ONLY")
+            self.assertEqual(context.phone_conclusion, "CONTEXT ONLY")
+            self.assertEqual(trade_quality.phone_conclusion, "TRADE QUALITY WATCH")
+            mixed_message = professional_telegram_message(mixed, "PHASE3_HEADS_UP")
+            self.assertTrue(mixed_message.startswith("AAPL MIXED / NO TRADE"))
+            self.assertIn("Wait for:", mixed_message)
+            self.assertIn("cleaner setup", mixed.phone_conclusion_reason.lower())
+
+        def test_official_alert_type_reporting_uses_shared_resolver(self) -> None:
+            config = load_config(None)
+            config["notifications"]["telegram_alert_types"] = ["PHASE3_HEADS_UP", "NORMAL_SMS"]
+            self.assertEqual(
+                scanner_identity(config)["alert_types_enabled"],
+                ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
             )
 
         def test_risk_engine_generates_bullish_and_bearish_invalidation(self) -> None:
@@ -6903,8 +7078,8 @@ def run_tests() -> int:
             self.assertEqual(alert.entry_timing_label, "DO_NOT_CHASE")
             self.assertTrue(alert.pullback_required)
             self.assertTrue(alert.do_not_chase_warning)
-            self.assertIn("Risk warning reason:", message)
-            self.assertIn("setup risk DO_NOT_CHASE", message)
+            self.assertTrue(message.startswith("AAPL DO NOT CHASE"))
+            self.assertIn("Risk:", message)
             self.assertIn("Invalidation:", message)
 
         def with_env(self, values: Dict[str, str]) -> Dict[str, Optional[str]]:
