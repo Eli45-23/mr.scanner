@@ -8076,6 +8076,87 @@ def run_tests() -> int:
                 self.assertEqual(preview_alert_text.main(), 0)
                 send.assert_called_once()
 
+        def test_preview_openai_missing_key_falls_back_without_request(self) -> None:
+            from unittest.mock import Mock
+            from tools import preview_alert_text
+
+            alert = preview_alert_text.sample_alerts()["mixed"]
+            rule = preview_alert_text.render_cases("mixed")["mixed"]
+            request = Mock()
+            result = preview_alert_text.format_with_openai("mixed", alert, rule, api_key="", request_fn=request)
+            self.assertFalse(result["success"])
+            self.assertTrue(result["fallback_used"])
+            self.assertEqual(result["message"], rule)
+            request.assert_not_called()
+
+        def test_preview_openai_rejects_forbidden_language_and_fact_changes(self) -> None:
+            from tools import preview_alert_text
+
+            alert = preview_alert_text.sample_alerts()["mixed"]
+            rule = preview_alert_text.render_cases("mixed")["mixed"]
+            facts = preview_alert_text.extract_rule_facts("mixed", alert, rule)
+            valid_output = {
+                "title": facts["title"],
+                "bias": "BEARISH structure with conflicting signals",
+                "why": facts["why"],
+                "risk": facts["risk"],
+                "wait_for": facts["wait_for"],
+                "invalidation": facts["invalidation"],
+                "option": facts["option"],
+                "reminder": preview_alert_text.DISCLAIMER,
+                "final_message": rule,
+            }
+            forbidden = dict(valid_output, final_message=rule.replace("Why:", "Why: Buy now."))
+            changed = dict(
+                valid_output,
+                title="AAPL TRADE QUALITY WATCH — Bullish Pullback Holding",
+                bias="BULLISH",
+                final_message=rule.replace("AAPL MIXED / NO TRADE", "AAPL TRADE QUALITY WATCH"),
+            )
+            self.assertFalse(preview_alert_text.validate_openai_output("mixed", forbidden, facts)[0])
+            self.assertFalse(preview_alert_text.validate_openai_output("mixed", changed, facts)[0])
+
+        def test_preview_openai_failure_redacts_key_and_logs_fallback(self) -> None:
+            from tools import preview_alert_text
+
+            original_log = preview_alert_text.OPENAI_FORMATTER_LOG
+            temp_dir = Path(tempfile.mkdtemp())
+            preview_alert_text.OPENAI_FORMATTER_LOG = temp_dir / "openai_alert_formatter.jsonl"
+            secret = "openai-preview-secret"
+            alert = preview_alert_text.sample_alerts()["mixed"]
+            rule = preview_alert_text.render_cases("mixed")["mixed"]
+
+            def fail_request(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError(f"request failed with {secret}")
+
+            try:
+                result = preview_alert_text.format_with_openai(
+                    "mixed", alert, rule, api_key=secret, request_fn=fail_request
+                )
+                self.assertTrue(result["fallback_used"])
+                self.assertNotIn(secret, result["error"])
+                logged = preview_alert_text.OPENAI_FORMATTER_LOG.read_text(encoding="utf-8")
+                self.assertIn('"fallback_used": true', logged)
+                self.assertNotIn(secret, logged)
+            finally:
+                preview_alert_text.OPENAI_FORMATTER_LOG = original_log
+
+        def test_preview_compare_openai_prints_both_formats(self) -> None:
+            import io
+            import sys
+            from unittest.mock import patch
+            from tools import preview_alert_text
+
+            rule = preview_alert_text.render_cases("mixed")["mixed"]
+            with patch.object(sys, "argv", ["preview_alert_text.py", "--case", "mixed", "--compare-openai"]), patch.object(
+                preview_alert_text, "format_with_openai",
+                return_value={"message": rule, "success": False, "fallback_used": True, "error": "test fallback", "model": "test"},
+            ), patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(preview_alert_text.main(), 0)
+                text = output.getvalue()
+                self.assertIn("RULE-BASED FORMAT", text)
+                self.assertIn("OPENAI FORMAT", text)
+
         def test_telegram_success_and_failure_are_logged_without_token(self) -> None:
             from unittest.mock import Mock, patch
             global NOTIFICATION_STATUS_LOG
