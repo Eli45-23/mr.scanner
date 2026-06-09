@@ -66,8 +66,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
 import requests
+from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
+from strategies.context import evaluate_multi_timeframe_context
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -81,6 +83,10 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
 NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
 SCANNER_STARTUP_STATUS_LOG = LOG_DIR / "scanner_startup_status.jsonl"
+MARKET_REGIME_LOG = LOG_DIR / "market_regime.jsonl"
+MULTI_TIMEFRAME_CONTEXT_LOG = LOG_DIR / "multi_timeframe_context.jsonl"
+POST_ALERT_PERFORMANCE_LOG = LOG_DIR / "post_alert_performance.jsonl"
+NEWS_CONTEXT_LOG = LOG_DIR / "news_context.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 
@@ -113,7 +119,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "opening_range_watch_proximity_pct": 0.12,
     "premarket_watch_proximity_pct": 0.15,
     "alert_cooldown_seconds": 600,
-    "max_news_age_minutes": 720,
+    "max_news_age_minutes": 120,
+    "news_context": {
+        "enabled": False,
+        "watch_symbols": ["AAPL"],
+        "lookback_minutes": 120,
+        "context_only": True,
+    },
     "only_symbols_with_options": True,
     "symbols_with_options": [
         "AAPL"
@@ -150,6 +162,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "csv_log": str(LOG_DIR / "alerts.csv"),
         "jsonl_log": str(LOG_DIR / "alerts.jsonl"),
         "state_file": str(STATE_DIR / "scanner_state.json"),
+    },
+    "post_alert_performance": {
+        "enabled": True,
+        "interval_minutes": [1, 3, 5, 10, 15],
+        "target_move_pct": 0.30,
     },
     "discovery": {
         "enabled": True,
@@ -358,6 +375,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_spread_pct": 12,
         "min_option_volume": 100,
         "min_open_interest": 250,
+        "block_late_0dte": False,
+        "risky_0dte_after_et": "15:30",
         "max_quote_age_seconds": 60,
         "max_chain_contracts": 1000,
     },
@@ -487,12 +506,13 @@ class OptionContractSnapshot:
 @dataclass
 class OptionSelection:
     contract: Optional[OptionContractSnapshot] = None
-    quality: str = "No clean contract"
+    quality: str = "INVALID"
     score: int = 0
     reasons: List[str] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict)
 
     def is_tradable(self) -> bool:
-        return self.quality == "Tradable" and self.contract is not None
+        return option_quality_is_tradable(self.quality) and self.contract is not None
 
 
 @dataclass
@@ -506,6 +526,8 @@ class SymbolSnapshot:
     opening_range_low: Optional[float] = None
     opening_range_15_high: Optional[float] = None
     opening_range_15_low: Optional[float] = None
+    daily_bars: List[Bar] = field(default_factory=list)
+    multi_timeframe_context: Dict[str, Any] = field(default_factory=dict)
     latest_news: Optional[NewsItem] = None
     best_call: OptionSelection = field(default_factory=OptionSelection)
     best_put: OptionSelection = field(default_factory=OptionSelection)
@@ -552,6 +574,14 @@ class Alert:
     option_timestamp_fallback_type: Optional[str] = None
     option_fallback_timestamp_utc: Optional[str] = None
     option_quality: Optional[str] = None
+    option_quality_message: Optional[str] = None
+    option_quality_reasons: List[str] = field(default_factory=list)
+    option_days_to_expiration: Optional[int] = None
+    option_is_0dte: Optional[bool] = None
+    option_strike_distance_pct: Optional[float] = None
+    option_liquidity_state: Optional[str] = None
+    option_time_state: Optional[str] = None
+    option_stock_only_allowed: bool = True
     options_score: Optional[int] = None
     direction: Optional[str] = None
     alert_grade: Optional[str] = None
@@ -560,6 +590,12 @@ class Alert:
     alert_tier_reason: Optional[str] = None
     alert_source: Optional[str] = None
     message_source_path: Optional[str] = None
+    invalidation_level: Optional[float] = None
+    invalidation_reason: Optional[str] = None
+    stop_logic_description: Optional[str] = None
+    pullback_required: bool = False
+    do_not_chase_warning: bool = False
+    entry_timing_label: Optional[str] = None
     sms_allowed: bool = False
     watch_allowed: bool = False
     sms_sent: Optional[bool] = None
@@ -585,7 +621,43 @@ class Alert:
     relative_strength_label: Optional[str] = None
     relative_strength_score: Optional[int] = None
     market_regime: Optional[str] = None
+    regime_score: Optional[int] = None
     market_score: Optional[int] = None
+    regime_reason: Optional[str] = None
+    spy_alignment: Optional[str] = None
+    qqq_alignment: Optional[str] = None
+    aapl_relative_strength: Optional[str] = None
+    volume_state: Optional[str] = None
+    volatility_state: Optional[str] = None
+    trend_1m: Optional[str] = None
+    trend_5m: Optional[str] = None
+    trend_15m: Optional[str] = None
+    daily_trend: Optional[str] = None
+    current_structure_bias: Optional[str] = None
+    structure_key_warning: Optional[str] = None
+    nearest_level_name: Optional[str] = None
+    nearest_level_price: Optional[float] = None
+    distance_to_key_level_pct: Optional[float] = None
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    demand_zones: List[Dict[str, float]] = field(default_factory=list)
+    supply_zones: List[Dict[str, float]] = field(default_factory=list)
+    liquidity_above_highs: List[Dict[str, Any]] = field(default_factory=list)
+    liquidity_below_lows: List[Dict[str, Any]] = field(default_factory=list)
+    multi_timeframe_levels: Dict[str, float] = field(default_factory=dict)
+    professional_setup: Dict[str, Any] = field(default_factory=dict)
+    setup_name: Optional[str] = None
+    setup_code: Optional[str] = None
+    setup_direction: Optional[str] = None
+    setup_stage: Optional[str] = None
+    setup_score: Optional[int] = None
+    setup_confidence: Optional[str] = None
+    setup_reason: Optional[str] = None
+    setup_invalidation_level: Optional[float] = None
+    setup_entry_quality: Optional[str] = None
+    setup_risk_label: Optional[str] = None
+    setup_watch_text: Optional[str] = None
+    setup_block_reason: Optional[str] = None
     pressure_label: Optional[str] = None
     pressure_score: Optional[int] = None
     scenario_top: Optional[Dict[str, Any]] = None
@@ -610,6 +682,10 @@ class Alert:
     mixed_signal_reason: Optional[str] = None
     conflict_warning_added: Optional[bool] = None
     news_context_present: Optional[bool] = None
+    latest_headline: Optional[str] = None
+    news_source: Optional[str] = None
+    news_age_minutes: Optional[float] = None
+    news_sentiment_guess: Optional[str] = None
     news_used_for_context_only: Optional[bool] = None
     news_upgraded_alert: Optional[bool] = None
     all_scenarios: List[Dict[str, Any]] = field(default_factory=list)
@@ -760,6 +836,19 @@ def parse_optional_dt(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def news_sentiment_guess(headline: Optional[str]) -> str:
+    text = str(headline or "").lower()
+    positive = ("beats", "raises", "growth", "gain", "record", "upgrade", "approval", "launch", "strong")
+    negative = ("misses", "cuts", "decline", "drop", "downgrade", "probe", "lawsuit", "delay", "weak")
+    positive_hits = sum(term in text for term in positive)
+    negative_hits = sum(term in text for term in negative)
+    if positive_hits > negative_hits:
+        return "POSITIVE"
+    if negative_hits > positive_hits:
+        return "NEGATIVE"
+    return "NEUTRAL"
 
 
 def safe_market_data_mapping(value: Any) -> Dict[str, Any]:
@@ -925,6 +1014,7 @@ def latest_market_data_status(config: Optional[Dict[str, Any]] = None) -> Dict[s
 class DataProvider(Protocol):
     def get_latest_bars(self, symbols: List[str]) -> Dict[str, Bar]: ...
     def get_recent_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]: ...
+    def get_daily_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]: ...
     def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]: ...
     def discover_symbols(self, config: Dict[str, Any]) -> List[str]: ...
     def get_option_chain(self, symbol: str, config: Dict[str, Any]) -> List[OptionContractSnapshot]: ...
@@ -984,6 +1074,24 @@ class AlpacaProvider:
         for symbol, items in raw.items():
             out[symbol] = [self._bar_from_json(item) for item in items]
         return out
+
+    def get_daily_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]:
+        resp = self.session.get(
+            f"{self.base_v2}/stocks/bars",
+            params={
+                "symbols": ",".join(symbols),
+                "timeframe": "1Day",
+                "start": start.astimezone(UTC).isoformat(),
+                "end": end.astimezone(UTC).isoformat(),
+                "adjustment": "raw",
+                "feed": self.feed,
+                "limit": 1000,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("bars", {})
+        return {symbol: [self._bar_from_json(item) for item in items] for symbol, items in raw.items()}
 
     def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
         resp = self.session.get(
@@ -1312,6 +1420,23 @@ class MockProvider:
             out[s] = bars
         return out
 
+    def get_daily_bars(self, symbols: List[str], start: datetime, end: datetime) -> Dict[str, List[Bar]]:
+        out: Dict[str, List[Bar]] = {}
+        for idx, symbol in enumerate(symbols):
+            base = self._base_price(symbol)
+            out[symbol] = [
+                Bar(
+                    t=(now_utc() - timedelta(days=day)).replace(hour=21, minute=0, second=0, microsecond=0),
+                    o=base - day * 0.2,
+                    h=base + 1.0 - day * 0.2,
+                    l=base - 1.0 - day * 0.2,
+                    c=base + 0.2 - day * 0.2,
+                    v=5_000_000 + idx * 100_000,
+                )
+                for day in range(5, 0, -1)
+            ]
+        return out
+
     def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
         items: List[NewsItem] = []
         if "ASTS" in symbols:
@@ -1421,6 +1546,9 @@ class AlertWriter:
         self.scenario_jsonl_path = LOG_DIR / "scenario_engine.jsonl"
         self.option_jsonl_path = LOG_DIR / "option_quality_decisions.jsonl"
         self.phase3_heads_up_jsonl_path = LOG_DIR / "phase3_heads_up.jsonl"
+        self.market_regime_jsonl_path = MARKET_REGIME_LOG
+        self.multi_timeframe_jsonl_path = MULTI_TIMEFRAME_CONTEXT_LOG
+        self.news_context_jsonl_path = NEWS_CONTEXT_LOG
         self._ensure_csv_header()
 
     def _ensure_csv_header(self) -> None:
@@ -1671,6 +1799,25 @@ class AlertWriter:
                 "alert_tier_reason": alert.alert_tier_reason,
                 "alert_source": alert.alert_source,
                 "message_source_path": alert.message_source_path,
+                "invalidation_level": alert.invalidation_level,
+                "invalidation_reason": alert.invalidation_reason,
+                "stop_logic_description": alert.stop_logic_description,
+                "pullback_required": alert.pullback_required,
+                "do_not_chase_warning": alert.do_not_chase_warning,
+                "entry_timing_label": alert.entry_timing_label,
+                "professional_setup": alert.professional_setup,
+                "setup_name": alert.setup_name,
+                "setup_code": alert.setup_code,
+                "setup_direction": alert.setup_direction,
+                "setup_stage": alert.setup_stage,
+                "setup_score": alert.setup_score,
+                "setup_confidence": alert.setup_confidence,
+                "setup_reason": alert.setup_reason,
+                "setup_invalidation_level": alert.setup_invalidation_level,
+                "setup_entry_quality": alert.setup_entry_quality,
+                "setup_risk_label": alert.setup_risk_label,
+                "setup_watch_text": alert.setup_watch_text,
+                "setup_block_reason": alert.setup_block_reason,
                 "scenario_alert_tier": alert.scenario_alert_tier,
                 "scenario_alert_eligible": alert.scenario_alert_eligible,
                 "scenario_would_sms": alert.scenario_would_sms,
@@ -1735,7 +1882,7 @@ class AlertWriter:
                 "quote_age_seconds": alert.option_quote_age_seconds,
                 "max_allowed_quote_age_seconds": alert.option_max_quote_age_seconds,
                 "stale_reason": alert.option_stale_reason,
-                "invalid_reason": "missing_bid_or_ask" if alert.option_quality == "Invalid quote" else "",
+                "invalid_reason": "missing_bid_or_ask" if normalize_option_quality_label(alert.option_quality) == "INVALID" else "",
                 "opra_feed_requested": latest_market_data_status().get("options_feed_requested"),
                 "opra_status": latest_market_data_status().get("opra_status"),
                 "data_source": alert.option_data_source,
@@ -1744,6 +1891,14 @@ class AlertWriter:
                 "fallback_timestamp_utc": alert.option_fallback_timestamp_utc,
                 "option_quality_label": alert.option_quality,
                 "option_quality_score": alert.options_score,
+                "option_quality_message": alert.option_quality_message,
+                "option_quality_reasons": alert.option_quality_reasons,
+                "days_to_expiration": alert.option_days_to_expiration,
+                "is_0dte": alert.option_is_0dte,
+                "strike_distance_pct": alert.option_strike_distance_pct,
+                "liquidity_state": alert.option_liquidity_state,
+                "time_state": alert.option_time_state,
+                "stock_only_allowed": alert.option_stock_only_allowed,
                 "market_session_status": "active" if options_session_active(alert.timestamp) else "session_closed_or_inactive",
                 "alert_score": alert.alert_score,
                 "option_feed_status": alert.option_feed_status,
@@ -1762,6 +1917,23 @@ class AlertWriter:
             },
         )
         self._append_jsonl(
+            self.news_context_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "news_context_present": alert.news_context_present,
+                "latest_headline": alert.latest_headline,
+                "news_source": alert.news_source,
+                "news_age_minutes": alert.news_age_minutes,
+                "news_sentiment_guess": alert.news_sentiment_guess,
+                "news_used_for_context_only": alert.news_used_for_context_only,
+                "news_upgraded_alert": alert.news_upgraded_alert,
+                "risk_label": alert.risk_label,
+                "option_quality": alert.option_quality,
+                "sms_allowed": alert.sms_allowed,
+            },
+        )
+        self._append_jsonl(
             self.phase3_heads_up_jsonl_path,
             {
                 "timestamp": alert.timestamp.isoformat(),
@@ -1771,6 +1943,25 @@ class AlertWriter:
                 "alert_tier_reason": alert.alert_tier_reason,
                 "alert_source": alert.alert_source,
                 "message_source_path": alert.message_source_path,
+                "invalidation_level": alert.invalidation_level,
+                "invalidation_reason": alert.invalidation_reason,
+                "stop_logic_description": alert.stop_logic_description,
+                "pullback_required": alert.pullback_required,
+                "do_not_chase_warning": alert.do_not_chase_warning,
+                "entry_timing_label": alert.entry_timing_label,
+                "professional_setup": alert.professional_setup,
+                "setup_name": alert.setup_name,
+                "setup_code": alert.setup_code,
+                "setup_direction": alert.setup_direction,
+                "setup_stage": alert.setup_stage,
+                "setup_score": alert.setup_score,
+                "setup_confidence": alert.setup_confidence,
+                "setup_reason": alert.setup_reason,
+                "setup_invalidation_level": alert.setup_invalidation_level,
+                "setup_entry_quality": alert.setup_entry_quality,
+                "setup_risk_label": alert.setup_risk_label,
+                "setup_watch_text": alert.setup_watch_text,
+                "setup_block_reason": alert.setup_block_reason,
                 "top_scenario": alert.scenario_top,
                 "scenario_stage": alert.scenario_stage,
                 "scenario_score": alert.scenario_score,
@@ -1811,6 +2002,51 @@ class AlertWriter:
                 "scenario_warnings": alert.scenario_warnings,
             },
         )
+        self._append_jsonl(
+            self.market_regime_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "alert_symbol": alert.symbol == "AAPL",
+                "context_symbols": ["SPY", "QQQ"],
+                "market_regime": alert.market_regime,
+                "regime_score": alert.regime_score if alert.regime_score is not None else alert.market_score,
+                "regime_reason": alert.regime_reason,
+                "spy_alignment": alert.spy_alignment,
+                "qqq_alignment": alert.qqq_alignment,
+                "aapl_relative_strength": alert.aapl_relative_strength,
+                "volume_state": alert.volume_state,
+                "volatility_state": alert.volatility_state,
+                "alert_tier": alert.alert_tier,
+                "sms_allowed": alert.sms_allowed,
+                "watch_allowed": alert.watch_allowed,
+            },
+        )
+        self._append_jsonl(
+            self.multi_timeframe_jsonl_path,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "alert_symbol": alert.symbol == "AAPL",
+                "context_symbols": ["SPY", "QQQ"],
+                "trend_1m": alert.trend_1m,
+                "trend_5m": alert.trend_5m,
+                "trend_15m": alert.trend_15m,
+                "daily_trend": alert.daily_trend,
+                "current_bias": alert.current_structure_bias,
+                "key_warning": alert.structure_key_warning,
+                "nearest_level_name": alert.nearest_level_name,
+                "nearest_level_price": alert.nearest_level_price,
+                "distance_to_key_level_pct": alert.distance_to_key_level_pct,
+                "nearest_support": alert.nearest_support,
+                "nearest_resistance": alert.nearest_resistance,
+                "levels": alert.multi_timeframe_levels,
+                "demand_zones": alert.demand_zones,
+                "supply_zones": alert.supply_zones,
+                "liquidity_above_highs": alert.liquidity_above_highs,
+                "liquidity_below_lows": alert.liquidity_below_lows,
+            },
+        )
 
     def _append_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as f:
@@ -1829,8 +2065,112 @@ PROFESSIONAL_ALERT_TIERS = {
 }
 
 
+def _valid_level(value: Any) -> Optional[float]:
+    try:
+        level = float(value)
+    except (TypeError, ValueError):
+        return None
+    return level if level > 0 else None
+
+
+def apply_risk_invalidation(alert: Alert) -> Alert:
+    scenario = alert.scenario_top or {}
+    direction = str(alert.scenario_direction or alert.direction or alert.strategy_direction or "").upper()
+    stage = str(alert.scenario_stage or scenario.get("stage") or "").upper()
+    entry = str(alert.entry_quality_label or alert.scenario_entry_quality_label or "").upper()
+    extension = str(alert.extension_label or "").upper()
+    risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
+
+    if risk == "DO_NOT_CHASE" or stage == "DO_NOT_CHASE" or entry == "DO_NOT_CHASE" or extension == "DO_NOT_CHASE":
+        timing = "DO_NOT_CHASE"
+    elif stage == "LATE" or entry == "LATE" or extension in {"EXTENDED", "VERY_EXTENDED"}:
+        timing = "LATE"
+    elif stage == "GOOD_POSITION" or entry == "GOOD_POSITION":
+        timing = "GOOD_POSITION"
+    else:
+        timing = "EARLY"
+    alert.entry_timing_label = timing
+    alert.pullback_required = timing in {"LATE", "DO_NOT_CHASE"}
+    alert.do_not_chase_warning = timing == "DO_NOT_CHASE" or risk == "DO_NOT_CHASE"
+
+    scenario_level = _valid_level(scenario.get("invalidation_level"))
+    scenario_reason = str(scenario.get("invalidation_reason") or "").strip()
+    if scenario_level is not None:
+        alert.invalidation_level = scenario_level
+        alert.invalidation_reason = scenario_reason or (
+            "Bullish setup fails below this support level"
+            if direction == "BULLISH"
+            else "Bearish setup fails above this resistance level"
+        )
+    else:
+        levels = {**(alert.strategy_levels or {}), **(alert.scenario_levels or {})}
+        if alert.trigger_level is not None:
+            levels.setdefault("trigger_level", alert.trigger_level)
+        level_candidates: List[Tuple[float, str]] = []
+        reason_by_level_bullish = {
+            "vwap": "Bullish setup invalidates if price loses VWAP",
+            "ema9": "Bullish setup invalidates if price loses EMA9",
+            "ema20": "Bullish setup invalidates if price loses EMA20",
+            "recent_low": "Bullish setup invalidates below the recent swing low",
+            "recent_swing_low": "Bullish setup invalidates below the recent swing low",
+            "swept_level": "Bullish reclaim fails if price loses the swept level",
+            "opening_range_low": "Bullish setup invalidates below opening range support",
+            "pml": "Bullish setup invalidates below premarket low",
+            "pdl": "Bullish setup invalidates below previous-day low",
+            "trigger_level": "Bullish setup invalidates if the reclaimed trigger level is lost",
+        }
+        reason_by_level_bearish = {
+            "vwap": "Bearish setup invalidates if price reclaims VWAP",
+            "ema9": "Bearish setup invalidates if price reclaims EMA9",
+            "ema20": "Bearish setup invalidates if price reclaims EMA20",
+            "recent_high": "Bearish setup invalidates above the recent swing high",
+            "recent_swing_high": "Bearish setup invalidates above the recent swing high",
+            "swept_level": "Bearish rejection fails above the sweep high",
+            "opening_range_high": "Bearish setup invalidates above opening range resistance",
+            "pmh": "Bearish setup invalidates above premarket high",
+            "pdh": "Bearish setup invalidates above previous-day high",
+            "trigger_level": "Bearish setup invalidates if the breakdown trigger level is reclaimed",
+        }
+        reason_map = reason_by_level_bullish if direction == "BULLISH" else reason_by_level_bearish
+        for name, reason in reason_map.items():
+            level = _valid_level(levels.get(name))
+            if level is None:
+                continue
+            if direction == "BULLISH" and level <= alert.price:
+                level_candidates.append((level, reason))
+            elif direction == "BEARISH" and level >= alert.price:
+                level_candidates.append((level, reason))
+        if level_candidates:
+            selected = max(level_candidates, key=lambda item: item[0]) if direction == "BULLISH" else min(level_candidates, key=lambda item: item[0])
+            alert.invalidation_level, alert.invalidation_reason = selected
+
+    if alert.invalidation_level is not None and alert.invalidation_reason:
+        alert.stop_logic_description = (
+            f"Idea is wrong on a confirmed close below {alert.invalidation_level:.2f}; {alert.invalidation_reason}."
+            if direction == "BULLISH"
+            else f"Idea is wrong on a confirmed close above {alert.invalidation_level:.2f}; {alert.invalidation_reason}."
+        )
+    else:
+        alert.invalidation_level = None
+        alert.invalidation_reason = "No clean invalidation level available — watch only until structure improves"
+        alert.stop_logic_description = "No clean structural risk level is available; do not treat this as trade-quality."
+        if alert.sms_allowed:
+            alert.sms_allowed = False
+            alert.text_alert_reason = "trade-quality blocked: no clean invalidation level"
+        alert.scenario_would_sms = False if alert.scenario_would_sms is not None else None
+        alert.scenario_sms_allowed = False if alert.scenario_sms_allowed is not None else None
+        alert.scenario_sms_block_reason = alert.scenario_sms_block_reason or "No clean invalidation level available"
+        alert.sms_block_reason = alert.sms_block_reason or "No clean invalidation level available"
+    if alert.pullback_required and "Wait for pullback/retest before entry." not in alert.strategy_warnings:
+        alert.strategy_warnings.append("Wait for pullback/retest before entry.")
+    if alert.do_not_chase_warning and "Do Not Chase — setup is extended or late." not in alert.strategy_warnings:
+        alert.strategy_warnings.insert(0, "Do Not Chase — setup is extended or late.")
+    return alert
+
+
 def assign_professional_alert_tier(alert: Alert) -> Alert:
     category = str(alert.category or "").upper()
+    direction = str(alert.scenario_direction or alert.direction or alert.strategy_direction or "").upper()
     stage = str(alert.scenario_stage or (alert.scenario_top or {}).get("stage") or "").upper()
     risk = str(alert.risk_label or alert.scenario_risk_label or "").upper()
     entry = str(alert.entry_quality_label or alert.scenario_entry_quality_label or "").upper()
@@ -1842,14 +2182,32 @@ def assign_professional_alert_tier(alert: Alert) -> Alert:
         risk in {"HIGH", "DO_NOT_CHASE"}
         or entry in {"LATE", "DO_NOT_CHASE"}
         or stage in {"LATE", "DO_NOT_CHASE", "INVALIDATED"}
+        or alert.market_regime == "CHOPPY"
         or bool(alert.mixed_signal_detected or alert.scenario_conflict)
-        or option_quality in {"WIDE SPREAD", "POOR_QUALITY", "STALE QUOTE", "INVALID QUOTE"}
+        or (
+            bool(option_quality)
+            and normalize_option_quality_label(option_quality) in {
+                "WIDE_SPREAD", "POOR_QUALITY", "STALE", "INVALID", "TOO_RISKY_0DTE", "LOW_LIQUIDITY"
+            }
+        )
         or any(term in warning_text for term in ("DO NOT CHASE", "WIDE SPREAD", "MIXED SIGNAL", "DIRECTION CONFLICT"))
+    )
+    no_clean_invalidation = (
+        alert.invalidation_level is None
+        and direction in {"BULLISH", "BEARISH"}
+        and "NO CLEAN INVALIDATION" in str(alert.invalidation_reason or "").upper()
     )
     if risk_warning:
         tier = "RISK_WARNING"
-        reason = "late/chase/mixed-signal/option-quality risk requires manual review"
-    elif alert.sms_allowed and bool(alert.option_tradable or alert.option_quality == "Tradable"):
+        reason = (
+            "choppy market regime requires watch-only manual review"
+            if alert.market_regime == "CHOPPY"
+            else "late/chase/mixed-signal/option-quality risk requires manual review"
+        )
+    elif no_clean_invalidation:
+        tier = "SETUP_FORMING"
+        reason = "watch only until a clean invalidation level is available"
+    elif alert.sms_allowed and bool(alert.option_tradable or option_quality_is_tradable(alert.option_quality)):
         tier = "TRADE_QUALITY_WATCH"
         reason = "existing strict alert approval passed with a tradable option"
     elif stage in {"CONFIRMED", "GOOD_POSITION"} or alert.phase3_heads_up_type == "GOOD_POSITION":
@@ -1899,6 +2257,7 @@ def confirmation_required_for_tier(alert: Alert) -> str:
 
 
 def compact_alert_message(alert: Alert) -> str:
+    apply_risk_invalidation(alert)
     assign_professional_alert_tier(alert)
     level = "WATCH" if alert.setup_level == "WATCH" else "ALERT"
     direction = alert.direction or "MOMENTUM"
@@ -1969,7 +2328,6 @@ def compact_alert_message(alert: Alert) -> str:
 
 
 def phase3_heads_up_message(alert: Alert) -> str:
-    assign_professional_alert_tier(alert)
     scenario = alert.scenario_top or {}
     scenario_name = scenario.get("scenario_name") or alert.primary_setup or "Scenario"
     stage = alert.scenario_stage or scenario.get("stage") or ""
@@ -2120,6 +2478,7 @@ def phase3_heads_up_dedupe_decision(
 
 
 def format_alert_message(alert: Alert, markdown: bool = True) -> str:
+    apply_risk_invalidation(alert)
     assign_professional_alert_tier(alert)
     if not markdown:
         return compact_alert_message(alert)
@@ -2141,6 +2500,15 @@ def format_alert_message(alert: Alert, markdown: bool = True) -> str:
         body_lines.append(f"Read: {bold}{alert.direction}{bold}")
     if alert.primary_setup:
         body_lines.append(f"Primary setup: {bold}{alert.primary_setup}{bold}")
+    if alert.setup_name:
+        body_lines.append(
+            f"Official setup: {bold}{alert.setup_name}{bold} | "
+            f"{alert.setup_direction or 'neutral'} | {alert.setup_stage or 'WATCHING'} | "
+            f"{alert.setup_score or 0} {alert.setup_confidence or 'LOW'}"
+        )
+        body_lines.append(f"Setup reason: {alert.setup_reason or 'No clear setup reason'}")
+        if alert.setup_block_reason:
+            body_lines.append(f"Setup block: {alert.setup_block_reason}")
     if alert.scenario_top:
         scenario_name = alert.scenario_top.get("scenario_name", "")
         scenario_stage = alert.scenario_stage or alert.scenario_top.get("stage", "")
@@ -2170,8 +2538,33 @@ def format_alert_message(alert: Alert, markdown: bool = True) -> str:
         score_text = f" {alert.relative_strength_score}" if alert.relative_strength_score is not None else ""
         body_lines.append(f"Relative strength: {bold}{alert.relative_strength_label}{score_text}{bold}")
     if alert.market_regime and alert.market_regime != "UNKNOWN":
-        score_text = f" {alert.market_score}" if alert.market_score is not None else ""
+        score_text = f" {alert.regime_score if alert.regime_score is not None else alert.market_score}" if alert.regime_score is not None or alert.market_score is not None else ""
         body_lines.append(f"Market regime: {bold}{alert.market_regime}{score_text}{bold}")
+        if alert.regime_reason:
+            body_lines.append(f"Market environment: {alert.regime_reason}")
+        body_lines.append(
+            f"Market alignment: SPY {bold}{alert.spy_alignment or 'UNKNOWN'}{bold} | "
+            f"QQQ {bold}{alert.qqq_alignment or 'UNKNOWN'}{bold} | "
+            f"AAPL relative strength {bold}{alert.aapl_relative_strength or 'UNKNOWN'}{bold}"
+        )
+        body_lines.append(
+            f"Market state: volume {bold}{alert.volume_state or 'UNKNOWN'}{bold} | "
+            f"volatility {bold}{alert.volatility_state or 'UNKNOWN'}{bold}"
+        )
+    if alert.current_structure_bias:
+        body_lines.append(
+            f"Structure: 1m {bold}{alert.trend_1m or 'UNKNOWN'}{bold} | "
+            f"5m {bold}{alert.trend_5m or 'UNKNOWN'}{bold} | "
+            f"15m {bold}{alert.trend_15m or 'UNKNOWN'}{bold} | "
+            f"bias {bold}{alert.current_structure_bias}{bold}"
+        )
+        if alert.nearest_level_name and alert.nearest_level_price is not None:
+            body_lines.append(
+                f"Nearest level: {bold}{alert.nearest_level_name} {alert.nearest_level_price:.2f}{bold} "
+                f"({alert.distance_to_key_level_pct or 0:.2f}% away)"
+            )
+        if alert.structure_key_warning:
+            body_lines.append(f"Structure warning: {alert.structure_key_warning}")
     if alert.pressure_label and alert.pressure_label != "UNKNOWN":
         score_text = f" {alert.pressure_score}" if alert.pressure_score is not None else ""
         body_lines.append(f"Pressure: {bold}{alert.pressure_label}{score_text}{bold}")
@@ -2181,6 +2574,17 @@ def format_alert_message(alert: Alert, markdown: bool = True) -> str:
         body_lines.append(f"RISK: {bold}DO_NOT_CHASE — valid setup may be late{bold}")
     elif alert.risk_label:
         body_lines.append(f"Risk: {bold}{alert.risk_label}{bold}")
+    body_lines.append(f"Entry timing: {bold}{alert.entry_timing_label or 'EARLY'}{bold}")
+    body_lines.append(
+        f"Invalidation: {bold}{alert.invalidation_level:.2f}{bold} — {alert.invalidation_reason}"
+        if alert.invalidation_level is not None
+        else f"Invalidation: {bold}WATCH ONLY{bold} — {alert.invalidation_reason}"
+    )
+    body_lines.append(f"Stop logic: {alert.stop_logic_description}")
+    if alert.pullback_required:
+        body_lines.append(f"Risk warning: {bold}Pullback/retest required before considering entry{bold}")
+    if alert.do_not_chase_warning:
+        body_lines.append(f"Risk warning: {bold}DO NOT CHASE{bold}")
     if alert.strategy_reasons:
         body_lines.append("Strategy reasons: " + " | ".join(alert.strategy_reasons[:5]))
     if alert.strategy_warnings:
@@ -2227,14 +2631,27 @@ def format_alert_message(alert: Alert, markdown: bool = True) -> str:
 
 
 def professional_telegram_message(alert: Alert, alert_type: str) -> str:
+    apply_risk_invalidation(alert)
     assign_professional_alert_tier(alert)
     scenario = alert.scenario_top or {}
-    setup = scenario.get("scenario_name") or alert.primary_setup or alert.category
-    stage = alert.scenario_stage or scenario.get("stage") or alert.entry_quality_label or "UNKNOWN"
-    direction = alert.scenario_direction or alert.direction or alert.strategy_direction or "MOMENTUM"
-    score = alert.scenario_score if alert.scenario_score is not None else alert.alert_score or 0
-    risk = alert.risk_label or alert.scenario_risk_label or "UNKNOWN"
-    option_quality = alert.option_quality or alert.option_feed_status or "UNAVAILABLE"
+    setup = alert.setup_name or scenario.get("scenario_name") or alert.primary_setup or alert.category
+    stage = alert.setup_stage or alert.scenario_stage or scenario.get("stage") or alert.entry_quality_label or "UNKNOWN"
+    direction = alert.setup_direction or alert.scenario_direction or alert.direction or alert.strategy_direction or "MOMENTUM"
+    score = alert.setup_score if alert.setup_score is not None else alert.scenario_score if alert.scenario_score is not None else alert.alert_score or 0
+    risk = alert.setup_risk_label or alert.risk_label or alert.scenario_risk_label or "UNKNOWN"
+    option_quality = alert.option_quality_message or option_quality_message(alert.option_quality or alert.option_feed_status)
+    invalidation = (
+        f"{alert.invalidation_level:.2f} — {alert.invalidation_reason}"
+        if alert.invalidation_level is not None
+        else alert.invalidation_reason or "No clean invalidation — watch only"
+    )
+    risk_warning = (
+        "DO NOT CHASE. Wait for pullback/retest."
+        if alert.do_not_chase_warning
+        else "Pullback/retest required."
+        if alert.pullback_required
+        else "Confirm invalidation and timing manually."
+    )
     base_message = phase3_heads_up_message(alert) if alert_type == "PHASE3_HEADS_UP" else compact_alert_message(alert)
     return "\n".join(
         [
@@ -2244,8 +2661,20 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
             f"Stage: {stage}",
             f"Score: {score}",
             f"Risk: {risk}",
+            f"Market regime: {alert.market_regime or 'UNKNOWN'} — {alert.regime_reason or 'No clear regime reason'}",
+            f"Structure: 1m {alert.trend_1m or 'UNKNOWN'} | 5m {alert.trend_5m or 'UNKNOWN'} | 15m {alert.trend_15m or 'UNKNOWN'} | bias {alert.current_structure_bias or 'UNKNOWN'}",
+            f"Entry timing: {alert.entry_timing_label}",
             f"Option quality: {option_quality}",
+            f"Invalidation: {invalidation}",
+            f"Setup reason: {alert.setup_reason or 'No clear setup reason'}",
+            f"Watch: {alert.setup_watch_text or 'Confirm manually on chart.'}",
+            f"Risk warning: {risk_warning}",
             f"Confirmation required: {confirmation_required_for_tier(alert)}",
+            *(
+                ["Fresh AAPL news present — context only. Confirm price reaction."]
+                if alert.news_context_present
+                else []
+            ),
             "",
             base_message,
             "Heads-up only — not a buy/sell signal.",
@@ -3165,37 +3594,145 @@ def option_expiration_rank(expiration: date, config: Dict[str, Any]) -> Optional
     return 0 if expiration == today else (expiration - today).days
 
 
-def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, Any]) -> Tuple[str, List[str]]:
+OPTION_QUALITY_LABELS = {
+    "TRADABLE",
+    "POOR_QUALITY",
+    "WIDE_SPREAD",
+    "STALE",
+    "INVALID",
+    "TOO_RISKY_0DTE",
+    "LOW_LIQUIDITY",
+    "WATCH_ONLY",
+}
+
+OPTION_QUALITY_ALIASES = {
+    "TRADABLE": "TRADABLE",
+    "TRADABLE DIAGNOSTIC": "WATCH_ONLY",
+    "WIDE SPREAD": "WIDE_SPREAD",
+    "STALE QUOTE": "STALE",
+    "INVALID QUOTE": "INVALID",
+    "LOW LIQUIDITY": "LOW_LIQUIDITY",
+    "NO CLEAN CONTRACT": "POOR_QUALITY",
+}
+
+
+def normalize_option_quality_label(label: Optional[str]) -> str:
+    value = str(label or "").strip().upper().replace("-", "_")
+    if value in OPTION_QUALITY_LABELS:
+        return value
+    return OPTION_QUALITY_ALIASES.get(value.replace("_", " "), value or "INVALID")
+
+
+def option_quality_is_tradable(label: Optional[str]) -> bool:
+    return normalize_option_quality_label(label) == "TRADABLE"
+
+
+def option_quality_message(label: Optional[str], is_0dte: bool = False) -> str:
+    normalized = normalize_option_quality_label(label)
+    messages = {
+        "TRADABLE": "Option tradable",
+        "WIDE_SPREAD": "Option wide spread — stock setup only",
+        "STALE": "Option stale — stock setup only",
+        "INVALID": "Option invalid — stock setup only",
+        "LOW_LIQUIDITY": "Option low liquidity — stock setup only",
+        "POOR_QUALITY": "Option poor quality — stock setup only",
+        "WATCH_ONLY": "Option watch only — stock setup only",
+        "TOO_RISKY_0DTE": "0DTE caution — stock setup only",
+    }
+    message = messages.get(normalized, "Option unavailable — stock setup only")
+    if normalized == "TRADABLE" and is_0dte:
+        message += " | 0DTE caution"
+    return message
+
+
+def evaluate_option_quality(
+    contract: OptionContractSnapshot,
+    config: Dict[str, Any],
+    underlying_price: Optional[float] = None,
+    scanner_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
     options_config = config.get("options", {})
     reasons: List[str] = []
-    freshness = option_freshness_details(contract, config)
-    if freshness["status"] == "invalid":
-        return "Invalid quote", [freshness["invalid_reason"]]
-    if freshness["status"] == "stale":
-        return "Stale quote", [freshness["stale_reason"]]
-    if freshness["status"] == "poor_quality":
-        return "Wide spread", [freshness["stale_reason"]]
-    if freshness["status"] == "diagnostic":
-        return "Tradable diagnostic", [freshness["stale_reason"]]
-
+    current = parse_optional_dt(scanner_time or now_utc()) or now_utc()
+    freshness = option_freshness_details(contract, config, current)
+    days_to_expiration = (contract.expiration_date - current.astimezone(ET).date()).days
+    is_0dte = days_to_expiration == 0
+    strike_distance_pct = (
+        abs(contract.strike - underlying_price) / underlying_price * 100.0
+        if underlying_price is not None and underlying_price > 0
+        else None
+    )
     min_volume = int(options_config.get("min_option_volume", 100))
     min_oi = int(options_config.get("min_open_interest", 250))
-    if contract.volume is not None and contract.volume < min_volume:
-        return "Low liquidity", ["option volume is below minimum"]
-    if contract.open_interest is not None and contract.open_interest < min_oi:
-        return "Low liquidity", ["open interest is below minimum"]
+    volume_low = contract.volume is not None and contract.volume < min_volume
+    oi_low = contract.open_interest is not None and contract.open_interest < min_oi
+    liquidity_state = "LOW" if volume_low or oi_low else "ACCEPTABLE"
+    time_state = "REGULAR_SESSION" if options_session_active(current) else "SESSION_CLOSED_OR_INACTIVE"
+    label = "TRADABLE"
 
-    if contract.delta is None:
-        return "No clean contract", ["delta is missing"]
-    delta_abs = abs(contract.delta)
-    if delta_abs < float(options_config.get("delta_min", 0.30)) or delta_abs > float(options_config.get("delta_max", 0.60)):
-        return "No clean contract", ["delta is outside target range"]
+    if freshness["status"] == "invalid":
+        label, reasons = "INVALID", [freshness["invalid_reason"]]
+    elif freshness["status"] == "stale":
+        label, reasons = "STALE", [freshness["stale_reason"]]
+    elif freshness["status"] == "poor_quality":
+        label, reasons = "WIDE_SPREAD", [freshness["stale_reason"]]
+    elif freshness["status"] == "diagnostic":
+        label, reasons = "WATCH_ONLY", [freshness["stale_reason"]]
+    elif volume_low or oi_low:
+        label = "LOW_LIQUIDITY"
+        if volume_low:
+            reasons.append("option volume is below minimum")
+        if oi_low:
+            reasons.append("open interest is below minimum")
+    elif contract.delta is None:
+        label, reasons = "POOR_QUALITY", ["delta is missing"]
+    else:
+        delta_abs = abs(contract.delta)
+        if delta_abs < float(options_config.get("delta_min", 0.30)) or delta_abs > float(options_config.get("delta_max", 0.60)):
+            label, reasons = "POOR_QUALITY", ["delta is outside target range"]
 
-    return "Tradable", reasons
+    risky_0dte_after = str(options_config.get("risky_0dte_after_et", "15:30"))
+    try:
+        risky_hour, risky_minute = (int(part) for part in risky_0dte_after.split(":", 1))
+        late_0dte = current.astimezone(ET).time() >= datetime_time(risky_hour, risky_minute)
+    except (TypeError, ValueError):
+        late_0dte = False
+    if (
+        label == "TRADABLE"
+        and is_0dte
+        and late_0dte
+        and bool(options_config.get("block_late_0dte", False))
+    ):
+        label, reasons = "TOO_RISKY_0DTE", ["0DTE contract is inside configured late-session risk window"]
+
+    return {
+        "label": label,
+        "message": option_quality_message(label, is_0dte=is_0dte),
+        "reasons": reasons,
+        "bid": contract.bid,
+        "ask": contract.ask,
+        "mid": contract.mid,
+        "spread_pct": contract.spread_pct,
+        "quote_age_seconds": freshness["quote_age_seconds"],
+        "timestamp_source_field": freshness["timestamp_source_field"],
+        "expiration": contract.expiration_date.isoformat(),
+        "days_to_expiration": days_to_expiration,
+        "is_0dte": is_0dte,
+        "strike_distance_pct": round(strike_distance_pct, 3) if strike_distance_pct is not None else None,
+        "liquidity_state": liquidity_state,
+        "time_state": time_state,
+        "trade_ready_allowed": label == "TRADABLE",
+        "stock_only_allowed": True,
+    }
+
+
+def option_contract_quality(contract: OptionContractSnapshot, config: Dict[str, Any]) -> Tuple[str, List[str]]:
+    result = evaluate_option_quality(contract, config)
+    return result["label"], result["reasons"]
 
 
 def score_option_contract(contract: OptionContractSnapshot, quality: str, config: Dict[str, Any]) -> int:
-    if quality != "Tradable":
+    if not option_quality_is_tradable(quality):
         return 0
     score = 40.0
     spread_pct = contract.spread_pct or float(config.get("options", {}).get("max_spread_pct", 12))
@@ -3221,18 +3758,19 @@ def choose_best_option_contract(
         if contract.option_type == option_type and option_expiration_rank(contract.expiration_date, config) is not None
     ]
     if not candidates:
-        return OptionSelection(quality="No clean contract", reasons=["no matching expiration"])
+        return OptionSelection(quality="INVALID", reasons=["no matching expiration"])
 
     best_any: Optional[OptionSelection] = None
     best_tradable: Optional[OptionSelection] = None
     for contract in candidates:
-        quality, reasons = option_contract_quality(contract, config)
+        details = evaluate_option_quality(contract, config, underlying_price=underlying_price)
+        quality, reasons = details["label"], details["reasons"]
         score = score_option_contract(contract, quality, config)
         expiry_rank = option_expiration_rank(contract.expiration_date, config) or 0
         distance_penalty = abs(contract.strike - underlying_price)
-        selection = OptionSelection(contract=contract, quality=quality, score=score, reasons=reasons)
+        selection = OptionSelection(contract=contract, quality=quality, score=score, reasons=reasons, details=details)
         sort_key = (-expiry_rank, score, -distance_penalty)
-        if quality == "Tradable":
+        if option_quality_is_tradable(quality):
             if best_tradable is None:
                 best_tradable = selection
             else:
@@ -3246,14 +3784,14 @@ def choose_best_option_contract(
         else:
             current = best_any.contract
             assert current is not None
-            current_quality_rank = 1 if best_any.quality == "Tradable" else 0
-            quality_rank = 1 if quality == "Tradable" else 0
+            current_quality_rank = 1 if option_quality_is_tradable(best_any.quality) else 0
+            quality_rank = 1 if option_quality_is_tradable(quality) else 0
             current_key = (current_quality_rank, -(option_expiration_rank(current.expiration_date, config) or 0), best_any.score, -abs(current.strike - underlying_price))
             any_key = (quality_rank, -expiry_rank, score, -distance_penalty)
             if any_key > current_key:
                 best_any = selection
 
-    return best_tradable or best_any or OptionSelection(quality="No clean contract")
+    return best_tradable or best_any or OptionSelection(quality="INVALID")
 
 
 def select_option_contracts(
@@ -3262,7 +3800,7 @@ def select_option_contracts(
     config: Dict[str, Any],
 ) -> Tuple[OptionSelection, OptionSelection]:
     if underlying_price is None or not config.get("options", {}).get("enabled", True):
-        empty = OptionSelection(quality="No clean contract", reasons=["options disabled or missing underlying price"])
+        empty = OptionSelection(quality="INVALID", reasons=["options disabled or missing underlying price"])
         return empty, empty
     return (
         choose_best_option_contract(chain, "C", underlying_price, config),
@@ -3293,6 +3831,14 @@ class EliteScanner:
             self.symbols = [s for s in self.symbols if s in eligible]
         self.context_symbols = [symbol for symbol in self.market_context_symbols() if symbol not in self.symbols]
         self.data_symbols = list(dict.fromkeys(self.symbols + self.context_symbols))
+        performance_config = config.get("post_alert_performance", {})
+        self.post_alert_performance_enabled = bool(performance_config.get("enabled", True))
+        self.post_alert_tracker = PostAlertPerformanceTracker(
+            writer.jsonl_path.parent / "post_alert_performance.jsonl",
+            state_store.path.parent / "post_alert_performance_pending.json",
+            intervals=performance_config.get("interval_minutes", [1, 3, 5, 10, 15]),
+            target_move_pct=float(performance_config.get("target_move_pct", 0.30)),
+        )
 
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
@@ -3306,10 +3852,28 @@ class EliteScanner:
         for i in range(0, len(self.data_symbols), batch_size):
             batch_symbols = self.data_symbols[i:i + batch_size]
             recent.update(self.provider.get_recent_bars(batch_symbols, start, end))
-        news = self.provider.get_news(self.symbols)
+        daily: Dict[str, List[Bar]] = {}
+        if hasattr(self.provider, "get_daily_bars"):
+            try:
+                daily = self.provider.get_daily_bars(self.data_symbols, end - timedelta(days=45), end)
+            except Exception as exc:
+                logger.warning("Daily structure bars unavailable: %s", exc)
+        news_config = self.config.get("news_context", {})
+        news_enabled = bool(news_config.get("enabled", False))
+        news_watch_symbols = [
+            str(symbol).upper()
+            for symbol in news_config.get("watch_symbols", ["AAPL"])
+            if str(symbol).upper() in self.symbols
+        ]
+        news: List[NewsItem] = []
+        if news_enabled and news_watch_symbols:
+            try:
+                news = self.provider.get_news(news_watch_symbols)
+            except Exception as exc:
+                logger.warning("News context unavailable: %s", exc)
 
         latest_news_map: Dict[str, NewsItem] = {}
-        max_age = timedelta(minutes=int(self.config["max_news_age_minutes"]))
+        max_age = timedelta(minutes=int(news_config.get("lookback_minutes", self.config["max_news_age_minutes"])))
         cutoff = now_utc() - max_age
         for item in news:
             if item.published_at >= cutoff and item.symbol not in latest_news_map:
@@ -3345,6 +3909,19 @@ class EliteScanner:
             if or_15_bars:
                 or_15_high = max(b.h for b in or_15_bars)
                 or_15_low = min(b.l for b in or_15_bars)
+            completed_daily = [
+                bar for bar in daily.get(symbol, [])
+                if bar.t.astimezone(ET).date() < now_et().date()
+            ]
+            structure_bars = list(rbars)
+            if latest_bar and (not structure_bars or latest_bar.t > structure_bars[-1].t):
+                structure_bars.append(latest_bar)
+            multi_timeframe_context = evaluate_multi_timeframe_context(
+                structure_bars,
+                daily_bars=completed_daily,
+                premarket_high=pm_high,
+                premarket_low=pm_low,
+            )
 
             option_chain: List[OptionContractSnapshot] = []
             if symbol in self.symbols and self.config.get("options", {}).get("enabled", True) and latest_bar:
@@ -3368,6 +3945,8 @@ class EliteScanner:
                 opening_range_low=or_low,
                 opening_range_15_high=or_15_high,
                 opening_range_15_low=or_15_low,
+                daily_bars=completed_daily,
+                multi_timeframe_context=multi_timeframe_context,
                 latest_news=latest_news_map.get(symbol),
                 best_call=best_call,
                 best_put=best_put,
@@ -3576,7 +4155,7 @@ class EliteScanner:
             return False
         if fast_opposes_setup:
             return False
-        if alert.option_quality != "Tradable":
+        if not option_quality_is_tradable(alert.option_quality):
             return False
         if (alert.options_score or 0) < int(quality_config.get("opposed_bearish_watch_min_options_score", 65)):
             return False
@@ -3736,9 +4315,9 @@ class EliteScanner:
     def market_regime_supports_direction(self, alert: Alert, alert_direction: str) -> bool:
         regime = alert.market_regime or "UNKNOWN"
         if alert_direction == "BULLISH":
-            return regime == "BULL_TREND"
+            return regime in {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}
         if alert_direction == "BEARISH":
-            return regime == "BEAR_TREND"
+            return regime in {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
         return False
 
     def phase2_sms_block_reasons(self, alert: Alert, alert_direction: str) -> List[str]:
@@ -4049,7 +4628,7 @@ class EliteScanner:
             alert.stock_only_heads_up_reason = normal_block_reason
             alert.phase3_heads_up_type = "STOCK_ONLY_WARNING"
         if alert.stock_only_heads_up_allowed:
-            if alert.option_quality in {"Stale quote", "Missing quote", "Unavailable"} or not alert.option_tradable:
+            if normalize_option_quality_label(alert.option_quality) in {"STALE", "INVALID"} or not alert.option_tradable:
                 alert.option_stale_did_not_block_heads_up = True
                 warning = "Option quote stale/missing — stock setup only."
                 if warning not in alert.scenario_warnings:
@@ -4224,7 +4803,7 @@ class EliteScanner:
         if alert.headline:
             reasons.append("fresh news present as context only")
 
-        if alert.option_quality == "Tradable":
+        if option_quality_is_tradable(alert.option_quality):
             score += 15
             opt_score = alert.options_score or 0
             if opt_score >= 80:
@@ -4257,7 +4836,7 @@ class EliteScanner:
             and self.fast_move_aligned(alert, float(quality_config.get("strong_fast_break_min_fast_move_pct", 0.75)))
             and rvol >= float(quality_config.get("strong_fast_break_min_rvol", 1.25))
             and not break_too_extended
-            and alert.option_quality == "Tradable"
+            and option_quality_is_tradable(alert.option_quality)
             and (alert.options_score or 0) >= int(quality_config.get("min_sms_options_score", 65))
         )
         max_score = 100
@@ -4278,7 +4857,7 @@ class EliteScanner:
             max_score = min(max_score, 54)
         if is_watch:
             max_score = min(max_score, 54)
-        if alert.option_quality != "Tradable" or (alert.options_score or 0) < int(quality_config.get("min_sms_options_score", 65)):
+        if not option_quality_is_tradable(alert.option_quality) or (alert.options_score or 0) < int(quality_config.get("min_sms_options_score", 65)):
             max_score = min(max_score, 54)
         strategy_warning_text = " | ".join(alert.strategy_warnings).lower()
         strategy_direction_conflict = self.phase2_direction_conflict(alert, direction)
@@ -4332,7 +4911,7 @@ class EliteScanner:
         sms_allowed = sms_allowed and break_confirmed
         sms_allowed = sms_allowed and not break_too_extended
         sms_allowed = sms_allowed and not fast_opposes_setup
-        sms_allowed = sms_allowed and alert.option_quality == "Tradable"
+        sms_allowed = sms_allowed and option_quality_is_tradable(alert.option_quality)
         sms_allowed = sms_allowed and (alert.options_score or 0) >= int(quality_config.get("min_sms_options_score", 65))
         if alert.option_spread_pct is not None:
             sms_allowed = sms_allowed and alert.option_spread_pct <= float(quality_config.get("max_sms_option_spread_pct", 8.0))
@@ -4417,7 +4996,7 @@ class EliteScanner:
             watch_allowed = watch_allowed and age is not None and age <= max_age
             watch_allowed = watch_allowed and score >= watch_min_score
             watch_allowed = watch_allowed and rvol >= watch_rvol_min
-            watch_allowed = watch_allowed and alert.option_quality == "Tradable"
+            watch_allowed = watch_allowed and option_quality_is_tradable(alert.option_quality)
             watch_allowed = watch_allowed and (alert.options_score or 0) >= watch_min_options_score
             if alert.option_spread_pct is not None:
                 watch_allowed = watch_allowed and alert.option_spread_pct <= float(
@@ -4476,6 +5055,22 @@ class EliteScanner:
             alert.notes.append("watch only: waiting for clean break/hold confirmation")
         if not alert.sms_allowed and not alert.phase3_heads_up_sent:
             alert.notes.append(f"text alert skipped: {alert.text_alert_reason}")
+        structural_levels = dict(alert.strategy_levels or {})
+        for name, value in {
+            "pmh": snap.premarket_high,
+            "pml": snap.premarket_low,
+            "opening_range_high": snap.opening_range_high,
+            "opening_range_low": snap.opening_range_low,
+        }.items():
+            if value is not None:
+                structural_levels.setdefault(name, value)
+        if snap.recent_bars:
+            recent = snap.recent_bars[-10:]
+            structural_levels.setdefault("recent_swing_low", min(bar.l for bar in recent))
+            structural_levels.setdefault("recent_swing_high", max(bar.h for bar in recent))
+        alert.strategy_levels = structural_levels
+        apply_risk_invalidation(alert)
+        assign_professional_alert_tier(alert)
         return alert
 
     def keep_best_text_alert_per_direction(self, alerts: List[Alert]) -> None:
@@ -4565,7 +5160,7 @@ class EliteScanner:
             return None
         selection = snap.best_call if direction == "BULLISH" else snap.best_put
         min_options_score = int(quality_config.get("watch_text_min_options_score", quality_config.get("min_sms_options_score", 65)))
-        if selection.quality != "Tradable" or selection.score < min_options_score:
+        if not option_quality_is_tradable(selection.quality) or selection.score < min_options_score:
             return None
         return Alert(
             symbol=snap.symbol,
@@ -4738,11 +5333,15 @@ class EliteScanner:
         return snap.best_put if direction == "BEARISH" else snap.best_call
 
     def strategy_levels_for_snapshot(self, snap: SymbolSnapshot) -> Dict[str, Optional[float]]:
+        structure_levels = snap.multi_timeframe_context.get("levels", {}) if snap.multi_timeframe_context else {}
         return {
             "pmh": snap.premarket_high,
             "pml": snap.premarket_low,
-            "pdh": None,
-            "pdl": None,
+            "pdh": structure_levels.get("pdh"),
+            "pdl": structure_levels.get("pdl"),
+            "pdc": structure_levels.get("pdc"),
+            "hod": structure_levels.get("hod"),
+            "lod": structure_levels.get("lod"),
             "opening_range_high": snap.opening_range_high,
             "opening_range_low": snap.opening_range_low,
             "opening_range_15_high": snap.opening_range_15_high,
@@ -4850,7 +5449,14 @@ class EliteScanner:
         alert.relative_strength_label = summary.get("relative_strength_label")
         alert.relative_strength_score = summary.get("relative_strength_score")
         alert.market_regime = summary.get("market_regime")
+        alert.regime_score = summary.get("regime_score", summary.get("market_score"))
         alert.market_score = summary.get("market_score")
+        alert.regime_reason = summary.get("regime_reason")
+        alert.spy_alignment = summary.get("spy_alignment")
+        alert.qqq_alignment = summary.get("qqq_alignment")
+        alert.aapl_relative_strength = summary.get("aapl_relative_strength")
+        alert.volume_state = summary.get("volume_state")
+        alert.volatility_state = summary.get("volatility_state")
         alert.pressure_label = summary.get("pressure_label")
         alert.pressure_score = summary.get("pressure_score")
         alert.scenario_top = summary.get("scenario_top")
@@ -4885,10 +5491,56 @@ class EliteScanner:
         alert.scenario_sms_block_reason = summary.get("scenario_sms_block_reason")
         alert.scenario_sms_allowed = summary.get("scenario_sms_allowed")
         alert.stock_setup_score_reason = summary.get("stock_setup_score_reason")
+        alert.professional_setup = dict(summary.get("professional_setup") or {})
+        alert.setup_name = summary.get("setup_name")
+        alert.setup_code = summary.get("setup_code")
+        alert.setup_direction = summary.get("setup_direction")
+        alert.setup_stage = summary.get("setup_stage")
+        alert.setup_score = summary.get("setup_score")
+        alert.setup_confidence = summary.get("setup_confidence")
+        alert.setup_reason = summary.get("setup_reason")
+        alert.setup_invalidation_level = summary.get("setup_invalidation_level")
+        alert.setup_entry_quality = summary.get("setup_entry_quality")
+        alert.setup_risk_label = summary.get("setup_risk_label")
+        alert.setup_watch_text = summary.get("setup_watch_text")
+        alert.setup_block_reason = summary.get("setup_block_reason")
         alert.strategy_reasons = list(summary.get("reasons") or [])
         alert.strategy_warnings = list(summary.get("warnings") or [])
         alert.strategy_levels = dict(summary.get("levels") or {})
         alert.strategy_results = list(summary.get("strategy_results") or [])
+        structure = snap.multi_timeframe_context or {}
+        alert.trend_1m = structure.get("trend_1m")
+        alert.trend_5m = structure.get("trend_5m")
+        alert.trend_15m = structure.get("trend_15m")
+        alert.daily_trend = structure.get("daily_trend")
+        alert.current_structure_bias = structure.get("current_bias")
+        alert.structure_key_warning = structure.get("key_warning")
+        alert.nearest_level_name = structure.get("nearest_level_name")
+        alert.nearest_level_price = structure.get("nearest_level_price")
+        alert.distance_to_key_level_pct = structure.get("distance_to_key_level_pct")
+        alert.nearest_support = structure.get("nearest_support")
+        alert.nearest_resistance = structure.get("nearest_resistance")
+        alert.demand_zones = list(structure.get("demand_zones") or [])
+        alert.supply_zones = list(structure.get("supply_zones") or [])
+        alert.liquidity_above_highs = list(structure.get("liquidity_above_highs") or [])
+        alert.liquidity_below_lows = list(structure.get("liquidity_below_lows") or [])
+        alert.multi_timeframe_levels = dict(structure.get("levels") or {})
+        if snap.latest_news:
+            alert.latest_headline = snap.latest_news.headline
+            alert.news_source = snap.latest_news.source
+            alert.news_age_minutes = round(
+                max(0.0, (alert.timestamp - snap.latest_news.published_at).total_seconds() / 60.0),
+                2,
+            )
+            alert.news_sentiment_guess = news_sentiment_guess(snap.latest_news.headline)
+        if (
+            alert.strategy_direction in {"bullish", "bearish"}
+            and alert.current_structure_bias in {"BULLISH", "BEARISH"}
+            and alert.strategy_direction.upper() != alert.current_structure_bias
+        ):
+            warning = "Setup direction disagrees with higher timeframe structure"
+            if warning not in alert.strategy_warnings:
+                alert.strategy_warnings.append(warning)
         self.apply_mixed_signal_and_news_context(alert)
         self.apply_aapl_bearish_continuation_label(alert, snap, market_context)
         if alert.primary_setup:
@@ -4914,6 +5566,20 @@ class EliteScanner:
             alert.notes.append(f"relative strength: {alert.relative_strength_label}")
         if alert.market_regime and alert.market_regime != "UNKNOWN":
             alert.notes.append(f"market regime: {alert.market_regime}")
+        if alert.current_structure_bias:
+            alert.notes.append(
+                f"structure: 1m {alert.trend_1m} | 5m {alert.trend_5m} | 15m {alert.trend_15m} | bias {alert.current_structure_bias}"
+            )
+        if alert.setup_name:
+            alert.notes.append(
+                f"official setup: {alert.setup_name} {alert.setup_stage or ''} ({alert.setup_score or 0} {alert.setup_confidence or ''})"
+            )
+        if alert.setup_name == "Mixed Signal" and alert.setup_reason:
+            warning = f"MIXED_SIGNAL: {alert.setup_reason}"
+            if warning not in alert.strategy_warnings:
+                alert.strategy_warnings.insert(0, warning)
+        if alert.regime_reason:
+            alert.notes.append(f"regime reason: {alert.regime_reason}")
         if alert.pressure_label and alert.pressure_label != "UNKNOWN":
             alert.notes.append(f"pressure: {alert.pressure_label}")
         if alert.strategy_warnings:
@@ -4946,12 +5612,15 @@ class EliteScanner:
                 alert.strategy_warnings.insert(0, warning)
                 alert.conflict_warning_added = True
         alert.news_context_present = bool(alert.headline)
+        alert.latest_headline = alert.latest_headline or alert.headline
+        alert.news_sentiment_guess = alert.news_sentiment_guess or (
+            news_sentiment_guess(alert.latest_headline) if alert.latest_headline else None
+        )
         alert.news_used_for_context_only = bool(alert.headline)
         alert.news_upgraded_alert = False
         if alert.headline:
             for warning in (
-                "Fresh AAPL news present — context only.",
-                "Confirm price reaction before using news.",
+                "Fresh AAPL news present — context only. Confirm price reaction.",
             ):
                 if warning not in alert.strategy_warnings:
                     alert.strategy_warnings.append(warning)
@@ -4959,7 +5628,17 @@ class EliteScanner:
     def attach_option_context(self, alert: Alert, snap: SymbolSnapshot) -> Alert:
         selection = self.preferred_option_selection(alert, snap)
         contract = selection.contract
-        alert.option_quality = selection.quality
+        alert.option_quality = normalize_option_quality_label(selection.quality)
+        alert.option_quality_message = selection.details.get(
+            "message", option_quality_message(alert.option_quality, bool(selection.details.get("is_0dte")))
+        )
+        alert.option_quality_reasons = list(selection.reasons)
+        alert.option_days_to_expiration = selection.details.get("days_to_expiration")
+        alert.option_is_0dte = selection.details.get("is_0dte")
+        alert.option_strike_distance_pct = selection.details.get("strike_distance_pct")
+        alert.option_liquidity_state = selection.details.get("liquidity_state")
+        alert.option_time_state = selection.details.get("time_state")
+        alert.option_stock_only_allowed = True
         alert.options_score = selection.score
         alert.option_tradable = selection.is_tradable()
         if contract:
@@ -5002,7 +5681,7 @@ class EliteScanner:
             alert.option_timestamp_fallback_type = freshness["fallback_type"]
             alert.option_fallback_timestamp_utc = freshness["fallback_timestamp_utc"]
             alert.notes.append(
-                f"suggested option: {contract.symbol} ({selection.quality}, score {selection.score})"
+                f"suggested option: {contract.symbol} ({alert.option_quality}, score {selection.score})"
             )
             if contract.is_simulated:
                 alert.notes.append("option data is simulated dry-run data")
@@ -5011,13 +5690,13 @@ class EliteScanner:
             elif contract.feed == "opra":
                 alert.notes.append("option feed: OPRA")
         else:
-            alert.notes.append(f"option warning: {selection.quality}")
+            alert.notes.append(f"option warning: {alert.option_quality_message}")
 
         if selection.is_tradable():
             alert.notes.append("high confidence requires stock momentum + tradable option")
         else:
-            reason = "; ".join(selection.reasons) if selection.reasons else selection.quality
-            alert.notes.append(f"option warning: no liquid contract found ({reason})")
+            reason = "; ".join(selection.reasons) if selection.reasons else alert.option_quality
+            alert.notes.append(f"{alert.option_quality_message} ({reason})")
         return alert
 
     def evaluate_symbol(
@@ -5287,7 +5966,10 @@ class EliteScanner:
                 )
 
         # 6) Big day mover with volume + news
-        if self.config["alert_rules"].get("news_catalyst", True):
+        if (
+            self.config["alert_rules"].get("news_catalyst", True)
+            and not bool(self.config.get("news_context", {}).get("context_only", True))
+        ):
             if abs(day_move) >= self.config["day_move_pct_threshold"] and (rel_vol or 0) >= self.config["relative_volume_threshold"] and snap.latest_news:
                 alerts.append(
                     Alert(
@@ -5380,7 +6062,7 @@ class EliteScanner:
         min_options_score = int(quality_config.get("trend_flip_min_options_score", 60))
         if (alert.relative_volume or 0.0) < min_rvol:
             return
-        if alert.option_quality != "Tradable" or (alert.options_score or 0) < min_options_score:
+        if not option_quality_is_tradable(alert.option_quality) or (alert.options_score or 0) < min_options_score:
             return
         if alert.option_spread_pct is not None and alert.option_spread_pct > float(
             quality_config.get("max_sms_option_spread_pct", 8.0)
@@ -5429,9 +6111,12 @@ class EliteScanner:
             text_key = self.phase3_heads_up_state_key(alert)
         if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
             return False
+        apply_risk_invalidation(alert)
         assign_professional_alert_tier(alert)
         logger.info(alert.short_summary())
         self.writer.write(alert)
+        if self.post_alert_performance_enabled:
+            self.post_alert_tracker.register(alert)
         self.notifier.send(alert)
         self.state_store.set_last_alert_time(alert.dedupe_key(), now_utc())
         if text_key:
@@ -5446,6 +6131,8 @@ class EliteScanner:
             logger.info("Outside scan window. No scan performed.")
             return 0
         snapshots = self.build_snapshots()
+        if self.post_alert_performance_enabled:
+            self.post_alert_tracker.update(snapshots, now=now_utc())
         market_context = self.build_market_context(snapshots)
         market_bars = {
             symbol: snap.recent_bars
@@ -5573,6 +6260,26 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
         "MAX_OPTION_QUOTE_AGE_SECONDS",
         int(options.get("max_quote_age_seconds", 60)),
     )
+    news_context = config.setdefault("news_context", {})
+    news_context["enabled"] = env_bool(
+        "ENABLE_NEWS_CONTEXT_LAYER",
+        bool(news_context.get("enabled", False)),
+    )
+    news_context["lookback_minutes"] = env_int(
+        "NEWS_LOOKBACK_MINUTES",
+        int(news_context.get("lookback_minutes", 120)),
+    )
+    news_context["context_only"] = env_bool(
+        "NEWS_CONTEXT_ONLY",
+        bool(news_context.get("context_only", True)),
+    )
+    raw_news_symbols = os.getenv("NEWS_WATCH_SYMBOLS")
+    if raw_news_symbols is not None:
+        news_context["watch_symbols"] = [
+            part.strip().upper()
+            for part in raw_news_symbols.split(",")
+            if part.strip()
+        ]
 
     quality = config.setdefault("alert_quality", {})
     quality["sms_min_confirmation_score"] = env_int(
@@ -5948,6 +6655,8 @@ def run_tests() -> int:
                     "direction": "bullish",
                     "stage": "CONFIRMED",
                     "score": 87,
+                    "invalidation_level": 100.25,
+                    "invalidation_reason": "Loses VWAP/EMA9 support",
                 },
             )
             alert = Alert(
@@ -6077,6 +6786,60 @@ def run_tests() -> int:
                 "Heads-up only — not a buy/sell signal.",
             ):
                 self.assertIn(label, message)
+
+        def test_risk_engine_generates_bullish_and_bearish_invalidation(self) -> None:
+            bullish = self.make_phase3_heads_up_alert(
+                scenario_top=None,
+                scenario_direction="bullish",
+                strategy_levels={"vwap": 100.4, "ema9": 100.6, "recent_swing_low": 99.8},
+            )
+            bearish = self.make_phase3_heads_up_alert(
+                price=99.0,
+                direction="BEARISH",
+                strategy_direction="bearish",
+                scenario_direction="bearish",
+                scenario_top=None,
+                strategy_levels={"vwap": 99.5, "ema9": 99.3, "recent_swing_high": 100.2},
+            )
+            apply_risk_invalidation(bullish)
+            apply_risk_invalidation(bearish)
+            self.assertEqual(bullish.invalidation_level, 100.6)
+            self.assertIn("loses EMA9", bullish.invalidation_reason)
+            self.assertEqual(bearish.invalidation_level, 99.3)
+            self.assertIn("reclaims EMA9", bearish.invalidation_reason)
+            self.assertIn("confirmed close below", bullish.stop_logic_description)
+            self.assertIn("confirmed close above", bearish.stop_logic_description)
+
+        def test_risk_engine_missing_invalidation_blocks_trade_quality(self) -> None:
+            alert = self.make_phase3_heads_up_alert(
+                scenario_top=None,
+                strategy_levels={},
+                scenario_levels={},
+                trigger_level=None,
+                sms_allowed=True,
+                option_tradable=True,
+                option_quality="Tradable",
+            )
+            apply_risk_invalidation(alert)
+            assign_professional_alert_tier(alert)
+            self.assertFalse(alert.sms_allowed)
+            self.assertEqual(alert.alert_tier, "SETUP_FORMING")
+            self.assertIn("No clean invalidation", alert.invalidation_reason)
+            self.assertIn("no clean invalidation", alert.sms_block_reason.lower())
+
+        def test_risk_engine_late_alert_requires_pullback_and_says_do_not_chase(self) -> None:
+            alert = self.make_phase3_heads_up_alert(
+                scenario_stage="LATE",
+                entry_quality_label="LATE",
+                risk_label="DO_NOT_CHASE",
+            )
+            apply_risk_invalidation(alert)
+            message = professional_telegram_message(alert, "PHASE3_HEADS_UP")
+            self.assertEqual(alert.entry_timing_label, "DO_NOT_CHASE")
+            self.assertTrue(alert.pullback_required)
+            self.assertTrue(alert.do_not_chase_warning)
+            self.assertIn("Risk warning: DO NOT CHASE", message)
+            self.assertIn("Invalidation:", message)
 
         def with_env(self, values: Dict[str, str]) -> Dict[str, Optional[str]]:
             old = {key: os.environ.get(key) for key in values}
@@ -6977,6 +7740,18 @@ def run_tests() -> int:
             scanner.evaluate_phase3_heads_up(alert, snap, "Fresh")
             self.assertTrue(alert.phase3_heads_up_sent)
 
+        def test_phase7_poor_option_does_not_block_stock_only_heads_up(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                option_quality="WIDE_SPREAD",
+                option_tradable=False,
+                option_feed_status="OPRA",
+            )
+            scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh")
+            self.assertTrue(alert.phase3_heads_up_sent)
+            self.assertFalse(alert.sms_allowed)
+            self.assertTrue(alert.option_stock_only_allowed)
+
         def test_phase3_heads_up_does_not_change_normal_sms_rules(self) -> None:
             scanner = self.make_phase3_heads_up_scanner()
             alert = self.make_phase3_heads_up_alert()
@@ -7680,14 +8455,14 @@ def run_tests() -> int:
             spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
             qqq = self.make_strategy_bars([100 + i * 0.15 for i in range(15)])
             result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
-            self.assertEqual(result["market_regime"], "BULL_TREND")
+            self.assertEqual(result["market_regime"], "OPENING_DRIVE_UP")
 
         def test_phase2f_spy_qqq_below_vwap_lower_lows_bear_trend(self) -> None:
             from strategies.confirmation.market_regime import evaluate_market_regime
             spy = self.make_strategy_bars([102 - i * 0.12 for i in range(15)])
             qqq = self.make_strategy_bars([102 - i * 0.15 for i in range(15)])
             result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
-            self.assertEqual(result["market_regime"], "BEAR_TREND")
+            self.assertEqual(result["market_regime"], "OPENING_DRIVE_DOWN")
 
         def test_phase2f_multiple_vwap_crosses_is_choppy(self) -> None:
             from strategies.confirmation.market_regime import evaluate_market_regime
@@ -7702,8 +8477,169 @@ def run_tests() -> int:
             spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
             qqq = self.make_strategy_bars([102 - i * 0.15 for i in range(15)])
             result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None))
-            self.assertEqual(result["market_regime"], "MIXED")
-            self.assertTrue(any("mixed" in warning.lower() for warning in result["warnings"]))
+            self.assertEqual(result["market_regime"], "REVERSAL_ATTEMPT")
+            self.assertTrue(any("disagree" in warning.lower() for warning in result["warnings"]))
+
+        def test_phase4_market_regime_classifies_trending_up_and_down(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            up_spy = self.make_strategy_bars([100 + i * 0.12 for i in range(15)])
+            up_qqq = self.make_strategy_bars([100 + i * 0.15 for i in range(15)])
+            down_spy = self.make_strategy_bars([102 - i * 0.12 for i in range(15)])
+            down_qqq = self.make_strategy_bars([102 - i * 0.15 for i in range(15)])
+            for bars in (up_spy, up_qqq, down_spy, down_qqq):
+                for bar in bars:
+                    bar.t += timedelta(hours=2)
+            up = evaluate_market_regime({"SPY": up_spy, "QQQ": up_qqq}, load_config(None), aapl_bars=up_qqq)
+            down = evaluate_market_regime({"SPY": down_spy, "QQQ": down_qqq}, load_config(None), aapl_bars=down_qqq)
+            self.assertEqual(up["market_regime"], "TRENDING_UP")
+            self.assertEqual(down["market_regime"], "TRENDING_DOWN")
+            self.assertIn("regime_reason", up)
+            self.assertIn("regime_score", down)
+
+        def test_phase4_market_regime_reports_spy_qqq_alignment_and_aapl_strength(self) -> None:
+            from strategies.confirmation.market_regime import evaluate_market_regime
+            aapl = self.make_strategy_bars([100 + i * 0.25 for i in range(15)])
+            spy = self.make_strategy_bars([100 + i * 0.08 for i in range(15)])
+            qqq = self.make_strategy_bars([100 + i * 0.10 for i in range(15)])
+            result = evaluate_market_regime({"SPY": spy, "QQQ": qqq}, load_config(None), aapl_bars=aapl)
+            self.assertEqual(result["spy_alignment"], "ALIGNED")
+            self.assertEqual(result["qqq_alignment"], "ALIGNED")
+            self.assertEqual(result["aapl_relative_strength"], "STRONG")
+            self.assertIn(result["volume_state"], {"LOW", "NORMAL", "STRONG", "CLIMAX"})
+            self.assertIn(result["volatility_state"], {"LOW", "NORMAL", "HIGH"})
+
+        def test_phase4_market_regime_log_contains_context_only_symbols(self) -> None:
+            temp_dir = Path(tempfile.mkdtemp())
+            writer = AlertWriter(temp_dir / "alerts.csv", temp_dir / "alerts.jsonl")
+            writer.market_regime_jsonl_path = temp_dir / "market_regime.jsonl"
+            alert = self.make_phase3_heads_up_alert(
+                market_regime="CHOPPY",
+                regime_score=70,
+                regime_reason="SPY/QQQ are repeatedly crossing VWAP",
+                spy_alignment="NEUTRAL",
+                qqq_alignment="NEUTRAL",
+                aapl_relative_strength="NEUTRAL",
+                volume_state="NORMAL",
+                volatility_state="NORMAL",
+            )
+            writer.write(alert)
+            record = json.loads(writer.market_regime_jsonl_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["symbol"], "AAPL")
+            self.assertEqual(record["context_symbols"], ["SPY", "QQQ"])
+            self.assertTrue(record["alert_symbol"])
+
+        def test_phase5_multi_timeframe_detects_premarket_and_previous_day_levels(self) -> None:
+            from strategies.context import evaluate_multi_timeframe_context
+            bars = self.make_strategy_bars([100 + i * 0.05 for i in range(45)])
+            prior = [
+                Bar(t=bars[0].t - timedelta(days=1), o=98.0, h=103.0, l=97.0, c=101.0, v=5_000_000),
+            ]
+            result = evaluate_multi_timeframe_context(
+                bars,
+                daily_bars=prior,
+                premarket_high=102.5,
+                premarket_low=98.5,
+            )
+            self.assertEqual(result["levels"]["pmh"], 102.5)
+            self.assertEqual(result["levels"]["pml"], 98.5)
+            self.assertEqual(result["levels"]["pdh"], 103.0)
+            self.assertEqual(result["levels"]["pdl"], 97.0)
+            self.assertEqual(result["levels"]["pdc"], 101.0)
+
+        def test_phase5_multi_timeframe_updates_hod_lod_and_nearest_level(self) -> None:
+            from strategies.context import evaluate_multi_timeframe_context
+            closes = [100 + i * 0.04 for i in range(45)]
+            highs = [close + 0.15 for close in closes]
+            lows = [close - 0.15 for close in closes]
+            highs[-1] = 105.0
+            lows[0] = 96.0
+            result = evaluate_multi_timeframe_context(
+                self.make_strategy_bars(closes, highs=highs, lows=lows),
+                premarket_high=102.0,
+                premarket_low=98.0,
+            )
+            self.assertEqual(result["levels"]["hod"], 105.0)
+            self.assertEqual(result["levels"]["lod"], 96.0)
+            self.assertIsNotNone(result["nearest_level_name"])
+            self.assertIsNotNone(result["distance_to_key_level_pct"])
+
+        def test_phase5_multi_timeframe_trend_classification_and_alignment_warning(self) -> None:
+            from strategies.context import evaluate_multi_timeframe_context
+            bullish = evaluate_multi_timeframe_context(self.make_strategy_bars([100 + i * 0.08 for i in range(60)]))
+            self.assertEqual(bullish["trend_1m"], "BULLISH")
+            self.assertEqual(bullish["trend_5m"], "BULLISH")
+            self.assertEqual(bullish["current_bias"], "BULLISH")
+            self.assertEqual(bullish["key_warning"], "")
+
+        def test_phase5_multi_timeframe_log_preserves_aapl_alert_scope(self) -> None:
+            temp_dir = Path(tempfile.mkdtemp())
+            writer = AlertWriter(temp_dir / "alerts.csv", temp_dir / "alerts.jsonl")
+            writer.multi_timeframe_jsonl_path = temp_dir / "multi_timeframe_context.jsonl"
+            alert = self.make_phase3_heads_up_alert(
+                trend_1m="BULLISH",
+                trend_5m="BULLISH",
+                trend_15m="BULLISH",
+                current_structure_bias="BULLISH",
+                nearest_level_name="VWAP",
+                nearest_level_price=100.0,
+            )
+            writer.write(alert)
+            record = json.loads(writer.multi_timeframe_jsonl_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(record["symbol"], "AAPL")
+            self.assertTrue(record["alert_symbol"])
+            self.assertEqual(record["context_symbols"], ["SPY", "QQQ"])
+
+        def test_phase6_classifier_bullish_pullback_hold_and_bearish_rejection(self) -> None:
+            from strategies.setup_classifier import classify_professional_setup
+            bullish = classify_professional_setup(
+                {"primary_setup": "VWAP Hold", "direction": "bullish", "confidence_score": 80},
+                {"top_scenario": {"scenario_name": "Pullback Holding", "direction": "bullish", "stage": "CONFIRMED", "score": 84, "reasons": ["Higher low held"]}},
+            )
+            bearish = classify_professional_setup(
+                {"primary_setup": "VWAP Rejection", "direction": "bearish", "confidence_score": 80},
+                {"top_scenario": {"scenario_name": "Pullback Rejecting", "direction": "bearish", "stage": "GOOD_POSITION", "score": 86, "reasons": ["Underside retest rejected"]}},
+            )
+            self.assertEqual(bullish["setup_name"], "Bullish Pullback Holding")
+            self.assertEqual(bullish["stage"], "CONFIRMED")
+            self.assertEqual(bearish["setup_name"], "Bearish Pullback Rejecting")
+            self.assertEqual(bearish["direction"], "bearish")
+
+        def test_phase6_classifier_liquidity_sweep_reclaim_and_rejection(self) -> None:
+            from strategies.setup_classifier import classify_professional_setup
+            bullish = classify_professional_setup(
+                {"primary_setup": "Bullish Liquidity Sweep Reclaim", "direction": "bullish", "confidence_score": 82},
+                {},
+            )
+            bearish = classify_professional_setup(
+                {"primary_setup": "Bearish Liquidity Sweep Rejection", "direction": "bearish", "confidence_score": 82},
+                {},
+            )
+            self.assertEqual(bullish["setup_name"], "Bullish Liquidity Sweep Reclaim")
+            self.assertEqual(bearish["setup_name"], "Bearish Liquidity Sweep Rejection")
+
+        def test_phase6_classifier_failed_breakout(self) -> None:
+            from strategies.setup_classifier import classify_professional_setup
+            result = classify_professional_setup(
+                {"primary_setup": "Possible Fakeout", "direction": "bearish", "confidence_score": 70},
+                {"top_scenario": {"scenario_name": "Failed Breakout", "direction": "bearish", "stage": "CONFIRMED", "score": 78}},
+            )
+            self.assertEqual(result["setup_name"], "Bearish Failed Breakout")
+            self.assertEqual(result["direction"], "bearish")
+
+        def test_phase6_classifier_mixed_signal_explains_failed_bullish_sweep(self) -> None:
+            from strategies.setup_classifier import classify_professional_setup
+            result = classify_professional_setup(
+                {"primary_setup": "Bullish Liquidity Sweep Reclaim", "direction": "bullish", "confidence_score": 82},
+                {
+                    "top_scenario": {"scenario_name": "Failed VWAP/EMA Reclaim", "direction": "bearish", "stage": "FORMING", "score": 72},
+                    "scenario_conflict": True,
+                },
+            )
+            self.assertEqual(result["setup_name"], "Mixed Signal")
+            self.assertEqual(result["setup_code"], "MIXED_SIGNAL")
+            self.assertTrue(result["mixed_signal"])
+            self.assertIn("reclaim failed", result["reason"].lower())
+            self.assertIn("MIXED_SIGNAL", result["block_reason"])
 
         def test_phase2f_choppy_market_lowers_setup_confidence(self) -> None:
             bars = self.make_strategy_bars(
@@ -8223,7 +9159,7 @@ def run_tests() -> int:
             ]
             selection = choose_best_option_contract(chain, "C", 100.0, config)
             self.assertEqual(selection.contract.expiration_date, today)
-            self.assertEqual(selection.quality, "Tradable")
+            self.assertEqual(selection.quality, "TRADABLE")
 
         def test_options_falls_back_to_nearest_weekly(self) -> None:
             config = load_config(None)
@@ -8234,14 +9170,14 @@ def run_tests() -> int:
         def test_options_rejects_wide_spread(self) -> None:
             config = load_config(None)
             selection = choose_best_option_contract([self.option_contract(bid=1.00, ask=1.50)], "C", 100.0, config)
-            self.assertEqual(selection.quality, "Wide spread")
+            self.assertEqual(selection.quality, "WIDE_SPREAD")
             self.assertEqual(selection.score, 0)
 
         def test_options_rejects_stale_quote(self) -> None:
             config = load_config(None)
             stale = now_utc() - timedelta(minutes=10)
             selection = choose_best_option_contract([self.option_contract(quote_time=stale)], "C", 100.0, config)
-            self.assertEqual(selection.quality, "Stale quote")
+            self.assertEqual(selection.quality, "STALE")
 
         def test_option_freshness_normalizes_utc_et_and_naive_timestamps(self) -> None:
             config = load_config(None)
@@ -8264,7 +9200,7 @@ def run_tests() -> int:
             self.assertEqual(details["status"], "invalid")
             self.assertEqual(details["stale_reason"], "")
             self.assertEqual(details["invalid_reason"], "missing_bid_or_ask")
-            self.assertEqual(option_contract_quality(zero_bid, config)[0], "Invalid quote")
+            self.assertEqual(option_contract_quality(zero_bid, config)[0], "INVALID")
 
         def test_option_freshness_wide_spread_is_poor_quality_not_stale(self) -> None:
             config = load_config(None)
@@ -8323,7 +9259,7 @@ def run_tests() -> int:
             self.assertEqual(details["status"], "diagnostic")
             self.assertTrue(details["fallback_used"])
             self.assertEqual(details["fallback_type"], "latest_trade")
-            self.assertEqual(option_contract_quality(contract, config)[0], "Tradable diagnostic")
+            self.assertEqual(option_contract_quality(contract, config)[0], "WATCH_ONLY")
             self.assertFalse(OptionSelection(contract, "Tradable diagnostic", 0).is_tradable())
 
         def test_option_missing_quote_timestamp_without_fallback_is_stale(self) -> None:
@@ -8353,10 +9289,243 @@ def run_tests() -> int:
             self.assertTrue(alert.news_used_for_context_only)
             self.assertFalse(alert.news_upgraded_alert)
 
+        def test_phase9_news_context_defaults_disabled_and_unavailable_does_not_crash(self) -> None:
+            class NewsFailProvider(MockProvider):
+                def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
+                    raise RuntimeError("news unavailable")
+
+            config = load_config(None)
+            self.assertFalse(config["news_context"]["enabled"])
+            scanner = EliteScanner(
+                config,
+                NewsFailProvider(["AAPL", "SPY", "QQQ"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_news_disabled.csv", LOG_DIR / "test_news_disabled.jsonl"),
+                StateStore(STATE_DIR / "test_news_disabled_state.json"),
+            )
+            snapshots = scanner.build_snapshots()
+            self.assertIsNone(snapshots["AAPL"].latest_news)
+
+            config["news_context"]["enabled"] = True
+            scanner = EliteScanner(
+                config,
+                NewsFailProvider(["AAPL", "SPY", "QQQ"]),
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_news_unavailable.csv", LOG_DIR / "test_news_unavailable.jsonl"),
+                StateStore(STATE_DIR / "test_news_unavailable_state.json"),
+            )
+            snapshots = scanner.build_snapshots()
+            self.assertIsNone(snapshots["AAPL"].latest_news)
+
+        def test_phase9_news_access_success_and_aapl_only_context(self) -> None:
+            class NewsProvider(MockProvider):
+                def get_news(self, symbols: List[str], limit: int = 50) -> List[NewsItem]:
+                    self.requested_news_symbols = list(symbols)
+                    return [
+                        NewsItem(
+                            symbol="AAPL",
+                            headline="Apple raises outlook after strong growth",
+                            url="https://example.com/aapl",
+                            published_at=now_utc() - timedelta(minutes=10),
+                            source="TestWire",
+                        )
+                    ]
+
+            config = load_config(None)
+            config["news_context"]["enabled"] = True
+            provider = NewsProvider(["AAPL", "SPY", "QQQ"])
+            scanner = EliteScanner(
+                config,
+                provider,
+                DiscordNotifier(None),
+                AlertWriter(LOG_DIR / "test_news_success.csv", LOG_DIR / "test_news_success.jsonl"),
+                StateStore(STATE_DIR / "test_news_success_state.json"),
+            )
+            snapshots = scanner.build_snapshots()
+            self.assertEqual(provider.requested_news_symbols, ["AAPL"])
+            self.assertEqual(snapshots["AAPL"].latest_news.source, "TestWire")
+            self.assertIsNone(snapshots["SPY"].latest_news)
+
+        def test_phase9_news_cannot_upgrade_or_override_risk_or_options(self) -> None:
+            scanner = self.make_phase3_heads_up_scanner()
+            alert = self.make_phase3_heads_up_alert(
+                headline="Apple raises outlook after strong growth",
+                risk_label="DO_NOT_CHASE",
+                option_quality="WIDE_SPREAD",
+                option_tradable=False,
+                sms_allowed=False,
+                alert_grade="C",
+                alert_score=45,
+            )
+            before = (alert.sms_allowed, alert.alert_grade, alert.alert_score, alert.risk_label, alert.option_quality)
+            scanner.apply_mixed_signal_and_news_context(alert)
+            after = (alert.sms_allowed, alert.alert_grade, alert.alert_score, alert.risk_label, alert.option_quality)
+            self.assertEqual(before, after)
+            self.assertTrue(alert.news_context_present)
+            self.assertTrue(alert.news_used_for_context_only)
+            self.assertFalse(alert.news_upgraded_alert)
+            self.assertEqual(alert.news_sentiment_guess, "POSITIVE")
+            self.assertIn("context only. Confirm price reaction", professional_telegram_message(alert, "PHASE3_HEADS_UP"))
+
         def test_options_rejects_delta_outside_range(self) -> None:
             config = load_config(None)
             selection = choose_best_option_contract([self.option_contract(delta=0.90)], "C", 100.0, config)
-            self.assertEqual(selection.quality, "No clean contract")
+            self.assertEqual(selection.quality, "POOR_QUALITY")
+
+        def test_option_quality_standard_labels_and_stock_only_behavior(self) -> None:
+            config = load_config(None)
+            tradable = evaluate_option_quality(self.option_contract(bid=1.95, ask=2.02), config, underlying_price=100.0)
+            wide = evaluate_option_quality(self.option_contract(bid=1.00, ask=1.50), config, underlying_price=100.0)
+            stale = evaluate_option_quality(
+                self.option_contract(quote_time=now_utc() - timedelta(minutes=10)),
+                config,
+                underlying_price=100.0,
+            )
+            self.assertEqual(tradable["label"], "TRADABLE")
+            self.assertTrue(tradable["trade_ready_allowed"])
+            self.assertEqual(wide["label"], "WIDE_SPREAD")
+            self.assertFalse(wide["trade_ready_allowed"])
+            self.assertTrue(wide["stock_only_allowed"])
+            self.assertEqual(wide["message"], "Option wide spread — stock setup only")
+            self.assertEqual(stale["label"], "STALE")
+            self.assertTrue(stale["stock_only_allowed"])
+            self.assertEqual(stale["message"], "Option stale — stock setup only")
+
+        def test_missing_timestamp_is_stale_and_trade_ready_blocked(self) -> None:
+            config = load_config(None)
+            contract = self.option_contract()
+            contract.quote_time = None
+            contract.trade_time = None
+            result = evaluate_option_quality(contract, config, underlying_price=100.0)
+            self.assertEqual(result["label"], "STALE")
+            self.assertFalse(result["trade_ready_allowed"])
+            self.assertTrue(result["stock_only_allowed"])
+
+        def test_phase7_poor_option_blocks_existing_trade_ready_sms(self) -> None:
+            scanner, snap, alert = self.phase2_sms_fixture("BULLISH")
+            snap.best_call = OptionSelection(
+                self.option_contract("C", bid=1.00, ask=1.50),
+                "WIDE_SPREAD",
+                0,
+                ["wide_spread"],
+            )
+            graded = scanner.grade_alert(scanner.attach_option_context(alert, snap), snap, {"SPY": "BULLISH", "QQQ": "BULLISH"})
+            self.assertFalse(graded.sms_allowed)
+            self.assertFalse(graded.option_tradable)
+            self.assertTrue(graded.option_stock_only_allowed)
+
+        def test_phase8_tracks_all_intervals_mfe_mae_and_direction(self) -> None:
+            alert_time = datetime(2026, 6, 9, 14, 0, tzinfo=UTC)
+            record = {
+                "alert_timestamp": alert_time.isoformat(),
+                "price_at_alert": 100.0,
+                "direction": "BULLISH",
+                "entry_timing_at_alert": "EARLY",
+                "invalidation_level": 99.5,
+                "target_move_pct": 0.30,
+                "interval_prices": {},
+                "interval_moves_pct": {},
+                "hit_invalidation": False,
+            }
+            closes = {1: 99.9, 3: 100.2, 5: 100.4, 10: 100.7, 15: 100.9}
+            bars = [
+                Bar(
+                    t=alert_time + timedelta(minutes=minute),
+                    o=100.0,
+                    h=close + 0.2,
+                    l=99.4 if minute == 1 else close - 0.1,
+                    c=close,
+                    v=1000,
+                )
+                for minute, close in closes.items()
+            ]
+            updated = update_performance_record(record, bars, now=alert_time + timedelta(minutes=15))
+            self.assertEqual(list(updated["interval_prices"]), ["1m", "3m", "5m", "10m", "15m"])
+            self.assertAlmostEqual(updated["max_favorable_excursion_pct"], 1.1)
+            self.assertAlmostEqual(updated["max_adverse_excursion_pct"], 0.6)
+            self.assertTrue(updated["direction_correct"])
+            self.assertTrue(updated["alert_was_early"])
+            self.assertTrue(updated["hit_invalidation"])
+            self.assertTrue(updated["hit_target_zone"])
+            self.assertEqual(updated["status"], "COMPLETE")
+
+        def test_phase8_daily_review_report_generated(self) -> None:
+            from tools.review_alert_performance import build_report, summarize
+
+            records = [
+                {
+                    "alert_timestamp": "2026-06-09T14:00:00+00:00",
+                    "symbol": "AAPL",
+                    "setup_type": "Bullish Pullback Holding",
+                    "alert_tier": "SETUP_CONFIRMED",
+                    "direction_correct": True,
+                    "useful_alert": True,
+                    "alert_was_late": False,
+                    "should_be_blocked_next_time": False,
+                    "interval_moves_pct": {"15m": 0.8},
+                    "max_favorable_excursion_pct": 1.0,
+                    "max_adverse_excursion_pct": 0.1,
+                },
+                {
+                    "alert_timestamp": "2026-06-09T15:00:00+00:00",
+                    "symbol": "AAPL",
+                    "setup_type": "Late Move",
+                    "alert_tier": "RISK_WARNING",
+                    "direction_correct": False,
+                    "useful_alert": False,
+                    "alert_was_late": True,
+                    "should_be_blocked_next_time": True,
+                    "interval_moves_pct": {"15m": -0.5},
+                    "max_favorable_excursion_pct": 0.1,
+                    "max_adverse_excursion_pct": 0.7,
+                },
+            ]
+            summary = summarize(records)
+            report = build_report("2026-06-09", records)
+            self.assertEqual(summary["best_setup_type"], "Bullish Pullback Holding")
+            self.assertEqual(summary["noisiest_alert_tier"], "RISK_WARNING")
+            self.assertIn("Alerts That Should Be Blocked Next Time", report)
+            self.assertIn("Bullish Pullback Holding", report)
+
+        def test_phase8_tracker_logs_alert_and_completed_intervals(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                tracker = PostAlertPerformanceTracker(root / "post_alert_performance.jsonl", root / "pending.json")
+                alert_time = datetime(2026, 6, 9, 14, 0, tzinfo=UTC)
+                alert = Alert(
+                    symbol="AAPL",
+                    timestamp=alert_time,
+                    category="WATCH AAPL BULLISH",
+                    price=100.0,
+                    direction="BULLISH",
+                    primary_setup="Bullish Pullback Holding",
+                    alert_tier="SETUP_CONFIRMED",
+                    market_regime="TRENDING_UP",
+                    option_quality="TRADABLE",
+                    invalidation_level=99.5,
+                )
+                registered = tracker.register(alert)
+                bars = [
+                    Bar(
+                        t=alert_time + timedelta(minutes=minute),
+                        o=100.0,
+                        h=100.0 + minute * 0.1,
+                        l=99.9,
+                        c=100.0 + minute * 0.08,
+                        v=1000,
+                    )
+                    for minute in (1, 3, 5, 10, 15)
+                ]
+                tracker.update(
+                    {"AAPL": SymbolSnapshot(symbol="AAPL", recent_bars=bars, latest_bar=bars[-1])},
+                    now=alert_time + timedelta(minutes=15),
+                )
+                lines = (root / "post_alert_performance.jsonl").read_text(encoding="utf-8").splitlines()
+                completed = json.loads(lines[-1])
+                self.assertEqual(completed["alert_id"], registered["alert_id"])
+                self.assertEqual(completed["status"], "COMPLETE")
+                self.assertEqual(len(completed["interval_prices"]), 5)
+                self.assertFalse(tracker.pending)
 
         def test_directional_alert_prefers_call_or_put(self) -> None:
             config = load_config(None)

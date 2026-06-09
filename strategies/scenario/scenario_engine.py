@@ -966,7 +966,12 @@ def evaluate_scenario_suite(
         or (top.direction == "bearish" and phase2_candle_label == "BUYER_CONTROL")
     )
     volume_supported = phase2_volume_label in {"NORMAL", "STRONG", "CLIMAX"}
-    market_not_opposing = phase2_market_regime not in {"BEAR_TREND" if top.direction == "bullish" else "BULL_TREND", "CHOPPY", "UNKNOWN"}
+    opposing_regimes = (
+        {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
+        if top.direction == "bullish"
+        else {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}
+    )
+    market_not_opposing = phase2_market_regime not in opposing_regimes | {"CHOPPY", "UNKNOWN"}
     extended_from_vwap = _current_extension_pct(latest, top.levels.get("vwap")) > 0.6
     extended_from_ema = _current_extension_pct(latest, top.levels.get("ema9")) > 0.4
     scenario_conflict = bool(

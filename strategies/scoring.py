@@ -14,6 +14,7 @@ from .confirmation import (
     evaluate_volume_quality,
 )
 from .scenario import evaluate_scenario_suite
+from .setup_classifier import classify_professional_setup
 
 
 def _risk_label(score: int, warnings: List[str]) -> str:
@@ -317,9 +318,17 @@ def evaluate_strategy_suite(
     market_regime = evaluate_market_regime(
         market_bars,
         config,
+        aapl_bars=bars if symbol == "AAPL" else None,
     ) if market_regime_enabled else {
         "market_regime": "UNKNOWN",
+        "regime_score": 0,
         "market_score": 0,
+        "regime_reason": "Market regime detector disabled",
+        "spy_alignment": "UNKNOWN",
+        "qqq_alignment": "UNKNOWN",
+        "aapl_relative_strength": "UNKNOWN",
+        "volume_state": "UNKNOWN",
+        "volatility_state": "UNKNOWN",
         "spy_state": {},
         "qqq_state": {},
         "reasons": [],
@@ -327,13 +336,15 @@ def evaluate_strategy_suite(
     }
     if active and market_regime_enabled:
         regime = market_regime.get("market_regime")
-        if (direction == "bullish" and regime == "BULL_TREND") or (direction == "bearish" and regime == "BEAR_TREND"):
+        bullish_regimes = {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}
+        bearish_regimes = {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
+        if (direction == "bullish" and regime in bullish_regimes) or (direction == "bearish" and regime in bearish_regimes):
             score = min(100, score + 6)
         elif regime == "CHOPPY":
             score = max(0, score - 8)
-        elif regime == "MIXED":
+        elif regime in {"RANGE_BOUND", "REVERSAL_ATTEMPT", "LOW_VOLUME_FAKE_MOVE"}:
             score = max(0, score - 4)
-        elif (direction == "bullish" and regime == "BEAR_TREND") or (direction == "bearish" and regime == "BULL_TREND"):
+        elif (direction == "bullish" and regime in bearish_regimes) or (direction == "bearish" and regime in bullish_regimes):
             score = max(0, score - 8)
             warning = "Market regime is opposing the setup"
             if warning not in warnings:
@@ -431,6 +442,20 @@ def evaluate_strategy_suite(
             "entry_quality_label": entry_quality_label,
         },
     )
+    phase1_for_classifier = {
+        "primary_setup": primary.get("label") if primary else None,
+        "direction": direction,
+        "confidence_score": score,
+        "confidence_label": confidence_label(score),
+        "entry_quality_label": entry_quality_label,
+        "risk_label": final_risk_label,
+        "reasons": reasons,
+    }
+    professional_setup = classify_professional_setup(
+        phase1_for_classifier,
+        scenario_summary,
+        market_alignment=market_alignment,
+    )
     return {
         "symbol": symbol,
         "primary_setup": primary.get("label") if primary else None,
@@ -451,7 +476,14 @@ def evaluate_strategy_suite(
         "relative_strength_label": relative_strength.get("relative_strength_label", "UNKNOWN"),
         "relative_strength_score": relative_strength.get("relative_strength_score", 50),
         "market_regime": market_regime.get("market_regime", "UNKNOWN"),
+        "regime_score": market_regime.get("regime_score", market_regime.get("market_score", 0)),
         "market_score": market_regime.get("market_score", 0),
+        "regime_reason": market_regime.get("regime_reason"),
+        "spy_alignment": market_regime.get("spy_alignment", "UNKNOWN"),
+        "qqq_alignment": market_regime.get("qqq_alignment", "UNKNOWN"),
+        "aapl_relative_strength": market_regime.get("aapl_relative_strength", "UNKNOWN"),
+        "volume_state": market_regime.get("volume_state", "UNKNOWN"),
+        "volatility_state": market_regime.get("volatility_state", "UNKNOWN"),
         "pressure_label": pressure_score.get("pressure_label", "UNKNOWN"),
         "pressure_score": pressure_score.get("pressure_score", 50),
         "scenario_top": scenario_summary.get("top_scenario"),
@@ -489,6 +521,19 @@ def evaluate_strategy_suite(
         "scenario_would_sms": scenario_summary.get("scenario_would_sms", False),
         "scenario_sms_allowed": scenario_summary.get("scenario_sms_allowed", False),
         "scenario_sms_block_reason": scenario_summary.get("scenario_sms_block_reason", ""),
+        "professional_setup": professional_setup,
+        "setup_name": professional_setup.get("setup_name"),
+        "setup_code": professional_setup.get("setup_code"),
+        "setup_stage": professional_setup.get("stage"),
+        "setup_score": professional_setup.get("score"),
+        "setup_confidence": professional_setup.get("confidence"),
+        "setup_reason": professional_setup.get("reason"),
+        "setup_invalidation_level": professional_setup.get("invalidation_level"),
+        "setup_entry_quality": professional_setup.get("entry_quality"),
+        "setup_risk_label": professional_setup.get("risk_label"),
+        "setup_watch_text": professional_setup.get("watch_text"),
+        "setup_block_reason": professional_setup.get("block_reason"),
+        "setup_direction": professional_setup.get("direction"),
         "candle_strength": candle_strength,
         "extension_exhaustion": extension_exhaustion,
         "market_regime_detail": market_regime,

@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
+try:
+    from tools.review_alert_performance import build_report as build_performance_report
+except ModuleNotFoundError:
+    from review_alert_performance import build_report as build_performance_report
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_DIR = APP_DIR / "logs"
@@ -55,7 +59,13 @@ def parse_local_window(day_text: str, start_text: str, end_text: str) -> tuple[d
 
 
 def parse_record_time(record: Dict[str, Any]) -> Optional[datetime]:
-    raw = record.get("timestamp") or record.get("time") or record.get("bar_time") or record.get("created_at")
+    raw = (
+        record.get("timestamp")
+        or record.get("alert_timestamp")
+        or record.get("time")
+        or record.get("bar_time")
+        or record.get("created_at")
+    )
     if not isinstance(raw, str) or not raw:
         return None
     try:
@@ -384,6 +394,10 @@ def build_review_summary(
 - `logs/phase3_heads_up.jsonl`
 - `logs/option_quality_decisions.jsonl`
 - `logs/market_data_status.jsonl`
+- `logs/market_regime.jsonl`
+- `logs/multi_timeframe_context.jsonl`
+- `logs/post_alert_performance.jsonl`
+- `logs/news_context.jsonl`
 - latest scanner log if available
 - `dashboard_snapshot_latest.md`
 - `dashboard_snapshot_latest.json`
@@ -393,6 +407,9 @@ def build_review_summary(
 - `window/phase3_heads_up_window.jsonl`
 - `window/option_quality_decisions_window.jsonl`
 - `window/market_data_status_window.jsonl`
+- `window/post_alert_performance_window.jsonl`
+- `window/news_context_window.jsonl`
+- `alert_performance_{day_text}.md` if generated
 
 ## Export Notes
 {notes_text}
@@ -433,24 +450,36 @@ def export_review_package(
     heads_up = records_for_day(read_jsonl(log_dir / "phase3_heads_up.jsonl"), day_text)
     options = records_for_day(read_jsonl(log_dir / "option_quality_decisions.jsonl"), day_text)
     market_data = records_for_day(read_jsonl(log_dir / "market_data_status.jsonl"), day_text)
+    market_regimes = records_for_day(read_jsonl(log_dir / "market_regime.jsonl"), day_text)
+    multi_timeframe = records_for_day(read_jsonl(log_dir / "multi_timeframe_context.jsonl"), day_text)
     notifications = records_for_day(read_jsonl(log_dir / "notification_status.jsonl"), day_text)
     startup_status = records_for_day(read_jsonl(log_dir / "scanner_startup_status.jsonl"), day_text)
     option_diagnostics = records_for_day(read_jsonl(log_dir / "option_freshness_diagnostic.jsonl"), day_text)
+    post_alert_performance = records_for_day(read_jsonl(log_dir / "post_alert_performance.jsonl"), day_text)
+    news_context = records_for_day(read_jsonl(log_dir / "news_context.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
     write_jsonl(logs_out / "phase3_heads_up.jsonl", heads_up)
     write_jsonl(logs_out / "option_quality_decisions.jsonl", options)
     write_jsonl(logs_out / "market_data_status.jsonl", market_data)
+    write_jsonl(logs_out / "market_regime.jsonl", market_regimes)
+    write_jsonl(logs_out / "multi_timeframe_context.jsonl", multi_timeframe)
     write_jsonl(logs_out / "notification_status.jsonl", notifications)
     write_jsonl(logs_out / "scanner_startup_status.jsonl", startup_status)
     write_jsonl(logs_out / "option_freshness_diagnostic.jsonl", option_diagnostics)
+    write_jsonl(logs_out / "post_alert_performance.jsonl", post_alert_performance)
+    write_jsonl(logs_out / "news_context.jsonl", news_context)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
     write_jsonl(window_out / "option_quality_decisions_window.jsonl", records_in_window(options, start_dt, end_dt))
     write_jsonl(window_out / "market_data_status_window.jsonl", records_in_window(market_data, start_dt, end_dt))
+    write_jsonl(window_out / "market_regime_window.jsonl", records_in_window(market_regimes, start_dt, end_dt))
+    write_jsonl(window_out / "multi_timeframe_context_window.jsonl", records_in_window(multi_timeframe, start_dt, end_dt))
     write_jsonl(window_out / "notification_status_window.jsonl", records_in_window(notifications, start_dt, end_dt))
+    write_jsonl(window_out / "post_alert_performance_window.jsonl", records_in_window(post_alert_performance, start_dt, end_dt))
+    write_jsonl(window_out / "news_context_window.jsonl", records_in_window(news_context, start_dt, end_dt))
 
     if not alerts:
         notes.append("No alerts.jsonl records found for the requested date.")
@@ -462,8 +491,16 @@ def export_review_package(
         notes.append("No option_quality_decisions.jsonl records found for the requested date.")
     if not market_data:
         notes.append("No market_data_status.jsonl records found for the requested date.")
+    if not market_regimes:
+        notes.append("No market_regime.jsonl records found for the requested date.")
+    if not multi_timeframe:
+        notes.append("No multi_timeframe_context.jsonl records found for the requested date.")
     if not notifications:
         notes.append("No notification_status.jsonl records found for the requested date.")
+    if not post_alert_performance:
+        notes.append("No post_alert_performance.jsonl records found for the requested date.")
+    if not news_context:
+        notes.append("No news_context.jsonl records found for the requested date.")
 
     scanner_log = log_dir / "scanner.log"
     if not scanner_log.exists():
@@ -472,6 +509,16 @@ def export_review_package(
     copy_redacted_file(snapshot_dir / "dashboard_snapshot_latest.md", package_dir / "dashboard_snapshot_latest.md", notes)
     copy_redacted_file(snapshot_dir / "dashboard_snapshot_latest.json", package_dir / "dashboard_snapshot_latest.json", notes)
     copy_redacted_file(config_example, package_dir / "config.example.json", notes)
+    performance_report = package_dir / f"alert_performance_{day_text}.md"
+    latest_performance = {
+        str(record.get("alert_id")): record
+        for record in post_alert_performance
+        if record.get("alert_id")
+    }
+    performance_report.write_text(
+        build_performance_report(day_text, list(latest_performance.values())),
+        encoding="utf-8",
+    )
 
     summary = build_review_summary(
         day_text=day_text,

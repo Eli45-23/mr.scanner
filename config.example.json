@@ -8,6 +8,12 @@
   "opening_range_minutes": 5,
   "opening_range_break_buffer_pct": 0.1,
   "alert_cooldown_seconds": 600,
+  "news_context": {
+    "enabled": false,
+    "watch_symbols": ["AAPL"],
+    "lookback_minutes": 120,
+    "context_only": true
+  },
   "notifications": {
     "mac_desktop_enabled": true,
     "pushover_enabled": true,

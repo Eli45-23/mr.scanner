@@ -166,7 +166,11 @@ def collect_live_sources(
         "recent_alert_logs": load_jsonl_tail(log_dir / "alerts.jsonl", 20),
         "recent_scenario_records": load_jsonl_tail(log_dir / "scenario_engine.jsonl", 20),
         "recent_option_decisions": load_jsonl_tail(log_dir / "option_quality_decisions.jsonl", 20),
+        "recent_market_regime_records": load_jsonl_tail(log_dir / "market_regime.jsonl", 20),
+        "recent_multi_timeframe_records": load_jsonl_tail(log_dir / "multi_timeframe_context.jsonl", 20),
         "recent_notification_events": load_jsonl_tail(log_dir / "notification_status.jsonl", 20),
+        "recent_post_alert_performance": load_jsonl_tail(log_dir / "post_alert_performance.jsonl", 20),
+        "recent_news_context": load_jsonl_tail(log_dir / "news_context.jsonl", 20),
     }
 
 
@@ -213,6 +217,8 @@ def _symbol_summary_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "ema9": _level_num(row, "ema9"),
         "ema20": _level_num(row, "ema20"),
         "option_feed_status": row.get("option_feed_status"),
+        "option_quality": row.get("option_quality"),
+        "option_quality_message": row.get("option_quality_message"),
         "scenario_alert_tier": _alert_tier(row),
         "scenario_alert_block_reason": _pick(row, "scenario_alert_block_reason", default=None),
         "scenario_alert_eligible": row.get("scenario_alert_eligible"),
@@ -231,9 +237,13 @@ def _symbol_detail(row: Dict[str, Any]) -> Dict[str, Any]:
     scenario_second = row.get("scenario_second") if isinstance(row.get("scenario_second"), dict) else {}
     option_warning = _pick(row, "option_warning", "option_block_reason", "sms_block_reason", default=None)
     invalidation_reason = _pick(
-        scenario_top,
+        row,
         "invalidation_reason",
-        default=_pick(row, "scenario_sms_block_reason", "sms_block_reason", default=None),
+        default=_pick(
+            scenario_top,
+            "invalidation_reason",
+            default=_pick(row, "scenario_sms_block_reason", "sms_block_reason", default=None),
+        ),
     )
     return {
         "symbol": row.get("symbol"),
@@ -296,7 +306,42 @@ def _symbol_detail(row: Dict[str, Any]) -> Dict[str, Any]:
             "extension_label": row.get("extension_label"),
             "relative_strength_label": row.get("relative_strength_label"),
             "market_regime": row.get("market_regime"),
+            "regime_score": row.get("regime_score", row.get("market_score")),
+            "regime_reason": row.get("regime_reason"),
+            "spy_alignment": row.get("spy_alignment"),
+            "qqq_alignment": row.get("qqq_alignment"),
+            "aapl_relative_strength": row.get("aapl_relative_strength"),
+            "volume_state": row.get("volume_state"),
+            "volatility_state": row.get("volatility_state"),
             "pressure_label": row.get("pressure_label"),
+            "trend_1m": row.get("trend_1m"),
+            "trend_5m": row.get("trend_5m"),
+            "trend_15m": row.get("trend_15m"),
+            "daily_trend": row.get("daily_trend"),
+            "current_structure_bias": row.get("current_structure_bias"),
+            "structure_key_warning": row.get("structure_key_warning"),
+            "nearest_level_name": row.get("nearest_level_name"),
+            "nearest_level_price": row.get("nearest_level_price"),
+            "distance_to_key_level_pct": row.get("distance_to_key_level_pct"),
+            "nearest_support": row.get("nearest_support"),
+            "nearest_resistance": row.get("nearest_resistance"),
+            "demand_zones": row.get("demand_zones") or [],
+            "supply_zones": row.get("supply_zones") or [],
+            "liquidity_above_highs": row.get("liquidity_above_highs") or [],
+            "liquidity_below_lows": row.get("liquidity_below_lows") or [],
+            "professional_setup": row.get("professional_setup") or {},
+            "setup_name": row.get("setup_name"),
+            "setup_code": row.get("setup_code"),
+            "setup_direction": row.get("setup_direction"),
+            "setup_stage": row.get("setup_stage"),
+            "setup_score": row.get("setup_score"),
+            "setup_confidence": row.get("setup_confidence"),
+            "setup_reason": row.get("setup_reason"),
+            "setup_invalidation_level": row.get("setup_invalidation_level"),
+            "setup_entry_quality": row.get("setup_entry_quality"),
+            "setup_risk_label": row.get("setup_risk_label"),
+            "setup_watch_text": row.get("setup_watch_text"),
+            "setup_block_reason": row.get("setup_block_reason"),
         },
         "phase3": {
             "top_scenario": scenario_top.get("scenario_name"),
@@ -310,8 +355,12 @@ def _symbol_detail(row: Dict[str, Any]) -> Dict[str, Any]:
             "fakeout_score": row.get("fakeout_score"),
             "scenario_reasons": row.get("scenario_reasons") or [],
             "scenario_warnings": row.get("scenario_warnings") or [],
-            "invalidation_level": _pick(scenario_top, "invalidation_level", default=None),
+            "invalidation_level": _pick(row, "invalidation_level", default=_pick(scenario_top, "invalidation_level", default=None)),
             "invalidation_reason": invalidation_reason,
+            "stop_logic_description": row.get("stop_logic_description"),
+            "pullback_required": row.get("pullback_required"),
+            "do_not_chase_warning": row.get("do_not_chase_warning"),
+            "entry_timing_label": row.get("entry_timing_label"),
             "scenario_alert_eligible": row.get("scenario_alert_eligible"),
             "scenario_would_sms": row.get("scenario_would_sms"),
             "scenario_alert_tier": _alert_tier(row),
@@ -322,7 +371,23 @@ def _symbol_detail(row: Dict[str, Any]) -> Dict[str, Any]:
             "stock_setup_score": row.get("stock_setup_score"),
             "option_tradability_score": row.get("option_tradability_score"),
             "option_feed_status": row.get("option_feed_status"),
+            "option_quality": row.get("option_quality"),
+            "option_quality_message": row.get("option_quality_message"),
+            "option_quality_reasons": row.get("option_quality_reasons") or [],
             "option_tradable": row.get("option_tradable"),
+            "option_stock_only_allowed": row.get("option_stock_only_allowed", True),
+            "bid": row.get("option_bid"),
+            "ask": row.get("option_ask"),
+            "mid": row.get("option_mid"),
+            "spread_pct": row.get("option_spread_pct"),
+            "quote_age_seconds": row.get("option_quote_age_seconds"),
+            "timestamp_source_field": row.get("option_timestamp_source_field"),
+            "expiration": row.get("option_expiration"),
+            "days_to_expiration": row.get("option_days_to_expiration"),
+            "is_0dte": row.get("option_is_0dte"),
+            "strike_distance_pct": row.get("option_strike_distance_pct"),
+            "liquidity_state": row.get("option_liquidity_state"),
+            "time_state": row.get("option_time_state"),
             "option_warning": option_warning,
             "sms_allowed_by_stock": row.get("sms_allowed_by_stock"),
             "sms_allowed_by_options": row.get("sms_allowed_by_options"),
@@ -330,6 +395,15 @@ def _symbol_detail(row: Dict[str, Any]) -> Dict[str, Any]:
             "sms_block_reason": row.get("sms_block_reason"),
         },
         "why": _short_join(row.get("strategy_reasons") or row.get("scenario_reasons")),
+        "news_context": {
+            "news_context_present": row.get("news_context_present"),
+            "latest_headline": _pick(row, "latest_headline", "headline", default=None),
+            "news_source": row.get("news_source"),
+            "news_age_minutes": row.get("news_age_minutes"),
+            "news_sentiment_guess": row.get("news_sentiment_guess"),
+            "news_used_for_context_only": row.get("news_used_for_context_only"),
+            "news_upgraded_alert": row.get("news_upgraded_alert"),
+        },
         "warnings": row.get("strategy_warnings") or row.get("scenario_warnings") or [],
         "invalidates": invalidation_reason,
         "raw": redact_payload(row),
@@ -374,6 +448,8 @@ def build_export_package(source_state: Dict[str, Any], watchlist_symbols: Sequen
         "recent_scenario_records": redact_payload(source_state.get("recent_scenario_records") or []),
         "recent_option_decisions": redact_payload(source_state.get("recent_option_decisions") or []),
         "recent_notification_events": redact_payload(source_state.get("recent_notification_events") or []),
+        "recent_post_alert_performance": redact_payload(source_state.get("recent_post_alert_performance") or []),
+        "recent_news_context": redact_payload(source_state.get("recent_news_context") or []),
         "dashboard_symbols_raw": redact_payload(symbols_payload),
         "dashboard_alerts_raw": redact_payload(source_state.get("dashboard_alerts_raw") or {}),
         "unavailable_fields": sorted(set(unavailable_fields)),
@@ -468,9 +544,13 @@ def render_markdown(snapshot: Dict[str, Any]) -> str:
         options = detail.get("options", {})
         lines.append(f"### {symbol}")
         lines.append(f"- Current read: price {_fmt_number(current.get('price'), 2)}, {current.get('direction', 'unavailable')} | top scenario {current.get('top_scenario', 'unavailable')} | stage {current.get('stage', 'unavailable')} | scenario score {current.get('scenario_score', 'unavailable')} | confirmation {current.get('confirmation_score', 'unavailable')}")
+        lines.append(f"- Market regime: {phase2.get('market_regime', 'unavailable')} {phase2.get('regime_score', 'unavailable')} | {_truncate(phase2.get('regime_reason'))} | SPY {phase2.get('spy_alignment', 'unavailable')} | QQQ {phase2.get('qqq_alignment', 'unavailable')} | AAPL RS {phase2.get('aapl_relative_strength', 'unavailable')} | volume {phase2.get('volume_state', 'unavailable')} | volatility {phase2.get('volatility_state', 'unavailable')}")
+        lines.append(f"- Market structure: 1m {phase2.get('trend_1m', 'unavailable')} | 5m {phase2.get('trend_5m', 'unavailable')} | 15m {phase2.get('trend_15m', 'unavailable')} | bias {phase2.get('current_structure_bias', 'unavailable')} | nearest {phase2.get('nearest_level_name', 'unavailable')} {_fmt_number(phase2.get('nearest_level_price'), 2)} | warning {_truncate(phase2.get('structure_key_warning'))}")
+        lines.append(f"- Official setup: {phase2.get('setup_name', 'unavailable')} | direction {phase2.get('setup_direction', 'unavailable')} | stage {phase2.get('setup_stage', 'unavailable')} | score {phase2.get('setup_score', 'unavailable')} {phase2.get('setup_confidence', 'unavailable')} | reason {_truncate(phase2.get('setup_reason'))} | block {_truncate(phase2.get('setup_block_reason'))}")
         lines.append(f"- Top scenario: {phase3.get('top_scenario', 'unavailable')}")
         lines.append(f"- Why the bot thinks that: {_short_join(phase1.get('reasons') or phase3.get('scenario_reasons'))}")
         lines.append(f"- What would invalidate it: {_truncate(phase3.get('invalidation_reason'))}")
+        lines.append(f"- Stop logic: {_truncate(phase3.get('stop_logic_description'))} | Entry timing: {phase3.get('entry_timing_label', 'unavailable')} | Pullback required: {_fmt_bool(phase3.get('pullback_required'))}")
         lines.append(f"- Stage: {phase3.get('scenario_stage', 'unavailable')}")
         lines.append(f"- Alert tier: {phase3.get('scenario_alert_tier', 'unavailable')} | Alert block: {_truncate(phase3.get('scenario_alert_block_reason'))} | SMS block: {_truncate(phase3.get('scenario_sms_block_reason'))}")
         lines.append(f"- Stock setup score: {current.get('stock_setup_score', phase1.get('stock_setup_score', 'unavailable'))} | Reason: {_truncate(current.get('stock_setup_score_reason') or phase1.get('stock_setup_score_reason'))}")

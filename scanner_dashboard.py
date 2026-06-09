@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -814,9 +814,6 @@ def score_symbol(app: scanner_app.EliteScanner, snap: scanner_app.SymbolSnapshot
         rv_threshold = max(float(config["relative_volume_threshold"]), 0.01)
         score += min(30.0, (rel_vol / rv_threshold) * 30.0)
 
-    if snap.latest_news:
-        score += 10.0
-
     price = snap.latest_bar.c
     buffer_pct = float(config["opening_range_break_buffer_pct"]) / 100.0
     if snap.premarket_high is not None and price > snap.premarket_high:
@@ -838,6 +835,7 @@ def option_selection_to_dict(selection: scanner_app.OptionSelection) -> Dict[str
             "quality": selection.quality,
             "score": selection.score,
             "reasons": selection.reasons,
+            **selection.details,
         }
     return {
         "symbol": contract.symbol,
@@ -853,8 +851,18 @@ def option_selection_to_dict(selection: scanner_app.OptionSelection) -> Dict[str
         "volume": contract.volume,
         "open_interest": contract.open_interest,
         "quality": selection.quality,
+        "message": selection.details.get("message"),
         "score": selection.score,
         "reasons": selection.reasons,
+        "quote_age_seconds": selection.details.get("quote_age_seconds"),
+        "timestamp_source_field": selection.details.get("timestamp_source_field"),
+        "days_to_expiration": selection.details.get("days_to_expiration"),
+        "is_0dte": selection.details.get("is_0dte"),
+        "strike_distance_pct": selection.details.get("strike_distance_pct"),
+        "liquidity_state": selection.details.get("liquidity_state"),
+        "time_state": selection.details.get("time_state"),
+        "trade_ready_allowed": selection.details.get("trade_ready_allowed", selection.is_tradable()),
+        "stock_only_allowed": selection.details.get("stock_only_allowed", True),
         "simulated": contract.is_simulated,
         "feed": "simulated" if contract.is_simulated else contract.feed,
     }
@@ -912,6 +920,8 @@ def build_symbol_rows(
         age_minutes = scanner_app.bar_age_minutes(latest)
         direction = "BULLISH" if (fast_move or day_move or 0) > 0 else "BEARISH" if (fast_move or day_move or 0) < 0 else "NEUTRAL"
         option_feed_status = option_feed_status_for_snapshot(snap)
+        preferred_option = snap.best_call if direction != "BEARISH" else snap.best_put
+        preferred_option_details = preferred_option.details or {}
         strategy_summary: Dict[str, Any] = {}
         if latest and bars and app.config.get("strategy_engine", {}).get("enabled", True):
             market_bars = {
@@ -976,6 +986,7 @@ def build_symbol_rows(
                 strategy_results=list(strategy_summary.get("strategy_results") or []),
             )
             app.evaluate_phase3_heads_up(heads_up_alert, snap, quality, market_context)
+            scanner_app.apply_risk_invalidation(heads_up_alert)
             scanner_app.assign_professional_alert_tier(heads_up_alert)
         rows.append({
             "symbol": snap.symbol,
@@ -993,6 +1004,12 @@ def build_symbol_rows(
             "alert_tier_reason": heads_up_alert.alert_tier_reason if heads_up_alert else None,
             "alert_source": heads_up_alert.alert_source if heads_up_alert else None,
             "message_source_path": heads_up_alert.message_source_path if heads_up_alert else None,
+            "invalidation_level": heads_up_alert.invalidation_level if heads_up_alert else None,
+            "invalidation_reason": heads_up_alert.invalidation_reason if heads_up_alert else None,
+            "stop_logic_description": heads_up_alert.stop_logic_description if heads_up_alert else None,
+            "pullback_required": heads_up_alert.pullback_required if heads_up_alert else None,
+            "do_not_chase_warning": heads_up_alert.do_not_chase_warning if heads_up_alert else None,
+            "entry_timing_label": heads_up_alert.entry_timing_label if heads_up_alert else None,
             "scenario_alert_block_reason": strategy_summary.get("scenario_alert_block_reason"),
             "scenario_reasons": strategy_summary.get("scenario_reasons", []),
             "scenario_warnings": strategy_summary.get("scenario_warnings", []),
@@ -1019,6 +1036,16 @@ def build_symbol_rows(
             "opening_range_15_low": snap.opening_range_15_low,
             "headline": snap.latest_news.headline if snap.latest_news else None,
             "url": snap.latest_news.url if snap.latest_news else None,
+            "news_context_present": bool(snap.latest_news),
+            "latest_headline": snap.latest_news.headline if snap.latest_news else None,
+            "news_source": snap.latest_news.source if snap.latest_news else None,
+            "news_age_minutes": round(
+                max(0.0, (scanner_app.now_utc() - snap.latest_news.published_at).total_seconds() / 60.0),
+                2,
+            ) if snap.latest_news else None,
+            "news_sentiment_guess": scanner_app.news_sentiment_guess(snap.latest_news.headline) if snap.latest_news else None,
+            "news_used_for_context_only": bool(snap.latest_news),
+            "news_upgraded_alert": False,
             "flags": flags,
             "passes_filters": app.passes_basic_filters(snap),
             "score": score_symbol(app, snap),
@@ -1040,12 +1067,66 @@ def build_symbol_rows(
             "relative_strength_label": strategy_summary.get("relative_strength_label"),
             "relative_strength_score": strategy_summary.get("relative_strength_score"),
             "market_regime": strategy_summary.get("market_regime"),
+            "regime_score": strategy_summary.get("regime_score", strategy_summary.get("market_score")),
             "market_score": strategy_summary.get("market_score"),
+            "regime_reason": strategy_summary.get("regime_reason"),
+            "spy_alignment": strategy_summary.get("spy_alignment"),
+            "qqq_alignment": strategy_summary.get("qqq_alignment"),
+            "aapl_relative_strength": strategy_summary.get("aapl_relative_strength"),
+            "volume_state": strategy_summary.get("volume_state"),
+            "volatility_state": strategy_summary.get("volatility_state"),
+            "trend_1m": snap.multi_timeframe_context.get("trend_1m"),
+            "trend_5m": snap.multi_timeframe_context.get("trend_5m"),
+            "trend_15m": snap.multi_timeframe_context.get("trend_15m"),
+            "daily_trend": snap.multi_timeframe_context.get("daily_trend"),
+            "current_structure_bias": snap.multi_timeframe_context.get("current_bias"),
+            "structure_key_warning": snap.multi_timeframe_context.get("key_warning"),
+            "nearest_level_name": snap.multi_timeframe_context.get("nearest_level_name"),
+            "nearest_level_price": snap.multi_timeframe_context.get("nearest_level_price"),
+            "distance_to_key_level_pct": snap.multi_timeframe_context.get("distance_to_key_level_pct"),
+            "nearest_support": snap.multi_timeframe_context.get("nearest_support"),
+            "nearest_resistance": snap.multi_timeframe_context.get("nearest_resistance"),
+            "demand_zones": snap.multi_timeframe_context.get("demand_zones", []),
+            "supply_zones": snap.multi_timeframe_context.get("supply_zones", []),
+            "liquidity_above_highs": snap.multi_timeframe_context.get("liquidity_above_highs", []),
+            "liquidity_below_lows": snap.multi_timeframe_context.get("liquidity_below_lows", []),
+            "multi_timeframe_levels": snap.multi_timeframe_context.get("levels", {}),
+            "professional_setup": strategy_summary.get("professional_setup", {}),
+            "setup_name": strategy_summary.get("setup_name"),
+            "setup_code": strategy_summary.get("setup_code"),
+            "setup_direction": strategy_summary.get("setup_direction"),
+            "setup_stage": strategy_summary.get("setup_stage"),
+            "setup_score": strategy_summary.get("setup_score"),
+            "setup_confidence": strategy_summary.get("setup_confidence"),
+            "setup_reason": strategy_summary.get("setup_reason"),
+            "setup_invalidation_level": strategy_summary.get("setup_invalidation_level"),
+            "setup_entry_quality": strategy_summary.get("setup_entry_quality"),
+            "setup_risk_label": strategy_summary.get("setup_risk_label"),
+            "setup_watch_text": strategy_summary.get("setup_watch_text"),
+            "setup_block_reason": strategy_summary.get("setup_block_reason"),
             "pressure_label": strategy_summary.get("pressure_label"),
             "pressure_score": strategy_summary.get("pressure_score"),
             "option_feed_status": option_feed_status,
             "option_tradability_score": options_score_for_row(snap, fast_move, day_move),
             "option_tradable": (snap.best_call.is_tradable() or snap.best_put.is_tradable()),
+            "option_quality": scanner_app.normalize_option_quality_label(preferred_option.quality),
+            "option_quality_message": preferred_option_details.get(
+                "message", scanner_app.option_quality_message(preferred_option.quality)
+            ),
+            "option_quality_reasons": list(preferred_option.reasons),
+            "option_bid": preferred_option.contract.bid if preferred_option.contract else None,
+            "option_ask": preferred_option.contract.ask if preferred_option.contract else None,
+            "option_mid": preferred_option.contract.mid if preferred_option.contract else None,
+            "option_spread_pct": preferred_option.contract.spread_pct if preferred_option.contract else None,
+            "option_quote_age_seconds": preferred_option_details.get("quote_age_seconds"),
+            "option_timestamp_source_field": preferred_option_details.get("timestamp_source_field"),
+            "option_expiration": preferred_option.contract.expiration_date.isoformat() if preferred_option.contract else None,
+            "option_days_to_expiration": preferred_option_details.get("days_to_expiration"),
+            "option_is_0dte": preferred_option_details.get("is_0dte"),
+            "option_strike_distance_pct": preferred_option_details.get("strike_distance_pct"),
+            "option_liquidity_state": preferred_option_details.get("liquidity_state"),
+            "option_time_state": preferred_option_details.get("time_state"),
+            "option_stock_only_allowed": preferred_option_details.get("stock_only_allowed", True),
             "sms_block_reason": strategy_summary.get("sms_block_reason"),
             "scenario_alert_eligible": strategy_summary.get("scenario_alert_eligible"),
             "scenario_would_sms": strategy_summary.get("scenario_would_sms"),
@@ -1570,6 +1651,14 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 8px;
       font-weight: 720;
     }
+    .risk-panel {
+      margin: 10px 0;
+      padding: 10px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 5px;
+    }
     .option-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1942,9 +2031,48 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
 
+    function renderMarketRegimePanel(item) {
+      return `
+        <div class="risk-panel">
+          <div class="option-title"><span>Market Regime</span><span>${esc(item.market_regime || 'UNKNOWN')} ${item.regime_score ?? item.market_score ?? ''}</span></div>
+          <div><span class="muted">Environment</span> ${esc(item.regime_reason || 'Insufficient evidence for a clear regime')}</div>
+          <div><span class="muted">SPY / QQQ alignment</span> ${esc(item.spy_alignment || 'UNKNOWN')} / ${esc(item.qqq_alignment || 'UNKNOWN')}</div>
+          <div><span class="muted">AAPL relative strength</span> ${esc(item.aapl_relative_strength || item.relative_strength_label || 'UNKNOWN')}</div>
+          <div><span class="muted">Volume / Volatility</span> ${esc(item.volume_state || item.volume_label || 'UNKNOWN')} / ${esc(item.volatility_state || 'UNKNOWN')}</div>
+          ${item.market_regime === 'CHOPPY' ? '<div><span class="muted">Action</span> WATCH ONLY — choppy regime downgrades setup quality</div>' : ''}
+        </div>
+      `;
+    }
+
+    function renderMarketStructurePanel(item) {
+      return `
+        <div class="risk-panel">
+          <div class="option-title"><span>Market Structure</span><span>${esc(item.current_structure_bias || 'UNKNOWN')}</span></div>
+          <div><span class="muted">1m / 5m / 15m</span> ${esc(item.trend_1m || 'UNKNOWN')} / ${esc(item.trend_5m || 'UNKNOWN')} / ${esc(item.trend_15m || 'UNKNOWN')}</div>
+          <div><span class="muted">Nearest level</span> ${esc(item.nearest_level_name || 'Unavailable')} ${item.nearest_level_price !== undefined && item.nearest_level_price !== null ? fmtMoney(item.nearest_level_price) : ''} ${item.distance_to_key_level_pct !== undefined && item.distance_to_key_level_pct !== null ? `(${fmtNum(item.distance_to_key_level_pct, '%')})` : ''}</div>
+          <div><span class="muted">Support / Resistance</span> ${item.nearest_support !== undefined && item.nearest_support !== null ? fmtMoney(item.nearest_support) : 'Unavailable'} / ${item.nearest_resistance !== undefined && item.nearest_resistance !== null ? fmtMoney(item.nearest_resistance) : 'Unavailable'}</div>
+          <div><span class="muted">Key warning</span> ${esc(item.structure_key_warning || 'Structure aligned')}</div>
+        </div>
+      `;
+    }
+
+    function renderProfessionalSetupPanel(item) {
+      return `
+        <div class="risk-panel">
+          <div class="option-title"><span>Professional Setup</span><span>${esc(item.setup_name || 'Low Quality Setup')}</span></div>
+          <div><span class="muted">Direction / Stage</span> ${esc(item.setup_direction || 'neutral')} / ${esc(item.setup_stage || 'WATCHING')}</div>
+          <div><span class="muted">Score / Confidence</span> ${item.setup_score ?? 0} / ${esc(item.setup_confidence || 'LOW')}</div>
+          <div><span class="muted">Reason</span> ${esc(item.setup_reason || 'No clear setup reason')}</div>
+          <div><span class="muted">Entry / Risk</span> ${esc(item.setup_entry_quality || 'UNKNOWN')} / ${esc(item.setup_risk_label || 'MEDIUM')}</div>
+          <div><span class="muted">Watch</span> ${esc(item.setup_watch_text || 'Confirm manually on chart.')}</div>
+          ${item.setup_block_reason ? `<div><span class="muted">Block</span> ${esc(item.setup_block_reason)}</div>` : ''}
+        </div>
+      `;
+    }
+
     function renderStrategySummary(item) {
       if (!item?.primary_setup) {
-        return '<div class="muted">No active Phase 1 strategy setup.</div>';
+        return `${renderProfessionalSetupPanel(item)}${renderMarketRegimePanel(item)}${renderMarketStructurePanel(item)}${renderOptionQualityPanel(item)}${renderNewsContextPanel(item)}<div class="muted">No active Phase 1 strategy setup.</div>`;
       }
       return `
         <div class="option-card">
@@ -1954,6 +2082,19 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           ${renderPhase2Summary(item)}
           ${renderPhase3Summary(item)}
+          ${renderProfessionalSetupPanel(item)}
+          ${renderMarketRegimePanel(item)}
+          ${renderMarketStructurePanel(item)}
+          ${renderOptionQualityPanel(item)}
+          ${renderNewsContextPanel(item)}
+          <div class="risk-panel">
+            <div class="option-title"><span>Risk / Invalidation</span><span>${esc(item.entry_timing_label || item.entry_quality_label || 'EARLY')}</span></div>
+            <div><span class="muted">Idea is wrong</span> ${item.invalidation_level !== undefined && item.invalidation_level !== null ? fmtMoney(item.invalidation_level) : 'No clean level — watch only'}</div>
+            <div><span class="muted">Reason</span> ${esc(item.invalidation_reason || 'Unavailable')}</div>
+            <div><span class="muted">Stop logic</span> ${esc(item.stop_logic_description || 'Unavailable')}</div>
+            <div><span class="muted">Pullback required</span> ${item.pullback_required ? 'Yes' : 'No'}</div>
+            <div><span class="muted">Do not chase</span> ${item.do_not_chase_warning ? 'Yes' : 'No'}</div>
+          </div>
           ${item.secondary_setups?.length ? `<div><span class="muted">Secondary</span> ${item.secondary_setups.map(esc).join(', ')}</div>` : ''}
           <div><span class="muted">Direction</span> ${esc(item.strategy_direction || item.direction || '')}</div>
           <div><span class="muted">Scenario</span> ${esc(item.scenario_top?.scenario_name || '')} ${esc(item.scenario_stage || '')}</div>
@@ -1991,8 +2132,39 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
 
+    function renderOptionQualityPanel(item) {
+      const quality = item.option_quality || 'UNAVAILABLE';
+      const message = item.option_quality_message || (
+        quality === 'TRADABLE' ? 'Option tradable' : `${quality} — stock setup only`
+      );
+      return `
+        <div class="risk-panel">
+          <div class="option-title"><span>Option Quality</span><span class="quality ${qualityClass(quality)}">${esc(quality)}</span></div>
+          <div><span class="muted">Read</span> ${esc(message)}</div>
+          <div><span class="muted">Bid / Ask / Mid</span> ${fmtMoney(item.option_bid)} / ${fmtMoney(item.option_ask)} / ${fmtMoney(item.option_mid)}</div>
+          <div><span class="muted">Spread / Quote age</span> ${fmtNum(item.option_spread_pct, '%')} / ${item.option_quote_age_seconds !== undefined && item.option_quote_age_seconds !== null ? fmtNum(item.option_quote_age_seconds, 's') : 'Unavailable'}</div>
+          <div><span class="muted">Timestamp source</span> ${esc(item.option_timestamp_source_field || 'Unavailable')}</div>
+          <div><span class="muted">Expiration / 0DTE / Strike distance</span> ${esc(item.option_expiration || 'Unavailable')} / ${item.option_is_0dte ? 'Yes' : 'No'} / ${item.option_strike_distance_pct !== undefined && item.option_strike_distance_pct !== null ? fmtNum(item.option_strike_distance_pct, '%') : 'Unavailable'}</div>
+          <div><span class="muted">Liquidity / Session</span> ${esc(item.option_liquidity_state || 'UNKNOWN')} / ${esc(item.option_time_state || 'UNKNOWN')}</div>
+          <div><span class="muted">Trade-ready / Stock-only</span> ${item.option_tradable ? 'Allowed' : 'Blocked'} / ${item.option_stock_only_allowed === false ? 'Blocked' : 'Allowed'}</div>
+        </div>
+      `;
+    }
+
+    function renderNewsContextPanel(item) {
+      return `
+        <div class="risk-panel">
+          <div class="option-title"><span>News Context</span><span>${item.news_context_present ? 'PRESENT' : 'NONE'}</span></div>
+          <div><span class="muted">Latest headline</span> ${esc(item.latest_headline || item.headline || 'No fresh AAPL news')}</div>
+          <div><span class="muted">Source / Age / Sentiment</span> ${esc(item.news_source || 'Unavailable')} / ${item.news_age_minutes !== undefined && item.news_age_minutes !== null ? fmtNum(item.news_age_minutes, 'm') : 'Unavailable'} / ${esc(item.news_sentiment_guess || 'NEUTRAL')}</div>
+          <div><span class="muted">Use</span> Context only — confirm price reaction</div>
+          <div><span class="muted">Upgraded alert</span> ${item.news_upgraded_alert ? 'Yes' : 'No'}</div>
+        </div>
+      `;
+    }
+
     function renderOptionCard(label, option) {
-      const quality = option?.quality || 'No clean contract';
+      const quality = option?.quality || 'INVALID';
       if (!option || !option.symbol) {
         return `
           <div class="option-card">
@@ -2019,7 +2191,11 @@ INDEX_HTML = r"""<!doctype html>
             <div><span class="muted">IV</span><strong>${fmtIv(option.iv)}</strong></div>
             <div><span class="muted">Vol/OI</span><strong>${fmtInt(option.volume)} / ${fmtInt(option.open_interest)}</strong></div>
             <div><span class="muted">Opt Score</span><strong>${option.score || 0}</strong></div>
+            <div><span class="muted">Quote age/source</span><strong>${option.quote_age_seconds !== undefined && option.quote_age_seconds !== null ? fmtNum(option.quote_age_seconds, 's') : 'Unavailable'} / ${esc(option.timestamp_source_field || 'Unavailable')}</strong></div>
+            <div><span class="muted">DTE / Strike dist</span><strong>${option.days_to_expiration ?? 'Unavailable'} / ${option.strike_distance_pct !== undefined && option.strike_distance_pct !== null ? fmtNum(option.strike_distance_pct, '%') : 'Unavailable'}</strong></div>
+            <div><span class="muted">Liquidity / Session</span><strong>${esc(option.liquidity_state || 'UNKNOWN')} / ${esc(option.time_state || 'UNKNOWN')}</strong></div>
           </div>
+          <div class="muted">${esc(option.message || '')}</div>
           ${option.feed === 'simulated' ? '<div class="muted">Simulated dry-run option data</div>' : ''}
           ${option.feed === 'indicative' ? '<div class="muted">Indicative options data is not official OPRA bid/ask.</div>' : ''}
         </div>
@@ -2529,6 +2705,35 @@ def run_tests() -> int:
             )
             self.assertEqual(score_symbol(app, snap), 0)
 
+        def test_phase9_news_context_does_not_upgrade_dashboard_score(self) -> None:
+            config = scanner_app.load_config(None)
+            app = scanner_app.EliteScanner(
+                config,
+                scanner_app.MockProvider(["AAPL"]),
+                scanner_app.DiscordNotifier(None),
+                scanner_app.AlertWriter(scanner_app.LOG_DIR / "dashboard_news_score.csv", scanner_app.LOG_DIR / "dashboard_news_score.jsonl"),
+                scanner_app.StateStore(scanner_app.STATE_DIR / "dashboard_news_score_state.json"),
+            )
+            now = scanner_app.now_utc()
+            bars = [
+                scanner_app.Bar(t=now - timedelta(minutes=10 - i), o=100, h=100.1, l=99.9, c=100, v=100000)
+                for i in range(11)
+            ]
+            plain = scanner_app.SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)
+            with_news = scanner_app.SymbolSnapshot(
+                symbol="AAPL",
+                latest_bar=bars[-1],
+                recent_bars=bars,
+                latest_news=scanner_app.NewsItem(
+                    symbol="AAPL",
+                    headline="Apple raises outlook",
+                    url="https://example.com/aapl",
+                    published_at=now,
+                    source="TestWire",
+                ),
+            )
+            self.assertEqual(score_symbol(app, plain), score_symbol(app, with_news))
+
         def test_phase2h_dashboard_rows_include_confirmation_fields(self) -> None:
             config = scanner_app.load_config(None)
             config["symbols"] = ["AAPL"]
@@ -2585,8 +2790,15 @@ def run_tests() -> int:
                     "extension_score": 20,
                     "relative_strength_label": "STRONG",
                     "relative_strength_score": 75,
-                    "market_regime": "BULL_TREND",
+                    "market_regime": "TRENDING_UP",
+                    "regime_score": 80,
                     "market_score": 80,
+                    "regime_reason": "SPY and QQQ are above VWAP with rising EMA structure",
+                    "spy_alignment": "ALIGNED",
+                    "qqq_alignment": "ALIGNED",
+                    "aapl_relative_strength": "STRONG",
+                    "volume_state": "STRONG",
+                    "volatility_state": "NORMAL",
                     "pressure_label": "UNKNOWN",
                     "pressure_score": 50,
                     "risk_label": "MEDIUM",
@@ -2637,7 +2849,11 @@ def run_tests() -> int:
             self.assertEqual(rows[0]["entry_quality_label"], "GOOD_POSITION")
             self.assertEqual(rows[0]["candle_label"], "BUYER_CONTROL")
             self.assertEqual(rows[0]["relative_strength_label"], "STRONG")
-            self.assertEqual(rows[0]["market_regime"], "BULL_TREND")
+            self.assertEqual(rows[0]["market_regime"], "TRENDING_UP")
+            self.assertEqual(rows[0]["spy_alignment"], "ALIGNED")
+            self.assertEqual(rows[0]["qqq_alignment"], "ALIGNED")
+            self.assertEqual(rows[0]["aapl_relative_strength"], "STRONG")
+            self.assertEqual(rows[0]["regime_reason"], "SPY and QQQ are above VWAP with rising EMA structure")
             self.assertEqual(rows[0]["scenario_top"]["scenario_name"], "Bullish Trend Continuation")
             self.assertEqual(rows[0]["option_feed_status"], "INDICATIVE")
             self.assertEqual(rows[0]["stock_setup_score"], 82)
@@ -2646,6 +2862,9 @@ def run_tests() -> int:
             self.assertTrue(rows[0]["alert_tier_reason"])
             self.assertTrue(rows[0]["alert_source"])
             self.assertTrue(rows[0]["message_source_path"])
+            self.assertIn("invalidation_reason", rows[0])
+            self.assertIn("stop_logic_description", rows[0])
+            self.assertIn("entry_timing_label", rows[0])
             self.assertEqual(rows[0]["stock_setup_score_reason"], "Breakout Retest Holding is strong")
             self.assertTrue(rows[0]["scenario_alert_eligible"])
             self.assertFalse(rows[0]["scenario_would_sms"])
@@ -2676,6 +2895,26 @@ def run_tests() -> int:
             self.assertIn("context-only", INDEX_HTML)
             self.assertIn("Professional Alert Tier", INDEX_HTML)
             self.assertIn("Alert Tier Reason", INDEX_HTML)
+            self.assertIn("Risk / Invalidation", INDEX_HTML)
+            self.assertIn("Market Regime", INDEX_HTML)
+            self.assertIn("SPY / QQQ alignment", INDEX_HTML)
+            self.assertIn("AAPL relative strength", INDEX_HTML)
+            self.assertIn("WATCH ONLY — choppy regime downgrades setup quality", INDEX_HTML)
+            self.assertIn("Market Structure", INDEX_HTML)
+            self.assertIn("1m / 5m / 15m", INDEX_HTML)
+            self.assertIn("Nearest level", INDEX_HTML)
+            self.assertIn("Key warning", INDEX_HTML)
+            self.assertIn("Professional Setup", INDEX_HTML)
+            self.assertIn("Option Quality", INDEX_HTML)
+            self.assertIn("Trade-ready / Stock-only", INDEX_HTML)
+            self.assertIn("Quote age/source", INDEX_HTML)
+            self.assertIn("News Context", INDEX_HTML)
+            self.assertIn("Context only — confirm price reaction", INDEX_HTML)
+            self.assertIn("Upgraded alert", INDEX_HTML)
+            self.assertIn("Direction / Stage", INDEX_HTML)
+            self.assertIn("Score / Confidence", INDEX_HTML)
+            self.assertIn("Idea is wrong", INDEX_HTML)
+            self.assertIn("Pullback required", INDEX_HTML)
 
         def test_dashboard_status_includes_telegram_without_exposing_token(self) -> None:
             old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
