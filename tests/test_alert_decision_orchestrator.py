@@ -41,6 +41,9 @@ class AlertDecisionOrchestratorTests(unittest.TestCase):
             "do_not_chase": False,
             "existing_trade_ready": False,
             "existing_user_alert": True,
+            "scenario_stage": "CONFIRMED",
+            "market_structure_warning": "",
+            "invalidation_reason": "Reclaim and hold above VWAP/EMA9.",
         }
         payload.update(overrides)
         return payload
@@ -63,6 +66,23 @@ class AlertDecisionOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(decision["final_alert_type"], "MIXED_NO_TRADE")
         self.assertFalse(decision["trade_ready"])
+
+    def test_weak_trend_stays_blocked_by_chop(self) -> None:
+        decision = orchestrate_alert_decision(
+            self.context(
+                trend_1m="BULLISH",
+                trend_5m="BEARISH",
+                trend_15m="NEUTRAL",
+                setup_score=40,
+                strategy_confidence_score=40,
+                scenario_score=40,
+                stock_setup_score=40,
+                existing_user_alert=False,
+            ),
+            self.config(),
+        )
+        self.assertEqual(decision["final_alert_type"], "CHOP_WARNING")
+        self.assertFalse(decision["telegram_allowed"])
 
     def test_sweep_adds_risk_but_does_not_approve_or_erase_trend(self) -> None:
         decision = orchestrate_alert_decision(
@@ -92,6 +112,20 @@ class AlertDecisionOrchestratorTests(unittest.TestCase):
         chopped = orchestrate_alert_decision(self.context(chop_mode_active=True, existing_trade_ready=True), self.config())
         self.assertEqual(clean["final_alert_type"], "TRADE_QUALITY")
         self.assertNotEqual(chopped["final_alert_type"], "TRADE_QUALITY")
+
+    def test_no_clean_edge_and_forming_stage_downgrade_trade_quality_to_trend_context(self) -> None:
+        for override in (
+            {"market_structure_warning": "no clean edge"},
+            {"scenario_stage": "FORMING"},
+        ):
+            decision = orchestrate_alert_decision(
+                self.context(chop_mode_active=False, existing_trade_ready=True, **override),
+                self.config(),
+            )
+            self.assertEqual(decision["final_alert_type"], "TREND_CONTEXT")
+            self.assertTrue(decision["watch_only"])
+            self.assertFalse(decision["trade_ready"])
+            self.assertFalse(decision["can_approve_trades"])
 
     def test_trend_context_dedupe(self) -> None:
         recent = {"last_trend_context": {"direction": "BEARISH", "timestamp": datetime.now(timezone.utc).isoformat()}}
@@ -135,6 +169,10 @@ class AlertDecisionOrchestratorTests(unittest.TestCase):
             "conflicts",
             "risk_notes",
             "what_to_wait_for",
+            "invalidation_notes",
+            "primary_engine",
+            "supporting_engines",
+            "blocking_engines",
         ):
             self.assertIn(field, decision)
         self.assertTrue(decision["dashboard_allowed"])

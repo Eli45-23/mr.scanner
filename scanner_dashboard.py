@@ -39,6 +39,7 @@ MARKET_STRUCTURE_LOG_PATHS = {
     "summary": APP_DIR / "logs" / "market_structure.jsonl",
 }
 LIQUIDITY_SWEEP_LOG_PATH = APP_DIR / "logs" / "liquidity_sweeps.jsonl"
+ALERT_ORCHESTRATOR_LOG_PATH = APP_DIR / "logs" / "alert_orchestrator.jsonl"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -1734,6 +1735,11 @@ def load_alerts(limit: int = 100) -> List[Dict[str, Any]]:
     return out
 
 
+def load_alert_brain(path: Optional[Path] = None) -> Dict[str, Any]:
+    records = _read_jsonl_records(path or ALERT_ORCHESTRATOR_LOG_PATH)
+    return records[-1] if records else {}
+
+
 def load_symbol_rows() -> List[Dict[str, Any]]:
     with STATE.lock:
         return list(STATE.symbol_rows)
@@ -2322,6 +2328,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="content">
       <section>
         <div class="table-head">
+          <h2>Main Alert Brain</h2>
+          <span class="muted" id="alertBrainUpdated">Waiting for decision</span>
+        </div>
+        <div class="structure-body" id="alertDecisionBrain"></div>
+      </section>
+      <section>
+        <div class="table-head">
           <h2>Live Market Structure</h2>
           <span class="muted" id="marketStructureUpdated">Waiting for data</span>
         </div>
@@ -2394,6 +2407,8 @@ INDEX_HTML = r"""<!doctype html>
       alertCount: document.getElementById('alertCount'),
       market: document.getElementById('market'),
       alerts: document.getElementById('alerts'),
+      alertDecisionBrain: document.getElementById('alertDecisionBrain'),
+      alertBrainUpdated: document.getElementById('alertBrainUpdated'),
       liveMarketStructure: document.getElementById('liveMarketStructure'),
       marketStructureUpdated: document.getElementById('marketStructureUpdated'),
       liquiditySweepZones: document.getElementById('liquiditySweepZones'),
@@ -3011,6 +3026,7 @@ INDEX_HTML = r"""<!doctype html>
       els.alertCount.textContent = alerts.length ? `${alerts.length} recent` : 'No alerts';
       if (!alerts.length) {
         els.alerts.innerHTML = '<div class="empty">No alerts logged yet.</div>';
+        renderAlertDecisionBrain(null);
         return;
       }
       els.alerts.innerHTML = `
@@ -3051,6 +3067,32 @@ INDEX_HTML = r"""<!doctype html>
 	            `).join('')}
           </tbody>
         </table>
+      `;
+      renderAlertDecisionBrain(alerts[0]);
+    }
+
+    function renderAlertDecisionBrain(alert) {
+      if (!alert || (!alert.orchestrator_enabled && !alert.final_alert_type)) {
+        els.alertBrainUpdated.textContent = 'Waiting for decision';
+        els.alertDecisionBrain.innerHTML = '<div class="empty">No Main Alert Brain decision logged yet.</div>';
+        return;
+      }
+      const list = (value) => (value && value.length) ? value.map(esc).join(', ') : 'None';
+      els.alertBrainUpdated.textContent = fmtTime(alert.timestamp);
+      els.alertDecisionBrain.innerHTML = `
+        <div class="structure-summary">
+          <div><span class="label">Final Event Type</span><strong>${esc(alert.orchestrator_final_alert_type || alert.final_alert_type || 'DASHBOARD_ONLY')}</strong></div>
+          <div><span class="label">Direction</span><strong>${esc(alert.orchestrator_final_direction || alert.final_direction || 'NEUTRAL')}</strong></div>
+          <div><span class="label">Telegram Allowed</span><strong>${(alert.orchestrator_telegram_allowed ?? alert.telegram_allowed) ? 'Yes' : 'No'}</strong></div>
+          <div><span class="label">Watch-only</span><strong>${(alert.orchestrator_watch_only ?? alert.watch_only) ? 'Yes' : 'No'}</strong></div>
+          <div><span class="label">Trade-ready</span><strong>${(alert.orchestrator_trade_ready ?? alert.trade_ready) ? 'Yes' : 'No'}</strong></div>
+          <div><span class="label">Primary Engine</span><strong>${esc(alert.orchestrator_primary_engine || alert.primary_engine || 'dashboard_context')}</strong></div>
+        </div>
+        <div class="copy-block"><strong>Decision Reason:</strong> ${esc(alert.orchestrator_decision_reason || alert.decision_reason || 'Context only')}</div>
+        <div class="copy-block"><strong>Supporting Engines:</strong> ${list(alert.orchestrator_supporting_engines || alert.supporting_engines)}</div>
+        <div class="copy-block"><strong>Blocking / Risk Engines:</strong> ${list(alert.orchestrator_blocking_engines || alert.blocking_engines)}</div>
+        <div class="copy-block"><strong>What To Wait For:</strong> ${list(alert.orchestrator_what_to_wait_for || alert.orchestrator_wait_for || alert.what_to_wait_for)}</div>
+        <div class="copy-block"><strong>Risk Notes:</strong> ${list(alert.orchestrator_risk_notes || alert.risk_notes)}</div>
       `;
     }
 
@@ -3148,10 +3190,11 @@ INDEX_HTML = r"""<!doctype html>
 
     async function refresh() {
       try {
-        const [status, alerts, symbols] = await Promise.all([api('/api/status'), api('/api/alerts'), api('/api/symbols')]);
+        const [status, alerts, symbols, brain] = await Promise.all([api('/api/status'), api('/api/alerts'), api('/api/symbols'), api('/api/alert-brain')]);
         renderStatus(status);
         renderMarket(symbols.symbols || []);
         renderAlerts(alerts.alerts || []);
+        renderAlertDecisionBrain(brain);
       } catch (err) {
         els.error.style.display = 'block';
         els.error.textContent = err.message;
@@ -3243,6 +3286,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"symbols": load_symbol_rows()})
             elif parsed.path == "/api/liquidity-sweeps":
                 self.send_json(STATE.snapshot().get("liquidity_sweeps", {}))
+            elif parsed.path == "/api/alert-brain":
+                self.send_json(load_alert_brain())
             elif parsed.path == "/api/alpaca-health":
                 force_refresh = parse_qs(parsed.query).get("force_refresh", ["false"])[0].lower() == "true"
                 self.send_json(alpaca_health_check(force_refresh=force_refresh))
@@ -3661,6 +3706,12 @@ def run_tests() -> int:
                 self.assertNotIn("OPENAI_API_KEY", serialized)
 
             for text in (
+                "Main Alert Brain",
+                "renderAlertDecisionBrain",
+                "Final Event Type",
+                "Supporting Engines",
+                "Blocking / Risk Engines",
+                "What To Wait For",
                 "Live Market Structure",
                 "renderLiveMarketStructure",
                 "Current Price",
@@ -3693,6 +3744,33 @@ def run_tests() -> int:
             self.assertEqual(payload["message"], "Waiting for market structure data.")
             self.assertEqual(payload["copy_summary"], "Not enough clean data yet")
             self.assertFalse(payload["can_upgrade"])
+
+        def test_main_alert_brain_reads_latest_orchestrator_decision(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "alert_orchestrator.jsonl"
+                path.write_text(
+                    "\n".join([
+                        json.dumps({"timestamp": "2026-06-11T14:00:00+00:00", "final_alert_type": "DASHBOARD_ONLY"}),
+                        json.dumps({
+                            "timestamp": "2026-06-11T14:01:00+00:00",
+                            "final_alert_type": "TREND_CONTEXT",
+                            "final_direction": "BEARISH",
+                            "telegram_allowed": True,
+                            "dashboard_allowed": True,
+                            "watch_only": True,
+                            "trade_ready": False,
+                            "primary_engine": "multi_timeframe_trend",
+                            "supporting_engines": ["market_structure", "strategy_engine"],
+                            "blocking_engines": ["chop_mode"],
+                        }),
+                    ]),
+                    encoding="utf-8",
+                )
+                payload = load_alert_brain(path)
+            self.assertEqual(payload["final_alert_type"], "TREND_CONTEXT")
+            self.assertEqual(payload["primary_engine"], "multi_timeframe_trend")
+            self.assertTrue(payload["dashboard_allowed"])
+            self.assertIn("/api/alert-brain", Path(__file__).read_text(encoding="utf-8"))
 
         def test_live_market_structure_refresh_reuses_aapl_snapshot_without_alert_changes(self) -> None:
             config = scanner_app.load_config(None)

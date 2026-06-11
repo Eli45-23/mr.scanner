@@ -97,6 +97,10 @@ def determine_trend_context_eligibility(
 def determine_trade_quality_eligibility(context: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, str]:
     if not bool(context.get("existing_trade_ready")):
         return False, "Existing strict trade-quality rules did not approve"
+    if str(context.get("scenario_stage") or "").upper() in {"WATCHING", "FORMING"}:
+        return False, "Phase 3 scenario is still forming"
+    if "no clean edge" in str(context.get("market_structure_warning") or "").lower():
+        return False, "Market structure reports no clean edge"
     if not bool(context.get("option_tradable")):
         return False, "Option quality does not support trade-quality alert"
     if context.get("mixed_signal_detected") or context.get("scenario_conflict"):
@@ -130,16 +134,52 @@ def orchestrate_alert_decision(
     score = _score(context)
     risk_notes = []
     conflicts = []
+    supporting_engines = []
+    blocking_engines = []
     wait_for = ["Clean pullback/retest and manual chart confirmation."]
+    invalidation_notes = [
+        str(note)
+        for note in (
+            context.get("invalidation_reason"),
+            context.get("stop_logic_description"),
+        )
+        if note
+    ]
+    if isinstance(context.get("invalidation_level"), (int, float)):
+        invalidation_notes.insert(0, f"Invalidation level: {float(context['invalidation_level']):.2f}")
+    scenario_stage = str(context.get("scenario_stage") or "").upper()
+    structure_warning = str(context.get("market_structure_warning") or "")
+    if max(votes["timeframes_bullish"], votes["timeframes_bearish"]) >= 2:
+        supporting_engines.append("multi_timeframe_trend")
+    if votes["structure_bias"] == direction and direction != "NEUTRAL":
+        supporting_engines.append("market_structure")
+    if votes["strategy_direction"] == direction and direction != "NEUTRAL":
+        supporting_engines.append("strategy_engine")
+    if votes["scenario_direction"] == direction and direction != "NEUTRAL":
+        supporting_engines.append("phase3_scenario")
+    if votes["market_alignment"] == "ALIGNED":
+        supporting_engines.append("market_alignment")
+    if context.get("option_tradable"):
+        supporting_engines.append("option_quality")
     if context.get("chop_mode_active"):
         risk_notes.append("Chop Mode is active; directional context remains watch-only.")
+        blocking_engines.append("chop_mode")
     if context.get("sweep_risk_active") or context.get("liquidity_sweep_context"):
         risk_notes.append(str(context.get("liquidity_sweep_context") or "Liquidity sweep risk is active."))
+        blocking_engines.append("liquidity_sweep")
     if context.get("do_not_chase") or str(context.get("risk_label") or "").upper() == "DO_NOT_CHASE":
         risk_notes.append("Move is late or extended; do not chase.")
+        blocking_engines.append("extension_exhaustion")
         wait_for = ["A fresh pullback/retest before continuation."]
     if context.get("mixed_signal_detected") or context.get("scenario_conflict"):
         conflicts.append("Primary setup and scenario signals conflict.")
+        blocking_engines.append("mixed_signal")
+    if scenario_stage in {"WATCHING", "FORMING"}:
+        risk_notes.append(f"Phase 3 scenario is {scenario_stage.lower()}; confirmation is incomplete.")
+        blocking_engines.append("phase3_scenario")
+    if "no clean edge" in structure_warning.lower():
+        risk_notes.append("Market structure reports no clean edge; keep directional context watch-only.")
+        blocking_engines.append("market_structure")
 
     trade_allowed, trade_reason = determine_trade_quality_eligibility(context, config)
     trend_allowed, trend_reason, trend_detail = determine_trend_context_eligibility(context, config)
@@ -203,6 +243,15 @@ def orchestrate_alert_decision(
         "MIXED_NO_TRADE": "AAPL MIXED / NO TRADE",
         "DASHBOARD_ONLY": "AAPL Dashboard Context",
     }[final_type]
+    primary_engine = {
+        "TRADE_QUALITY": "existing_trade_quality",
+        "TREND_CONTEXT": "multi_timeframe_trend",
+        "SWEEP_EVENT": "liquidity_sweep",
+        "CHOP_WARNING": "chop_mode",
+        "DO_NOT_CHASE": "extension_exhaustion",
+        "MIXED_NO_TRADE": "mixed_signal",
+        "DASHBOARD_ONLY": "dashboard_context",
+    }[final_type]
     return {
         "final_alert_type": final_type,
         "final_direction": direction,
@@ -218,6 +267,10 @@ def orchestrate_alert_decision(
         "suppression_reason": "" if telegram_allowed else reason,
         "what_to_wait_for": wait_for,
         "risk_notes": risk_notes,
+        "invalidation_notes": invalidation_notes,
+        "primary_engine": primary_engine,
+        "supporting_engines": list(dict.fromkeys(supporting_engines)),
+        "blocking_engines": list(dict.fromkeys(blocking_engines)),
         "engine_votes": votes,
         "conflicts": conflicts,
         "recommended_message_title": title,

@@ -904,16 +904,22 @@ class Alert:
     orchestrator_final_direction: Optional[str] = None
     orchestrator_final_priority: Optional[int] = None
     orchestrator_telegram_allowed: bool = False
+    orchestrator_dashboard_allowed: bool = True
     orchestrator_trade_ready: bool = False
     orchestrator_watch_only: bool = False
     orchestrator_context_only: bool = True
     orchestrator_decision_reason: Optional[str] = None
+    orchestrator_primary_engine: Optional[str] = None
+    orchestrator_supporting_engines: List[str] = field(default_factory=list)
+    orchestrator_blocking_engines: List[str] = field(default_factory=list)
     orchestrator_block_reason: Optional[str] = None
     orchestrator_suppression_reason: Optional[str] = None
     orchestrator_engine_votes: Dict[str, Any] = field(default_factory=dict)
     orchestrator_conflicts: List[str] = field(default_factory=list)
     orchestrator_risk_notes: List[str] = field(default_factory=list)
     orchestrator_wait_for: List[str] = field(default_factory=list)
+    orchestrator_what_to_wait_for: List[str] = field(default_factory=list)
+    orchestrator_invalidation_notes: List[str] = field(default_factory=list)
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -7049,6 +7055,7 @@ class EliteScanner:
             "scenario_top": alert.scenario_top,
             "scenario_score": alert.scenario_score,
             "scenario_direction": alert.scenario_direction,
+            "scenario_stage": alert.scenario_stage,
             "scenario_conflict": alert.scenario_conflict,
             "stock_setup_score": alert.stock_setup_score,
             "confirmation_score": alert.confirmation_score,
@@ -7061,6 +7068,7 @@ class EliteScanner:
             "trend_5m": alert.trend_5m,
             "trend_15m": alert.trend_15m,
             "current_structure_bias": alert.current_structure_bias,
+            "market_structure_warning": alert.market_structure_warning,
             "vwap": levels.get("vwap"),
             "ema9": levels.get("ema9"),
             "chop_mode_active": alert.chop_mode_active,
@@ -7073,6 +7081,9 @@ class EliteScanner:
             "mixed_signal_detected": alert.mixed_signal_detected,
             "do_not_chase": bool(alert.do_not_chase_warning or alert.entry_quality_label == "DO_NOT_CHASE"),
             "risk_label": alert.risk_label,
+            "invalidation_level": alert.invalidation_level or (alert.scenario_top or {}).get("invalidation_level"),
+            "invalidation_reason": alert.invalidation_reason or (alert.scenario_top or {}).get("invalidation_reason"),
+            "stop_logic_description": alert.stop_logic_description,
             "existing_trade_ready": bool(alert.sms_allowed),
             "existing_user_alert": bool(alert.sms_allowed or alert.watch_allowed or alert.phase3_heads_up_sent),
         }
@@ -7098,16 +7109,22 @@ class EliteScanner:
         alert.orchestrator_final_direction = decision["final_direction"]
         alert.orchestrator_final_priority = decision["final_priority"]
         alert.orchestrator_telegram_allowed = decision["telegram_allowed"]
+        alert.orchestrator_dashboard_allowed = decision["dashboard_allowed"]
         alert.orchestrator_trade_ready = decision["trade_ready"]
         alert.orchestrator_watch_only = decision["watch_only"]
         alert.orchestrator_context_only = decision["context_only"]
         alert.orchestrator_decision_reason = decision["decision_reason"]
+        alert.orchestrator_primary_engine = decision["primary_engine"]
+        alert.orchestrator_supporting_engines = decision["supporting_engines"]
+        alert.orchestrator_blocking_engines = decision["blocking_engines"]
         alert.orchestrator_block_reason = decision["block_reason"]
         alert.orchestrator_suppression_reason = decision["suppression_reason"]
         alert.orchestrator_engine_votes = decision["engine_votes"]
         alert.orchestrator_conflicts = decision["conflicts"]
         alert.orchestrator_risk_notes = decision["risk_notes"]
         alert.orchestrator_wait_for = decision["what_to_wait_for"]
+        alert.orchestrator_what_to_wait_for = decision["what_to_wait_for"]
+        alert.orchestrator_invalidation_notes = decision["invalidation_notes"]
         if decision["final_alert_type"] == "TREND_CONTEXT" and decision["telegram_allowed"]:
             alert.sms_allowed = False
             alert.watch_allowed = True
