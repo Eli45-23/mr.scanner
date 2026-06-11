@@ -22,6 +22,7 @@ def _direction(record: Dict[str, Any]) -> str:
 def evaluate_chop_mode(
     history: Iterable[Dict[str, Any]],
     market_structure: Optional[Dict[str, Any]] = None,
+    liquidity_sweeps: Optional[Iterable[Dict[str, Any]]] = None,
     *,
     now: Optional[datetime] = None,
     lookback_minutes: int = 15,
@@ -53,6 +54,31 @@ def evaluate_chop_mode(
         or ("between 5m demand" in location and "5m supply" in location)
         or "trapped between" in location
     )
+    raw_recent_sweeps = [
+        record for record in (liquidity_sweeps or [])
+        if (_time(record.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff
+        and str(record.get("sweep_status") or "").upper() in {"SWEEP_WATCH", "SWEEP_FORMING", "SWEEP_CONFIRMED"}
+    ]
+    unique_sweeps: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+    for record in raw_recent_sweeps:
+        key = (
+            str(record.get("level_source") or ""),
+            str(record.get("sweep_direction") or ""),
+            str(record.get("sweep_status") or ""),
+            record.get("sweep_level"),
+        )
+        unique_sweeps[key] = record
+    recent_sweeps = list(unique_sweeps.values())
+    latest_sweep = recent_sweeps[-1] if recent_sweeps else {}
+    sweep_risk_active = bool(
+        range_chop
+        and (
+            recent_sweeps
+            or summary.get("major_demand_area")
+            or summary.get("major_supply_area")
+        )
+    )
+    repeated_range_sweeps = sum(bool(record.get("inside_chop_range")) for record in recent_sweeps) >= 2
 
     active = False
     chop_type = ""
@@ -60,6 +86,11 @@ def evaluate_chop_mode(
     if range_chop:
         active, chop_type = True, "supply_demand_range"
         reason = summary.get("current_price_location_summary") or "Market structure reports price inside a chop range"
+        if sweep_risk_active:
+            reason = "Price is trapped between demand and supply; fake breaks/sweeps are likely."
+    elif repeated_range_sweeps:
+        active, chop_type = True, "liquidity_sweep_range"
+        reason = "Repeated liquidity sweeps inside the same range indicate no clean edge."
     elif mixed_count >= min_mixed_alerts:
         active, chop_type = True, "mixed_overload"
         reason = f"{mixed_count} mixed/no-trade conclusions occurred inside {lookback_minutes} minutes"
@@ -84,6 +115,14 @@ def evaluate_chop_mode(
         "expires_at": (now + timedelta(minutes=lookback_minutes)).isoformat() if active else None,
         "direction_flips": flips,
         "mixed_alert_count": mixed_count,
+        "sweep_risk_active": sweep_risk_active or repeated_range_sweeps,
+        "upside_sweep_zone": latest_sweep.get("nearest_upside_sweep_zone"),
+        "downside_sweep_zone": latest_sweep.get("nearest_downside_sweep_zone"),
+        "recent_sweep_count": len(recent_sweeps),
+        "sweep_risk_reason": (
+            "Price is trapped between demand and supply; fake breaks/sweeps are likely."
+            if sweep_risk_active or repeated_range_sweeps else ""
+        ),
         "can_approve_trades": False,
     }
 

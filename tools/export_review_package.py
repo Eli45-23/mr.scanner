@@ -262,10 +262,12 @@ def build_review_summary(
     chop_records: Optional[List[Dict[str, Any]]] = None,
     missed_entry_records: Optional[List[Dict[str, Any]]] = None,
     openai_records: Optional[List[Dict[str, Any]]] = None,
+    liquidity_sweep_records: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     chop_records = chop_records or []
     missed_entry_records = missed_entry_records or []
     openai_records = openai_records or []
+    liquidity_sweep_records = liquidity_sweep_records or []
     market_status = latest_status_for_day(market_data_records)
     alert_rows = [
         [
@@ -349,6 +351,28 @@ def build_review_summary(
     inside_chop = [record for record in alert_window if record.get("chop_mode_active")]
     openai_success = sum(1 for record in openai_records if record.get("formatter_success"))
     openai_fallback = sum(1 for record in openai_records if record.get("fallback_used"))
+    sweep_statuses = [str(record.get("sweep_status") or "").upper() for record in liquidity_sweep_records]
+    confirmed_sweeps = [record for record in liquidity_sweep_records if str(record.get("sweep_status") or "").upper() == "SWEEP_CONFIRMED"]
+    sweep_downgrades = [record for record in alert_window if record.get("downgraded_by_liquidity_sweep")]
+    bullish_supply_downgrades = [
+        record for record in sweep_downgrades
+        if str(record.get("direction") or record.get("scenario_direction") or "").upper() == "BULLISH"
+        and "supply" in str(record.get("liquidity_sweep_downgrade_reason") or "").lower()
+    ]
+    bearish_demand_downgrades = [
+        record for record in sweep_downgrades
+        if str(record.get("direction") or record.get("scenario_direction") or "").upper() == "BEARISH"
+        and "demand" in str(record.get("liquidity_sweep_downgrade_reason") or "").lower()
+    ]
+    important_level_sweeps = sum(
+        1 for record in liquidity_sweep_records
+        if str(record.get("level_source") or "").lower() in {"hod", "lod", "pmh", "pml", "pdh", "pdl"}
+    )
+    supply_demand_sweeps = sum(
+        1 for record in liquidity_sweep_records
+        if "5m_supply" in str(record.get("level_source") or "").lower()
+        or "5m_demand" in str(record.get("level_source") or "").lower()
+    )
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -420,6 +444,24 @@ def build_review_summary(
 - Alerts inside chop range: {len(inside_chop)}
 - OpenAI formatter success / fallback: {openai_success} / {openai_fallback}
 
+## Liquidity Sweep Review
+- Sweep watch records: {sweep_statuses.count("SWEEP_WATCH")}
+- Sweep forming records: {sweep_statuses.count("SWEEP_FORMING")}
+- Sweep confirmed records: {len(confirmed_sweeps)}
+- Confirmed upside sweeps: {sum(1 for record in confirmed_sweeps if str(record.get("sweep_direction") or "").upper() == "ABOVE_LEVEL")}
+- Confirmed downside sweeps: {sum(1 for record in confirmed_sweeps if str(record.get("sweep_direction") or "").upper() == "BELOW_LEVEL")}
+- Failed / held sweeps: {sweep_statuses.count("SWEEP_FAILED_HELD")}
+- Alerts downgraded by liquidity sweep: {len(sweep_downgrades)}
+- Bullish alerts downgraded near supply: {len(bullish_supply_downgrades)}
+- Bearish alerts downgraded near demand: {len(bearish_demand_downgrades)}
+- Chop records strengthened by sweep risk: {sum(1 for record in chop_records if record.get("sweep_risk_active"))}
+- Telegram sweep alerts sent: {sum(1 for record in liquidity_sweep_records if record.get("telegram_sent"))}
+- Telegram sweep alerts suppressed by cooldown: {sum(1 for record in liquidity_sweep_records if "cooldown" in str(record.get("telegram_suppressed_reason") or "").lower())}
+- OpenAI sweep formatter fallbacks: {sum(1 for record in liquidity_sweep_records if record.get("fallback_used"))}
+- Sweeps near HOD/LOD/PMH/PML/PDH/PDL: {important_level_sweeps}
+- Sweeps near 5m supply/demand: {supply_demand_sweeps}
+- Sweeps inside chop range: {sum(1 for record in liquidity_sweep_records if record.get("inside_chop_range"))}
+
 ### Premarket
 {markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(premarket))}
 
@@ -457,6 +499,7 @@ def build_review_summary(
 - `logs/support_resistance_levels.jsonl`
 - `logs/supply_demand_zones.jsonl`
 - `logs/market_structure.jsonl`
+- `logs/liquidity_sweeps.jsonl`
 - `logs/chop_mode.jsonl` if available
 - `logs/missed_clean_entry.jsonl` if available
 - `logs/openai_alert_formatter.jsonl` if available
@@ -475,6 +518,7 @@ def build_review_summary(
 - `window/support_resistance_levels_window.jsonl`
 - `window/supply_demand_zones_window.jsonl`
 - `window/market_structure_window.jsonl`
+- `window/liquidity_sweeps_window.jsonl`
 - `alert_performance_{day_text}.md` if generated
 
 ## Export Notes
@@ -526,6 +570,7 @@ def export_review_package(
     support_resistance = records_for_day(read_jsonl(log_dir / "support_resistance_levels.jsonl"), day_text)
     supply_demand = records_for_day(read_jsonl(log_dir / "supply_demand_zones.jsonl"), day_text)
     market_structure = records_for_day(read_jsonl(log_dir / "market_structure.jsonl"), day_text)
+    liquidity_sweeps = records_for_day(read_jsonl(log_dir / "liquidity_sweeps.jsonl"), day_text)
     openai_formatter = records_for_day(read_jsonl(log_dir / "openai_alert_formatter.jsonl"), day_text)
     premarket_discipline = records_for_day(read_jsonl(log_dir / "premarket_discipline_message.jsonl"), day_text)
     chop_mode = records_for_day(read_jsonl(log_dir / "chop_mode.jsonl"), day_text)
@@ -546,6 +591,7 @@ def export_review_package(
     write_jsonl(logs_out / "support_resistance_levels.jsonl", support_resistance)
     write_jsonl(logs_out / "supply_demand_zones.jsonl", supply_demand)
     write_jsonl(logs_out / "market_structure.jsonl", market_structure)
+    write_jsonl(logs_out / "liquidity_sweeps.jsonl", liquidity_sweeps)
     if (log_dir / "openai_alert_formatter.jsonl").exists():
         write_jsonl(logs_out / "openai_alert_formatter.jsonl", openai_formatter)
     if (log_dir / "premarket_discipline_message.jsonl").exists():
@@ -567,6 +613,7 @@ def export_review_package(
     write_jsonl(window_out / "support_resistance_levels_window.jsonl", records_in_window(support_resistance, start_dt, end_dt))
     write_jsonl(window_out / "supply_demand_zones_window.jsonl", records_in_window(supply_demand, start_dt, end_dt))
     write_jsonl(window_out / "market_structure_window.jsonl", records_in_window(market_structure, start_dt, end_dt))
+    write_jsonl(window_out / "liquidity_sweeps_window.jsonl", records_in_window(liquidity_sweeps, start_dt, end_dt))
     if chop_mode:
         write_jsonl(window_out / "chop_mode_window.jsonl", records_in_window(chop_mode, start_dt, end_dt))
     if missed_clean_entry:
@@ -598,6 +645,8 @@ def export_review_package(
         notes.append("No supply_demand_zones.jsonl records found for the requested date.")
     if not market_structure:
         notes.append("No market_structure.jsonl records found for the requested date.")
+    if not liquidity_sweeps:
+        notes.append("No liquidity_sweeps.jsonl records found for the requested date.")
 
     scanner_log = log_dir / "scanner.log"
     if not scanner_log.exists():
@@ -630,6 +679,7 @@ def export_review_package(
         chop_records=chop_mode,
         missed_entry_records=missed_clean_entry,
         openai_records=openai_formatter,
+        liquidity_sweep_records=liquidity_sweeps,
     )
     summary_path = package_dir / "review_summary.md"
     summary_path.write_text(summary, encoding="utf-8")

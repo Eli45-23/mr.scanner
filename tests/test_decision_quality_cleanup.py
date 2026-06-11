@@ -38,9 +38,27 @@ class ChopModeTests(unittest.TestCase):
         self.assertEqual(result["chop_mode_type"], "mixed_overload")
 
     def test_supply_demand_range_activates_chop(self) -> None:
-        result = evaluate_chop_mode([], {"chop_range_detected": True, "range_low": 290.2, "range_high": 291.4}, now=NOW)
+        result = evaluate_chop_mode(
+            [],
+            {"chop_range_detected": True, "range_low": 290.2, "range_high": 291.4},
+            [{"timestamp": NOW.isoformat(), "sweep_status": "SWEEP_WATCH", "inside_chop_range": True}],
+            now=NOW,
+        )
         self.assertEqual(result["chop_mode_type"], "supply_demand_range")
         self.assertEqual(result["range_low"], 290.2)
+        self.assertTrue(result["sweep_risk_active"])
+        self.assertIn("fake breaks/sweeps", result["sweep_risk_reason"])
+
+    def test_repeated_sweeps_inside_range_strengthen_chop(self) -> None:
+        sweeps = [
+            {"timestamp": (NOW - timedelta(minutes=4)).isoformat(), "sweep_status": "SWEEP_CONFIRMED", "inside_chop_range": True},
+            {"timestamp": (NOW - timedelta(minutes=1)).isoformat(), "sweep_status": "SWEEP_FORMING", "inside_chop_range": True},
+        ]
+        result = evaluate_chop_mode([], {}, sweeps, now=NOW)
+        self.assertTrue(result["chop_mode_active"])
+        self.assertEqual(result["chop_mode_type"], "liquidity_sweep_range")
+        self.assertEqual(result["recent_sweep_count"], 2)
+        self.assertFalse(result["can_approve_trades"])
 
     def test_clean_breakout_can_exit_but_not_approve(self) -> None:
         chop = {"chop_mode_active": True, "range_low": 290.2, "range_high": 291.4}
@@ -152,6 +170,121 @@ class ScannerDecisionIntegrationTests(unittest.TestCase):
         message = scanner.professional_telegram_message(alert, "PHASE3_HEADS_UP")
         self.assertIn("Structure: AAPL is between 5m demand near 290.26 and 5m supply near 291.40", message)
         self.assertEqual(message.count("5m demand"), 1)
+
+    def test_bullish_chase_near_supply_is_downgraded_by_sweep_risk(self) -> None:
+        app = self.make_scanner()
+        alert = self.make_alert(
+            direction="BULLISH",
+            scenario_direction="BULLISH",
+            setup_name="Bullish Trend Continuation",
+            scenario_levels={},
+            volume_label="STRONG",
+            market_alignment="ALIGNED",
+        )
+        structure = {
+            "chop_range_detected": True,
+            "structure_warning": "near supply inside chop range",
+            "current_price_location_summary": "AAPL is trapped between demand and supply",
+        }
+        sweep = {
+            "timestamp": NOW.isoformat(),
+            "sweep_status": "SWEEP_WATCH",
+            "sweep_direction": "ABOVE_LEVEL",
+            "trap_bias": "BEARISH",
+            "inside_chop_range": True,
+            "nearest_upside_sweep_zone": {"zone_low": 291.4, "zone_high": 291.58},
+        }
+        with (
+            patch.object(app, "latest_market_structure", return_value=structure),
+            patch.object(app, "recent_liquidity_sweeps", return_value=[sweep]),
+        ):
+            app.apply_market_structure_decision_quality(alert)
+        self.assertTrue(alert.downgraded_by_liquidity_sweep)
+        self.assertEqual(alert.risk_label, "DO_NOT_CHASE")
+        self.assertFalse(alert.sms_allowed)
+        self.assertIn("near supply", alert.liquidity_sweep_downgrade_reason)
+
+    def test_confirmed_downside_sweep_downgrades_bearish_continuation_only(self) -> None:
+        app = self.make_scanner()
+        alert = self.make_alert(
+            setup_name="Bearish Trend Continuation",
+            scenario_levels={},
+            volume_label="STRONG",
+            market_alignment="ALIGNED",
+        )
+        sweep = {
+            "timestamp": NOW.isoformat(),
+            "sweep_status": "SWEEP_CONFIRMED",
+            "sweep_direction": "BELOW_LEVEL",
+            "trap_bias": "BULLISH",
+            "reason": "Price reclaimed demand after sweeping below.",
+        }
+        with (
+            patch.object(app, "latest_market_structure", return_value={}),
+            patch.object(app, "recent_liquidity_sweeps", return_value=[sweep]),
+        ):
+            app.apply_market_structure_decision_quality(alert)
+        self.assertTrue(alert.downgraded_by_liquidity_sweep)
+        self.assertEqual(alert.sweep_trap_bias, "BULLISH")
+        self.assertFalse(alert.sms_allowed)
+        self.assertIn("requires loss and hold", alert.liquidity_sweep_downgrade_reason)
+
+    def test_bearish_chase_near_demand_is_downgraded_by_sweep_risk(self) -> None:
+        app = self.make_scanner()
+        alert = self.make_alert(
+            setup_name="Bearish Pullback Rejecting",
+            scenario_levels={},
+            volume_label="STRONG",
+            market_alignment="ALIGNED",
+        )
+        structure = {
+            "chop_range_detected": True,
+            "structure_warning": "near demand inside chop range",
+            "current_price_location_summary": "AAPL is trapped between demand and supply",
+        }
+        sweep = {
+            "timestamp": NOW.isoformat(),
+            "sweep_status": "SWEEP_WATCH",
+            "sweep_direction": "BELOW_LEVEL",
+            "trap_bias": "BULLISH",
+            "inside_chop_range": True,
+            "nearest_downside_sweep_zone": {"zone_low": 290.05, "zone_high": 290.26},
+        }
+        with (
+            patch.object(app, "latest_market_structure", return_value=structure),
+            patch.object(app, "recent_liquidity_sweeps", return_value=[sweep]),
+        ):
+            app.apply_market_structure_decision_quality(alert)
+        self.assertTrue(alert.downgraded_by_liquidity_sweep)
+        self.assertFalse(alert.sms_allowed)
+        self.assertIn("near demand", alert.liquidity_sweep_downgrade_reason)
+
+    def test_confirmed_upside_sweep_downgrades_bullish_continuation_only(self) -> None:
+        app = self.make_scanner()
+        alert = self.make_alert(
+            direction="BULLISH",
+            scenario_direction="BULLISH",
+            setup_name="Bullish Trend Continuation",
+            scenario_levels={},
+            volume_label="STRONG",
+            market_alignment="ALIGNED",
+        )
+        sweep = {
+            "timestamp": NOW.isoformat(),
+            "sweep_status": "SWEEP_CONFIRMED",
+            "sweep_direction": "ABOVE_LEVEL",
+            "trap_bias": "BEARISH",
+            "reason": "Price rejected after sweeping above supply.",
+        }
+        with (
+            patch.object(app, "latest_market_structure", return_value={}),
+            patch.object(app, "recent_liquidity_sweeps", return_value=[sweep]),
+        ):
+            app.apply_market_structure_decision_quality(alert)
+        self.assertTrue(alert.downgraded_by_liquidity_sweep)
+        self.assertEqual(alert.sweep_trap_bias, "BEARISH")
+        self.assertFalse(alert.sms_allowed)
+        self.assertIn("requires reclaim and hold", alert.liquidity_sweep_downgrade_reason)
 
 
 if __name__ == "__main__":

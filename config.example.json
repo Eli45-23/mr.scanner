@@ -68,6 +68,28 @@
     "missed_clean_entry_lookback_minutes": 15,
     "missed_clean_entry_cooldown_minutes": 15
   },
+  "liquidity_sweep_engine": {
+    "enabled": true,
+    "timeframes": ["1m", "5m", "15m"],
+    "min_confidence": 55,
+    "confirm_on_candle_close": true,
+    "watch_distance_bps": 8,
+    "cooldown_minutes": 10,
+    "use_supply_demand": true,
+    "use_support_resistance": true,
+    "can_confirm": true,
+    "can_downgrade": true,
+    "can_upgrade": false,
+    "telegram_enabled": true,
+    "telegram_watch_enabled": true,
+    "telegram_forming_enabled": true,
+    "telegram_confirmed_enabled": true,
+    "telegram_min_confidence": 55,
+    "telegram_confirmed_min_confidence": 65,
+    "telegram_cooldown_minutes": 10,
+    "telegram_max_chars": 900,
+    "telegram_include_structure": true
+  },
   "alert_quality": {
     "sms_symbol_cooldown_seconds": 1200,
     "watch_symbol_cooldown_seconds": 600,

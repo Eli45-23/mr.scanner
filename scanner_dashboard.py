@@ -23,6 +23,10 @@ from zoneinfo import ZoneInfo
 import elite_momentum_scanner as scanner_app
 import requests
 from tools import dashboard_snapshot_exporter as snapshot_exporter
+from tools.preview_liquidity_sweeps import (
+    build_liquidity_sweep_preview,
+    write_log as write_liquidity_sweep_log,
+)
 from tools.preview_market_structure import build_market_structure, write_logs as write_market_structure_logs
 
 APP_DIR = Path(__file__).resolve().parent
@@ -33,6 +37,7 @@ MARKET_STRUCTURE_LOG_PATHS = {
     "supply_demand": APP_DIR / "logs" / "supply_demand_zones.jsonl",
     "summary": APP_DIR / "logs" / "market_structure.jsonl",
 }
+LIQUIDITY_SWEEP_LOG_PATH = APP_DIR / "logs" / "liquidity_sweeps.jsonl"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -190,6 +195,130 @@ def load_market_structure_dashboard(
     }
 
 
+def _sweep_zone_text(candidate: Any) -> str:
+    if not isinstance(candidate, dict):
+        return "Not enough clean data yet"
+    low, high, level = candidate.get("zone_low"), candidate.get("zone_high"), candidate.get("level")
+    if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+        return f"{low:.2f}-{high:.2f}"
+    if isinstance(level, (int, float)):
+        return f"{level:.2f}"
+    return "Not enough clean data yet"
+
+
+def _liquidity_sweep_copy_block(payload: Dict[str, Any]) -> str:
+    upside = payload.get("upside_sweep_zone")
+    downside = payload.get("downside_sweep_zone")
+    event = payload.get("current_event") if isinstance(payload.get("current_event"), dict) else {}
+    status = str(payload.get("status") or "NO_ACTIVE_SWEEP").replace("_", " ").title()
+    lines = [
+        "Liquidity Sweep Notes:",
+        f"Upside sweep zone: {_sweep_zone_text(upside)}, {str((upside or {}).get('source') or 'not enough clean data yet').replace('_', ' ')}.",
+        f"Downside sweep zone: {_sweep_zone_text(downside)}, {str((downside or {}).get('source') or 'not enough clean data yet').replace('_', ' ')}.",
+        f"Current status: {status}.",
+    ]
+    if payload.get("status") == "SWEEP_CONFIRMED":
+        lines.extend([
+            str(event.get("meaning") or "A possible liquidity trap is confirmed."),
+            f"Wait for: {event.get('wait_for') or 'Manual confirmation.'}",
+            f"Invalidation: {event.get('invalidation') or 'Unavailable.'}",
+        ])
+    else:
+        lines.append("Watch for fake break above supply or fake break below demand.")
+    return "\n".join(lines)
+
+
+def _liquidity_sweep_context_summary(payload: Dict[str, Any]) -> str:
+    event = payload.get("current_event") if isinstance(payload.get("current_event"), dict) else {}
+    status = str(payload.get("status") or "NO_ACTIVE_SWEEP").upper()
+    direction = str(event.get("sweep_direction") or "").upper()
+    if status == "SWEEP_CONFIRMED" and direction == "ABOVE_LEVEL":
+        return "Confirmed upside sweep: buyers may be trapped."
+    if status == "SWEEP_CONFIRMED" and direction == "BELOW_LEVEL":
+        return "Confirmed downside sweep: sellers may be trapped."
+    if event.get("inside_chop_range") and payload.get("upside_sweep_zone") and payload.get("downside_sweep_zone"):
+        return "Inside range; upside sweep risk near supply and downside sweep risk near demand."
+    if event.get("inside_chop_range") and payload.get("upside_sweep_zone"):
+        return "Inside range; upside sweep risk near supply."
+    if event.get("inside_chop_range") and payload.get("downside_sweep_zone"):
+        return "Inside range; downside sweep risk near demand."
+    return "No active sweep."
+
+
+def load_liquidity_sweep_dashboard(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    path: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    config = config or scanner_app.load_config(STATE.config_path)
+    enabled = bool(config.get("liquidity_sweep_engine", {}).get("enabled", True))
+    empty = {
+        "symbol": "AAPL",
+        "current_price": None,
+        "status": "NO_ACTIVE_SWEEP",
+        "status_label": "No active sweep",
+        "sweep_bias": "NEUTRAL",
+        "sweep_bias_label": "Neutral",
+        "upside_sweep_zone": None,
+        "downside_sweep_zone": None,
+        "current_event": {},
+        "recent_events": [],
+        "copy_block": "Not enough liquidity sweep data yet.",
+        "context_summary": "No active sweep.",
+        "source": "unavailable",
+        "updated_at": None,
+        "message": "Not enough liquidity sweep data yet.",
+        "enabled": enabled,
+        "context_only": True,
+        "can_approve_trades": False,
+    }
+    if not enabled:
+        return {**empty, "source": "disabled", "message": "Liquidity sweep engine is disabled."}
+    records = [
+        record for record in _read_jsonl_records(path or LIQUIDITY_SWEEP_LOG_PATH)
+        if str(record.get("symbol") or "").upper() == "AAPL"
+    ]
+    if not records:
+        return empty
+    latest = records[-1]
+    status = str(latest.get("sweep_status") or "NO_ACTIVE_SWEEP").upper()
+    trap_bias = str(latest.get("trap_bias") or "NEUTRAL").upper()
+    status_labels = {
+        "NO_ACTIVE_SWEEP": "No active sweep",
+        "SWEEP_WATCH": "Sweep watch",
+        "SWEEP_FORMING": "Sweep forming",
+        "SWEEP_CONFIRMED": "Sweep confirmed",
+        "SWEEP_FAILED_HELD": "Sweep failed / held",
+    }
+    bias_labels = {
+        "BEARISH": "Buyer trap risk / bearish trap",
+        "BULLISH": "Seller trap risk / bullish trap",
+        "NEUTRAL": "Neutral",
+    }
+    payload = {
+        **empty,
+        "current_price": latest.get("current_price"),
+        "status": status,
+        "status_label": status_labels.get(status, status.replace("_", " ").title()),
+        "sweep_bias": trap_bias,
+        "sweep_bias_label": bias_labels.get(trap_bias, "Neutral"),
+        "upside_sweep_zone": latest.get("nearest_upside_sweep_zone"),
+        "downside_sweep_zone": latest.get("nearest_downside_sweep_zone"),
+        "current_event": latest,
+        "recent_events": list(reversed(records[-20:])),
+        "source": "log_fallback",
+        "updated_at": latest.get("timestamp"),
+        "message": "Latest liquidity sweep log data",
+    }
+    payload["copy_block"] = _liquidity_sweep_copy_block(payload)
+    payload["context_summary"] = _liquidity_sweep_context_summary(payload)
+    if _market_session_label(now).startswith("After-hours"):
+        payload["source"] = "after_hours_limited"
+        payload["message"] = "After-hours / limited liquidity sweep reads"
+    return payload
+
+
 class DashboardState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -208,7 +337,10 @@ class DashboardState:
         self.stop_event = threading.Event()
         self.config_path: Optional[Path] = None
         self.market_structure_live: Optional[Dict[str, Any]] = None
+        self.market_structure_engine_live: Optional[Dict[str, Any]] = None
         self.market_structure_updated_monotonic = 0.0
+        self.liquidity_sweep_live: Optional[Dict[str, Any]] = None
+        self.liquidity_sweep_updated_monotonic = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
         config = scanner_app.load_config(self.config_path)
@@ -219,7 +351,11 @@ class DashboardState:
             live_structure = self.market_structure_live
         fallback_structure = live_structure or load_market_structure_dashboard(config)
         with self.lock:
+            live_sweeps = self.liquidity_sweep_live
+        fallback_sweeps = live_sweeps or load_liquidity_sweep_dashboard(config)
+        with self.lock:
             market_structure = dict(self.market_structure_live or fallback_structure)
+            liquidity_sweeps = dict(self.liquidity_sweep_live or fallback_sweeps)
             if _market_session_label().startswith("After-hours") and market_structure.get("last_updated"):
                 market_structure["data_mode"] = "After-hours / limited structure"
                 market_structure["message"] = "After-hours / limited structure"
@@ -249,6 +385,7 @@ class DashboardState:
                 "notification_status": notification_status,
                 "scanner_identity": scanner_identity,
                 "market_structure": market_structure,
+                "liquidity_sweeps": liquidity_sweeps,
             }
 
 
@@ -298,7 +435,51 @@ def refresh_live_market_structure(
     dashboard_payload["message"] = "Live scanner candle data"
     with STATE.lock:
         STATE.market_structure_live = dashboard_payload
+        STATE.market_structure_engine_live = payload
         STATE.market_structure_updated_monotonic = current_monotonic
+    return dashboard_payload
+
+
+def refresh_live_liquidity_sweeps(
+    snapshots: Dict[str, scanner_app.SymbolSnapshot],
+    config: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    settings = config.get("liquidity_sweep_engine", {})
+    if not settings.get("enabled", True):
+        return None
+    refresh_seconds = max(1, int(config.get("market_structure_engines", {}).get("refresh_seconds", 15)))
+    current_monotonic = time.monotonic()
+    with STATE.lock:
+        if (
+            not force
+            and STATE.liquidity_sweep_live
+            and current_monotonic - STATE.liquidity_sweep_updated_monotonic < refresh_seconds
+        ):
+            return STATE.liquidity_sweep_live
+    snap = snapshots.get("AAPL")
+    if not snap or not snap.recent_bars:
+        return None
+    with STATE.lock:
+        market_structure = STATE.market_structure_engine_live
+    payload = build_liquidity_sweep_preview(
+        "AAPL",
+        snap.recent_bars,
+        daily_bars=snap.daily_bars,
+        config=config,
+        market_structure=market_structure,
+    )
+    write_liquidity_sweep_log(payload, config)
+    dashboard_payload = load_liquidity_sweep_dashboard(config)
+    dashboard_payload["source"] = "live"
+    dashboard_payload["message"] = "Live scanner candle data"
+    if _market_session_label().startswith("After-hours"):
+        dashboard_payload["source"] = "after_hours_limited"
+        dashboard_payload["message"] = "After-hours / limited liquidity sweep reads"
+    with STATE.lock:
+        STATE.liquidity_sweep_live = dashboard_payload
+        STATE.liquidity_sweep_updated_monotonic = current_monotonic
     return dashboard_payload
 
 
@@ -1374,6 +1555,10 @@ def scan_once(app: scanner_app.EliteScanner, source_map: Dict[str, str]) -> tupl
         refresh_live_market_structure(snapshots, app.config)
     except Exception as exc:
         logger.warning("Market-structure dashboard refresh failed without affecting scanner alerts: %s", exc)
+    try:
+        refresh_live_liquidity_sweeps(snapshots, app.config)
+    except Exception as exc:
+        logger.warning("Liquidity-sweep dashboard refresh failed without affecting scanner alerts: %s", exc)
     market_context = app.build_market_context(snapshots)
     market_bars = {
         symbol: snap.recent_bars
@@ -1478,7 +1663,10 @@ def clear_dashboard_data() -> Dict[str, Any]:
         STATE.last_discovery_count = 0
         STATE.symbol_rows = []
         STATE.market_structure_live = None
+        STATE.market_structure_engine_live = None
         STATE.market_structure_updated_monotonic = 0.0
+        STATE.liquidity_sweep_live = None
+        STATE.liquidity_sweep_updated_monotonic = 0.0
 
     csv_path = Path(config["outputs"]["csv_log"])
     jsonl_path = Path(config["outputs"]["jsonl_log"])
@@ -2119,6 +2307,13 @@ INDEX_HTML = r"""<!doctype html>
       </section>
       <section>
         <div class="table-head">
+          <h2>Liquidity Sweep Zones</h2>
+          <span class="muted" id="liquiditySweepUpdated">Waiting for data</span>
+        </div>
+        <div class="structure-body" id="liquiditySweepZones"></div>
+      </section>
+      <section>
+        <div class="table-head">
           <h2>Market View</h2>
           <span class="muted" id="lastScan">No scan yet</span>
         </div>
@@ -2179,6 +2374,8 @@ INDEX_HTML = r"""<!doctype html>
       alerts: document.getElementById('alerts'),
       liveMarketStructure: document.getElementById('liveMarketStructure'),
       marketStructureUpdated: document.getElementById('marketStructureUpdated'),
+      liquiditySweepZones: document.getElementById('liquiditySweepZones'),
+      liquiditySweepUpdated: document.getElementById('liquiditySweepUpdated'),
     };
 
     async function api(path, options = {}) {
@@ -2364,6 +2561,61 @@ INDEX_HTML = r"""<!doctype html>
         <div>
           <h3>Copy Levels</h3>
           <pre class="copy-levels">${esc(structureValue(data.copy_summary))}</pre>
+        </div>
+      `;
+    }
+
+    function renderSweepZone(candidate) {
+      if (!candidate || !Object.keys(candidate).length) return 'Not enough clean data yet';
+      const zone = candidate.zone_low !== null && candidate.zone_low !== undefined
+        ? `${structureMoney(candidate.zone_low)}-${structureMoney(candidate.zone_high)}`
+        : structureMoney(candidate.level);
+      const quality = candidate.strength || candidate.related_zone?.strength || '';
+      return `${zone} | ${structureValue(candidate.source)} | ${structureValue(candidate.timeframe)}${quality ? ` | ${quality}` : ''}`;
+    }
+
+    function renderLiquiditySweeps(data) {
+      const event = data.current_event || {};
+      const recent = data.recent_events || [];
+      els.liquiditySweepUpdated.textContent = data.updated_at ? `Last updated ${fmtTime(data.updated_at)}` : 'Waiting for data';
+      if (!data.enabled || !data.updated_at) {
+        els.liquiditySweepZones.innerHTML = `<div class="empty">${esc(data.message || 'Not enough liquidity sweep data yet.')}</div>`;
+        return;
+      }
+      els.liquiditySweepZones.innerHTML = `
+        <div class="structure-status">
+          <div><span class="label">Current Liquidity Status</span><div><strong>${esc(structureValue(data.status_label))}</strong></div></div>
+          <div><span class="label">Sweep Bias</span><div><strong>${esc(structureValue(data.sweep_bias_label))}</strong></div></div>
+          <div><span class="label">Sweep Context</span><div><strong>${esc(structureValue(data.context_summary))}</strong></div></div>
+          <div><span class="label">Confidence</span><div><strong>${esc(structureValue(event.confidence))} ${esc(structureValue(event.score))}</strong></div></div>
+          <div><span class="label">Data Source</span><div><strong>${esc(structureValue(data.source))}</strong></div></div>
+        </div>
+        <div class="structure-summary">
+          <div class="structure-wide"><span class="label">Nearest Upside Sweep Zone</span><div><strong>${esc(renderSweepZone(data.upside_sweep_zone))}</strong></div></div>
+          <div class="structure-wide"><span class="label">Nearest Downside Sweep Zone</span><div><strong>${esc(renderSweepZone(data.downside_sweep_zone))}</strong></div></div>
+          <div class="structure-wide"><span class="label">Current Sweep Event</span><div><strong>${esc(structureValue(event.reason))}</strong></div></div>
+          <div><span class="label">Meaning</span><div>${esc(structureValue(event.meaning))}</div></div>
+          <div><span class="label">Wait For</span><div>${esc(structureValue(event.wait_for))}</div></div>
+          <div class="structure-wide"><span class="label">Invalidation</span><div>${esc(structureValue(event.invalidation))}</div></div>
+        </div>
+        <div class="structure-table">
+          <h3>Recent Sweep Events</h3>
+          ${recent.length ? `<table>
+            <thead><tr><th>Time</th><th>Type</th><th>Level / Zone</th><th>Source</th><th>Status</th><th>Confidence</th><th>Result / Meaning</th></tr></thead>
+            <tbody>${recent.map((item) => `<tr>
+              <td>${esc(fmtTime(item.timestamp))}</td>
+              <td>${esc(item.sweep_direction || 'NONE')}</td>
+              <td>${esc(item.sweep_zone_low !== null && item.sweep_zone_low !== undefined ? `${structureMoney(item.sweep_zone_low)}-${structureMoney(item.sweep_zone_high)}` : structureMoney(item.sweep_level))}</td>
+              <td>${esc(structureValue(item.level_source))}</td>
+              <td>${esc(structureValue(item.sweep_status))}</td>
+              <td>${esc(structureValue(item.confidence))} ${esc(structureValue(item.score))}</td>
+              <td>${esc(structureValue(item.meaning))}</td>
+            </tr>`).join('')}</tbody>
+          </table>` : '<div class="empty">No recent sweep events yet</div>'}
+        </div>
+        <div>
+          <h3>Copy Liquidity Sweep Notes</h3>
+          <pre class="copy-levels">${esc(structureValue(data.copy_block))}</pre>
         </div>
       `;
     }
@@ -2610,6 +2862,7 @@ INDEX_HTML = r"""<!doctype html>
       renderScannerIdentityStatus(data.scanner_identity || {}, data.market_data_status || {});
       renderNotificationStatus(data.notification_status || {});
       renderLiveMarketStructure(data.market_structure || {});
+      renderLiquiditySweeps(data.liquidity_sweeps || {});
     }
 
     function renderScannerIdentityStatus(identity, market) {
@@ -2964,6 +3217,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"alerts": load_alerts(limit=limit)})
             elif parsed.path == "/api/symbols":
                 self.send_json({"symbols": load_symbol_rows()})
+            elif parsed.path == "/api/liquidity-sweeps":
+                self.send_json(STATE.snapshot().get("liquidity_sweeps", {}))
             elif parsed.path == "/api/alpaca-health":
                 force_refresh = parse_qs(parsed.query).get("force_refresh", ["false"])[0].lower() == "true"
                 self.send_json(alpaca_health_check(force_refresh=force_refresh))
@@ -3444,6 +3699,149 @@ def run_tests() -> int:
             self.assertEqual(result["message"], "Live scanner candle data")
             self.assertTrue(result["context_only"])
             self.assertFalse(result["can_upgrade"])
+            build.assert_called_once()
+            write.assert_called_once()
+
+        def test_liquidity_sweep_dashboard_reads_log_fallback_and_renders_sections(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "liquidity_sweeps.jsonl"
+                timestamp = "2026-06-10T20:05:00+00:00"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": "AAPL",
+                            "current_price": 291.32,
+                            "sweep_status": "SWEEP_CONFIRMED",
+                            "sweep_direction": "ABOVE_LEVEL",
+                            "trap_bias": "BEARISH",
+                            "sweep_level": 291.58,
+                            "sweep_zone_low": 291.40,
+                            "sweep_zone_high": 291.58,
+                            "level_source": "5m_supply",
+                            "timeframe": "5m",
+                            "confidence": "HIGH",
+                            "score": 88,
+                            "reason": "Price broke above 5m supply and closed back below.",
+                            "meaning": "Buyers may be trapped above the level.",
+                            "wait_for": "Failed reclaim or lower high.",
+                            "invalidation": "Clean reclaim and hold above 291.40-291.58.",
+                            "nearest_upside_sweep_zone": {
+                                "zone_low": 291.40,
+                                "zone_high": 291.58,
+                                "source": "5m_supply",
+                                "timeframe": "5m",
+                                "related_zone": {"strength": "HIGH"},
+                            },
+                            "nearest_downside_sweep_zone": {
+                                "zone_low": 290.05,
+                                "zone_high": 290.26,
+                                "source": "5m_demand",
+                                "timeframe": "5m",
+                                "related_zone": {"strength": "HIGH"},
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload = load_liquidity_sweep_dashboard(
+                    scanner_app.load_config(None),
+                    path=path,
+                    now=datetime(2026, 6, 10, 20, 5, tzinfo=timezone.utc),
+                )
+            self.assertEqual(payload["status_label"], "Sweep confirmed")
+            self.assertEqual(payload["sweep_bias_label"], "Buyer trap risk / bearish trap")
+            self.assertEqual(payload["upside_sweep_zone"]["zone_high"], 291.58)
+            self.assertEqual(payload["downside_sweep_zone"]["zone_low"], 290.05)
+            self.assertIn("Buyers may be trapped", payload["copy_block"])
+            self.assertEqual(payload["context_summary"], "Confirmed upside sweep: buyers may be trapped.")
+            self.assertEqual(len(payload["recent_events"]), 1)
+            self.assertFalse(payload["can_approve_trades"])
+
+            for text in (
+                "Liquidity Sweep Zones",
+                "renderLiquiditySweeps",
+                "Nearest Upside Sweep Zone",
+                "Nearest Downside Sweep Zone",
+                "Current Sweep Event",
+                "Sweep Context",
+                "Recent Sweep Events",
+                "Copy Liquidity Sweep Notes",
+                "/api/liquidity-sweeps",
+            ):
+                self.assertIn(text, INDEX_HTML if not text.startswith("/") else Path(__file__).read_text(encoding="utf-8"))
+
+        def test_liquidity_sweep_dashboard_handles_downside_after_hours_and_missing_data(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                path = root / "liquidity_sweeps.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-06-10T22:05:00+00:00",
+                            "symbol": "AAPL",
+                            "current_price": 290.34,
+                            "sweep_status": "SWEEP_CONFIRMED",
+                            "sweep_direction": "BELOW_LEVEL",
+                            "trap_bias": "BULLISH",
+                            "confidence": "HIGH",
+                            "score": 84,
+                            "meaning": "Sellers may be trapped below the level.",
+                            "wait_for": "Reclaim hold or higher low.",
+                            "invalidation": "Clean loss and hold below 290.05-290.26.",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload = load_liquidity_sweep_dashboard(
+                    scanner_app.load_config(None),
+                    path=path,
+                    now=datetime(2026, 6, 10, 23, 0, tzinfo=timezone.utc),
+                )
+                missing = load_liquidity_sweep_dashboard(
+                    scanner_app.load_config(None),
+                    path=root / "missing.jsonl",
+                )
+                malformed_path = root / "malformed.jsonl"
+                malformed_path.write_text("not-json\n", encoding="utf-8")
+                malformed = load_liquidity_sweep_dashboard(
+                    scanner_app.load_config(None),
+                    path=malformed_path,
+                )
+            self.assertEqual(payload["sweep_bias_label"], "Seller trap risk / bullish trap")
+            self.assertEqual(payload["source"], "after_hours_limited")
+            self.assertIn("After-hours", payload["message"])
+            self.assertEqual(missing["message"], "Not enough liquidity sweep data yet.")
+            self.assertEqual(malformed["message"], "Not enough liquidity sweep data yet.")
+
+        def test_live_liquidity_sweep_refresh_reuses_aapl_snapshot_without_alert_changes(self) -> None:
+            config = scanner_app.load_config(None)
+            now = scanner_app.now_utc()
+            bars = [
+                scanner_app.Bar(t=now - timedelta(minutes=20 - index), o=100, h=100.2, l=99.8, c=100.0, v=100000)
+                for index in range(21)
+            ]
+            snapshots = {"AAPL": scanner_app.SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)}
+            live_payload = {"symbol": "AAPL", "timestamp": now.isoformat(), "sweep_status": "SWEEP_WATCH"}
+            dashboard_payload = {
+                "updated_at": now.isoformat(),
+                "source": "log_fallback",
+                "message": "Latest liquidity sweep log data",
+                "context_only": True,
+                "can_approve_trades": False,
+            }
+            with (
+                mock.patch.object(sys.modules[__name__], "build_liquidity_sweep_preview", return_value=live_payload) as build,
+                mock.patch.object(sys.modules[__name__], "write_liquidity_sweep_log") as write,
+                mock.patch.object(sys.modules[__name__], "load_liquidity_sweep_dashboard", return_value=dashboard_payload),
+            ):
+                with STATE.lock:
+                    STATE.liquidity_sweep_live = None
+                    STATE.liquidity_sweep_updated_monotonic = 0.0
+                result = refresh_live_liquidity_sweeps(snapshots, config, force=True)
+            self.assertIn(result["source"], {"live", "after_hours_limited"})
+            self.assertTrue(result["context_only"])
+            self.assertFalse(result["can_approve_trades"])
             build.assert_called_once()
             write.assert_called_once()
 

@@ -68,6 +68,13 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 import requests
 from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
 from scanner.chop_mode_engine import clean_breakout_exits_chop, evaluate_chop_mode
+from scanner.liquidity_sweep_telegram import (
+    append_sweep_telegram_log,
+    claim_sweep_delivery,
+    select_liquidity_sweep_message,
+    sweep_telegram_eligibility,
+    validate_liquidity_sweep_message,
+)
 from scanner.missed_clean_entry import detect_missed_clean_entry
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
@@ -93,6 +100,7 @@ CHOP_MODE_LOG = LOG_DIR / "chop_mode.jsonl"
 MISSED_CLEAN_ENTRY_LOG = LOG_DIR / "missed_clean_entry.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
+LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE = STATE_DIR / "liquidity_sweep_telegram_dedupe.json"
 
 logger = logging.getLogger("elite_scanner")
 logging.basicConfig(
@@ -216,6 +224,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_missed_clean_entry_label": True,
         "missed_clean_entry_lookback_minutes": 15,
         "missed_clean_entry_cooldown_minutes": 15,
+    },
+    "liquidity_sweep_engine": {
+        "enabled": True,
+        "timeframes": ["1m", "5m", "15m"],
+        "min_confidence": 55,
+        "confirm_on_candle_close": True,
+        "watch_distance_bps": 8,
+        "cooldown_minutes": 10,
+        "use_supply_demand": True,
+        "use_support_resistance": True,
+        "can_confirm": True,
+        "can_downgrade": True,
+        "can_upgrade": False,
+        "telegram_enabled": True,
+        "telegram_watch_enabled": True,
+        "telegram_forming_enabled": True,
+        "telegram_confirmed_enabled": True,
+        "telegram_min_confidence": 55,
+        "telegram_confirmed_min_confidence": 65,
+        "telegram_cooldown_minutes": 10,
+        "telegram_max_chars": 900,
+        "telegram_include_structure": True,
     },
     "market_data": {
         "stock_feed": "sip",
@@ -800,6 +830,15 @@ class Alert:
     bearish_confirmation_reason: Optional[str] = None
     bearish_downgraded_by_structure: bool = False
     bearish_downgrade_reason: Optional[str] = None
+    sweep_risk_active: bool = False
+    upside_sweep_zone: Optional[Dict[str, Any]] = None
+    downside_sweep_zone: Optional[Dict[str, Any]] = None
+    recent_sweep_count: int = 0
+    sweep_risk_reason: Optional[str] = None
+    downgraded_by_liquidity_sweep: bool = False
+    liquidity_sweep_downgrade_reason: Optional[str] = None
+    liquidity_sweep_context: Optional[str] = None
+    sweep_trap_bias: Optional[str] = None
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -2043,6 +2082,11 @@ class AlertWriter:
                 "suppressed_setup": alert.setup_name if alert.suppressed_by_chop else None,
                 "exit_condition_met": not alert.chop_mode_active,
                 "market_structure_summary": alert.market_structure_summary,
+                "sweep_risk_active": alert.sweep_risk_active,
+                "upside_sweep_zone": alert.upside_sweep_zone,
+                "downside_sweep_zone": alert.downside_sweep_zone,
+                "recent_sweep_count": alert.recent_sweep_count,
+                "sweep_risk_reason": alert.sweep_risk_reason,
                 "git_commit": git_value("rev-parse", "--short", "HEAD"),
             },
         )
@@ -4244,6 +4288,26 @@ class EliteScanner:
             return {}
         return {}
 
+    def recent_liquidity_sweeps(self, now: datetime, minutes: int = 15) -> List[Dict[str, Any]]:
+        path = LOG_DIR / "liquidity_sweeps.jsonl"
+        if not path.exists():
+            return []
+        cutoff = now - timedelta(minutes=minutes)
+        records: List[Dict[str, Any]] = []
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]:
+                record = json.loads(line)
+                if str(record.get("symbol") or "").upper() != "AAPL":
+                    continue
+                timestamp = datetime.fromisoformat(str(record.get("timestamp")))
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+                if timestamp >= cutoff:
+                    records.append(record)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return []
+        return records
+
     def apply_market_structure_decision_quality(self, alert: Alert) -> None:
         structure_record = self.latest_market_structure()
         structure = structure_record.get("summary") if isinstance(structure_record.get("summary"), dict) else structure_record
@@ -4256,9 +4320,14 @@ class EliteScanner:
         alert.market_structure_near_supply = "near supply" in warning
 
         decision_config = self.config.get("decision_quality", {})
+        sweep_records = self.recent_liquidity_sweeps(
+            alert.timestamp,
+            int(decision_config.get("chop_mode_lookback_minutes", 15)),
+        )
         chop = evaluate_chop_mode(
             self.decision_history,
             structure_record,
+            sweep_records,
             now=alert.timestamp,
             lookback_minutes=int(decision_config.get("chop_mode_lookback_minutes", 15)),
             min_flips=int(decision_config.get("chop_mode_min_flips", 2)),
@@ -4270,10 +4339,51 @@ class EliteScanner:
             alert.chop_mode_reason = chop["chop_mode_reason"] or None
             alert.chop_suppression_active = bool(chop["suppression_active"])
             alert.chop_suppression_reason = chop["suppression_reason"] or None
+            alert.sweep_risk_active = bool(chop.get("sweep_risk_active"))
+            alert.upside_sweep_zone = chop.get("upside_sweep_zone")
+            alert.downside_sweep_zone = chop.get("downside_sweep_zone")
+            alert.recent_sweep_count = int(chop.get("recent_sweep_count") or 0)
+            alert.sweep_risk_reason = chop.get("sweep_risk_reason") or None
 
         direction = str(alert.scenario_direction or alert.setup_direction or alert.direction or "").upper()
         setup_name = str(alert.setup_name or alert.primary_setup or (alert.scenario_top or {}).get("scenario_name") or "")
         stage = str(alert.scenario_stage or alert.setup_stage or (alert.scenario_top or {}).get("stage") or "").upper()
+        latest_sweep = sweep_records[-1] if sweep_records else {}
+        sweep_status = str(latest_sweep.get("sweep_status") or "").upper()
+        sweep_direction = str(latest_sweep.get("sweep_direction") or "").upper()
+        trap_bias = str(latest_sweep.get("trap_bias") or "NEUTRAL").upper()
+        near_supply = bool(alert.market_structure_near_supply or (alert.sweep_risk_active and alert.upside_sweep_zone))
+        near_demand = bool(alert.market_structure_near_demand or (alert.sweep_risk_active and alert.downside_sweep_zone))
+        bullish_continuation = direction == "BULLISH" and any(
+            token in setup_name.upper() for token in ("CONTINUATION", "BREAKOUT", "PULLBACK", "RECLAIM")
+        )
+        bearish_continuation = direction == "BEARISH" and any(
+            token in setup_name.upper() for token in ("CONTINUATION", "BREAKDOWN", "PULLBACK", "REJECTION")
+        )
+        sweep_downgrade_reason = ""
+        if bullish_continuation and near_supply and alert.sweep_risk_active:
+            sweep_downgrade_reason = "Bullish chase is risky near supply; upside liquidity sweep risk active."
+        elif bearish_continuation and near_demand and alert.sweep_risk_active:
+            sweep_downgrade_reason = "Bearish chase is risky near demand; downside liquidity sweep risk active."
+        if bullish_continuation and sweep_status == "SWEEP_CONFIRMED" and sweep_direction == "ABOVE_LEVEL":
+            sweep_downgrade_reason = "Confirmed upside sweep: bullish continuation requires reclaim and hold above the swept level."
+        elif bearish_continuation and sweep_status == "SWEEP_CONFIRMED" and sweep_direction == "BELOW_LEVEL":
+            sweep_downgrade_reason = "Confirmed downside sweep: bearish continuation requires loss and hold below the swept level."
+        if latest_sweep:
+            alert.sweep_trap_bias = trap_bias
+            alert.liquidity_sweep_context = str(latest_sweep.get("reason") or latest_sweep.get("meaning") or "")
+        if sweep_downgrade_reason:
+            alert.downgraded_by_liquidity_sweep = True
+            alert.liquidity_sweep_downgrade_reason = sweep_downgrade_reason
+            alert.sms_allowed = False
+            alert.scenario_would_sms = False if alert.scenario_would_sms is not None else None
+            alert.scenario_sms_allowed = False if alert.scenario_sms_allowed is not None else None
+            if alert.risk_label != "DO_NOT_CHASE":
+                alert.risk_label = "DO_NOT_CHASE"
+            alert.entry_quality_label = "DO_NOT_CHASE"
+            alert.do_not_chase_warning = True
+            if sweep_downgrade_reason not in alert.strategy_warnings:
+                alert.strategy_warnings.insert(0, sweep_downgrade_reason)
         if direction == "BEARISH" and ("PULLBACK" in setup_name.upper() or "REJECTION" in setup_name.upper()):
             reasons: List[str] = []
             vwap = alert.scenario_levels.get("vwap") if alert.scenario_levels else None
@@ -4367,6 +4477,89 @@ class EliteScanner:
             record for record in self.decision_history
             if datetime.fromisoformat(record["timestamp"]) >= cutoff
         ]
+
+    def process_liquidity_sweep_telegram(self, snap: SymbolSnapshot) -> bool:
+        settings = self.config.get("liquidity_sweep_engine", {})
+        notifications = self.config.get("notifications", {})
+        if not settings.get("enabled", True) or not settings.get("telegram_enabled", True):
+            return False
+        try:
+            from tools.preview_liquidity_sweeps import build_liquidity_sweep_preview
+
+            payload = build_liquidity_sweep_preview(
+                snap.symbol,
+                snap.recent_bars,
+                daily_bars=snap.daily_bars,
+                config=self.config,
+            )
+            if not settings.get("telegram_include_structure", True):
+                payload.pop("market_structure_summary", None)
+        except Exception as exc:
+            logger.warning("Liquidity sweep Telegram evaluation failed safely: %s", redact_notification_error(exc))
+            return False
+
+        eligible, reason, alert_type = sweep_telegram_eligibility(payload, self.config)
+        log_fields: Dict[str, Any] = {
+            "telegram_eligible": bool(eligible),
+            "telegram_sent": False,
+            "telegram_alert_type": alert_type,
+            "telegram_suppressed_reason": "" if eligible else reason,
+            "openai_formatter_used": False,
+            "openai_validation_passed": False,
+            "fallback_used": False,
+        }
+        if not eligible or not alert_type:
+            append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
+            return False
+        if not notifications.get("telegram_enabled", False):
+            log_fields["telegram_suppressed_reason"] = "global Telegram notifications disabled"
+            append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
+            return False
+
+        max_chars = int(settings.get("telegram_max_chars", 900))
+        rule_message, formatter_fields = select_liquidity_sweep_message(payload, max_chars=max_chars)
+        log_fields.update(formatter_fields)
+        valid, validation_reason = validate_liquidity_sweep_message(
+            payload,
+            rule_message,
+            rule_message=rule_message,
+            max_chars=max_chars,
+        )
+        if not valid:
+            log_fields["telegram_suppressed_reason"] = f"deterministic sweep message validation failed: {validation_reason}"
+            log_fields["fallback_used"] = True
+            append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
+            return False
+
+        allowed, dedupe_reason, _ = claim_sweep_delivery(
+            payload,
+            int(settings.get("telegram_cooldown_minutes", 10)),
+            LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE,
+        )
+        if not allowed:
+            log_fields["telegram_suppressed_reason"] = dedupe_reason
+            append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
+            return False
+
+        sent, error = send_telegram_message(
+            token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            message=rule_message,
+            timeout_seconds=int(notifications.get("telegram_timeout_seconds", 8)),
+            alert_type=alert_type,
+            alert_source="LIQUIDITY_SWEEP_ENGINE",
+            symbol="AAPL",
+            sms_sent=False,
+            alert_tier="CONTEXT",
+            alert_tier_reason="Liquidity sweep context cannot approve trades",
+            message_source_path="scanner.liquidity_sweep_telegram",
+            phone_conclusion="WATCH ONLY",
+            phone_conclusion_reason=str(payload.get("reason") or "Liquidity sweep context"),
+        )
+        log_fields["telegram_sent"] = bool(sent)
+        log_fields["telegram_suppressed_reason"] = "" if sent else error
+        append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
+        return bool(sent)
 
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
@@ -6673,6 +6866,8 @@ class EliteScanner:
             snap = snapshots.get(symbol)
             if not snap:
                 continue
+            if symbol == "AAPL":
+                self.process_liquidity_sweep_telegram(snap)
             for alert in self.evaluate_symbol(snap, market_context, market_bars):
                 if self.process_alert(alert):
                     count += 1
@@ -6896,6 +7091,60 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     )
     decision["missed_clean_entry_cooldown_minutes"] = env_int(
         "MISSED_CLEAN_ENTRY_COOLDOWN_MINUTES", int(decision.get("missed_clean_entry_cooldown_minutes", 15))
+    )
+    sweep = config.setdefault("liquidity_sweep_engine", {})
+    sweep["enabled"] = env_bool("ENABLE_LIQUIDITY_SWEEP_ENGINE", bool(sweep.get("enabled", True)))
+    raw_sweep_timeframes = os.getenv("LIQUIDITY_SWEEP_TIMEFRAMES")
+    if raw_sweep_timeframes is not None:
+        sweep["timeframes"] = [part.strip() for part in raw_sweep_timeframes.split(",") if part.strip()]
+    sweep["min_confidence"] = env_int(
+        "LIQUIDITY_SWEEP_MIN_CONFIDENCE", int(sweep.get("min_confidence", 55))
+    )
+    sweep["confirm_on_candle_close"] = env_bool(
+        "LIQUIDITY_SWEEP_CONFIRM_ON_CANDLE_CLOSE", bool(sweep.get("confirm_on_candle_close", True))
+    )
+    sweep["watch_distance_bps"] = env_float(
+        "LIQUIDITY_SWEEP_WATCH_DISTANCE_BPS", float(sweep.get("watch_distance_bps", 8))
+    )
+    sweep["cooldown_minutes"] = env_int(
+        "LIQUIDITY_SWEEP_COOLDOWN_MINUTES", int(sweep.get("cooldown_minutes", 10))
+    )
+    sweep["use_supply_demand"] = env_bool(
+        "LIQUIDITY_SWEEP_USE_SUPPLY_DEMAND", bool(sweep.get("use_supply_demand", True))
+    )
+    sweep["use_support_resistance"] = env_bool(
+        "LIQUIDITY_SWEEP_USE_SUPPORT_RESISTANCE", bool(sweep.get("use_support_resistance", True))
+    )
+    sweep["can_confirm"] = env_bool("LIQUIDITY_SWEEP_CAN_CONFIRM", bool(sweep.get("can_confirm", True)))
+    sweep["can_downgrade"] = env_bool("LIQUIDITY_SWEEP_CAN_DOWNGRADE", bool(sweep.get("can_downgrade", True)))
+    sweep["can_upgrade"] = env_bool("LIQUIDITY_SWEEP_CAN_UPGRADE", bool(sweep.get("can_upgrade", False)))
+    sweep["telegram_enabled"] = env_bool(
+        "ENABLE_LIQUIDITY_SWEEP_TELEGRAM", bool(sweep.get("telegram_enabled", True))
+    )
+    sweep["telegram_watch_enabled"] = env_bool(
+        "LIQUIDITY_SWEEP_TELEGRAM_WATCH_ENABLED", bool(sweep.get("telegram_watch_enabled", True))
+    )
+    sweep["telegram_forming_enabled"] = env_bool(
+        "LIQUIDITY_SWEEP_TELEGRAM_FORMING_ENABLED", bool(sweep.get("telegram_forming_enabled", True))
+    )
+    sweep["telegram_confirmed_enabled"] = env_bool(
+        "LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_ENABLED", bool(sweep.get("telegram_confirmed_enabled", True))
+    )
+    sweep["telegram_min_confidence"] = env_int(
+        "LIQUIDITY_SWEEP_TELEGRAM_MIN_CONFIDENCE", int(sweep.get("telegram_min_confidence", 55))
+    )
+    sweep["telegram_confirmed_min_confidence"] = env_int(
+        "LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_MIN_CONFIDENCE",
+        int(sweep.get("telegram_confirmed_min_confidence", 65)),
+    )
+    sweep["telegram_cooldown_minutes"] = env_int(
+        "LIQUIDITY_SWEEP_TELEGRAM_COOLDOWN_MINUTES", int(sweep.get("telegram_cooldown_minutes", 10))
+    )
+    sweep["telegram_max_chars"] = env_int(
+        "LIQUIDITY_SWEEP_TELEGRAM_MAX_CHARS", int(sweep.get("telegram_max_chars", 900))
+    )
+    sweep["telegram_include_structure"] = env_bool(
+        "LIQUIDITY_SWEEP_TELEGRAM_INCLUDE_STRUCTURE", bool(sweep.get("telegram_include_structure", True))
     )
 
     quality = config.setdefault("alert_quality", {})
