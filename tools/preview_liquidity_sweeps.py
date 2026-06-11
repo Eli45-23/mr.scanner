@@ -72,6 +72,9 @@ def write_log(payload: Dict[str, Any], config: Dict[str, Any], path: Path = LOG_
             "reason", "meaning", "wait_for", "invalidation", "current_candle_closed",
             "inside_chop_range", "related_demand_zone", "related_supply_zone",
             "nearest_upside_sweep_zone", "nearest_downside_sweep_zone",
+            "sweep_map_status", "sweep_event_status", "map_only", "event_alert_candidate",
+            "possible_sweep_zones", "zone_bucket", "alert_state", "repeated_range_sweeps",
+            "telegram_filter_allowed", "telegram_filter_reason", "suppression_type", "dashboard_only_reason",
         )
     }
     record.update({

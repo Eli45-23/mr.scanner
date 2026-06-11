@@ -68,6 +68,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 import requests
 from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
 from scanner.chop_mode_engine import clean_breakout_exits_chop, evaluate_chop_mode
+from scanner.liquidity_sweep_alert_filter import should_send_liquidity_sweep_telegram
 from scanner.liquidity_sweep_telegram import (
     append_sweep_telegram_log,
     claim_sweep_delivery,
@@ -248,11 +249,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "can_downgrade": True,
         "can_upgrade": False,
         "telegram_enabled": True,
-        "telegram_watch_enabled": True,
+        "telegram_watch_enabled": False,
         "telegram_forming_enabled": True,
         "telegram_confirmed_enabled": True,
-        "telegram_min_confidence": 55,
-        "telegram_confirmed_min_confidence": 65,
+        "telegram_failed_held_enabled": False,
+        "telegram_forming_min_score": 70,
+        "telegram_confirmed_min_score": 80,
+        "telegram_min_confidence": "MEDIUM",
+        "telegram_confirmed_min_confidence": "HIGH",
+        "telegram_require_meaningful_source": True,
+        "telegram_require_5m_or_15m_for_watch": True,
+        "telegram_suppress_1m_only": True,
+        "telegram_zone_bucket_bps": 12,
+        "telegram_same_bucket_cooldown_minutes": 30,
+        "telegram_same_direction_cooldown_minutes": 20,
+        "telegram_opposite_direction_cooldown_minutes": 10,
+        "telegram_suppress_repeated_range_sweeps": True,
+        "telegram_repeated_range_lookback_minutes": 10,
+        "telegram_repeated_range_max_bps": 35,
+        "telegram_repeated_range_min_sweeps": 3,
+        "telegram_chop_requires_high_confidence": True,
+        "telegram_chop_min_score": 85,
+        "dashboard_show_sweep_map_always": True,
         "telegram_cooldown_minutes": 10,
         "telegram_max_chars": 900,
         "telegram_include_structure": True,
@@ -4530,6 +4548,19 @@ class EliteScanner:
             return False
 
         eligible, reason, alert_type = sweep_telegram_eligibility(payload, self.config)
+        recent_sweeps = self.recent_liquidity_sweeps(
+            now_utc(),
+            int(settings.get("telegram_repeated_range_lookback_minutes", 10)),
+        )
+        filter_allowed, filter_reason, filter_metadata = should_send_liquidity_sweep_telegram(
+            payload,
+            recent_sweeps,
+            LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE,
+            self.config,
+            self.latest_market_structure(),
+        )
+        eligible = bool(eligible and filter_allowed)
+        reason = reason if eligible else filter_reason
         log_fields: Dict[str, Any] = {
             "telegram_eligible": bool(eligible),
             "telegram_sent": False,
@@ -4538,6 +4569,7 @@ class EliteScanner:
             "openai_formatter_used": False,
             "openai_validation_passed": False,
             "fallback_used": False,
+            **filter_metadata,
         }
         if not eligible or not alert_type:
             append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
@@ -4564,7 +4596,7 @@ class EliteScanner:
 
         allowed, dedupe_reason, _ = claim_sweep_delivery(
             payload,
-            int(settings.get("telegram_cooldown_minutes", 10)),
+            int(settings.get("telegram_same_bucket_cooldown_minutes", 30)),
             LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE,
         )
         if not allowed:
@@ -7274,7 +7306,7 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
         "ENABLE_LIQUIDITY_SWEEP_TELEGRAM", bool(sweep.get("telegram_enabled", True))
     )
     sweep["telegram_watch_enabled"] = env_bool(
-        "LIQUIDITY_SWEEP_TELEGRAM_WATCH_ENABLED", bool(sweep.get("telegram_watch_enabled", True))
+        "LIQUIDITY_SWEEP_TELEGRAM_WATCH_ENABLED", bool(sweep.get("telegram_watch_enabled", False))
     )
     sweep["telegram_forming_enabled"] = env_bool(
         "LIQUIDITY_SWEEP_TELEGRAM_FORMING_ENABLED", bool(sweep.get("telegram_forming_enabled", True))
@@ -7282,13 +7314,35 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     sweep["telegram_confirmed_enabled"] = env_bool(
         "LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_ENABLED", bool(sweep.get("telegram_confirmed_enabled", True))
     )
-    sweep["telegram_min_confidence"] = env_int(
-        "LIQUIDITY_SWEEP_TELEGRAM_MIN_CONFIDENCE", int(sweep.get("telegram_min_confidence", 55))
+    sweep["telegram_failed_held_enabled"] = env_bool(
+        "LIQUIDITY_SWEEP_TELEGRAM_FAILED_HELD_ENABLED", bool(sweep.get("telegram_failed_held_enabled", False))
     )
-    sweep["telegram_confirmed_min_confidence"] = env_int(
-        "LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_MIN_CONFIDENCE",
-        int(sweep.get("telegram_confirmed_min_confidence", 65)),
-    )
+    for env_name, key, default in (
+        ("LIQUIDITY_SWEEP_TELEGRAM_FORMING_MIN_SCORE", "telegram_forming_min_score", 70),
+        ("LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_MIN_SCORE", "telegram_confirmed_min_score", 80),
+        ("LIQUIDITY_SWEEP_TELEGRAM_ZONE_BUCKET_BPS", "telegram_zone_bucket_bps", 12),
+        ("LIQUIDITY_SWEEP_TELEGRAM_SAME_BUCKET_COOLDOWN_MINUTES", "telegram_same_bucket_cooldown_minutes", 30),
+        ("LIQUIDITY_SWEEP_TELEGRAM_REPEATED_RANGE_LOOKBACK_MINUTES", "telegram_repeated_range_lookback_minutes", 10),
+        ("LIQUIDITY_SWEEP_TELEGRAM_REPEATED_RANGE_MAX_BPS", "telegram_repeated_range_max_bps", 35),
+        ("LIQUIDITY_SWEEP_TELEGRAM_REPEATED_RANGE_MIN_SWEEPS", "telegram_repeated_range_min_sweeps", 3),
+        ("LIQUIDITY_SWEEP_TELEGRAM_CHOP_MIN_SCORE", "telegram_chop_min_score", 85),
+    ):
+        sweep[key] = env_int(env_name, int(sweep.get(key, default)))
+    sweep["telegram_min_confidence"] = os.getenv(
+        "LIQUIDITY_SWEEP_TELEGRAM_MIN_CONFIDENCE", str(sweep.get("telegram_min_confidence", "MEDIUM"))
+    ).strip().upper() or "MEDIUM"
+    sweep["telegram_confirmed_min_confidence"] = os.getenv(
+        "LIQUIDITY_SWEEP_TELEGRAM_CONFIRMED_MIN_CONFIDENCE", str(sweep.get("telegram_confirmed_min_confidence", "HIGH"))
+    ).strip().upper() or "HIGH"
+    for env_name, key, default in (
+        ("LIQUIDITY_SWEEP_TELEGRAM_REQUIRE_MEANINGFUL_SOURCE", "telegram_require_meaningful_source", True),
+        ("LIQUIDITY_SWEEP_TELEGRAM_REQUIRE_5M_OR_15M_FOR_WATCH", "telegram_require_5m_or_15m_for_watch", True),
+        ("LIQUIDITY_SWEEP_TELEGRAM_SUPPRESS_1M_ONLY", "telegram_suppress_1m_only", True),
+        ("LIQUIDITY_SWEEP_TELEGRAM_SUPPRESS_REPEATED_RANGE_SWEEPS", "telegram_suppress_repeated_range_sweeps", True),
+        ("LIQUIDITY_SWEEP_TELEGRAM_CHOP_REQUIRES_HIGH_CONFIDENCE", "telegram_chop_requires_high_confidence", True),
+        ("LIQUIDITY_SWEEP_DASHBOARD_SHOW_MAP_ALWAYS", "dashboard_show_sweep_map_always", True),
+    ):
+        sweep[key] = env_bool(env_name, bool(sweep.get(key, default)))
     sweep["telegram_cooldown_minutes"] = env_int(
         "LIQUIDITY_SWEEP_TELEGRAM_COOLDOWN_MINUTES", int(sweep.get("telegram_cooldown_minutes", 10))
     )

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from .market_structure_models import clamp_score, normalize_bars, strength
+from .liquidity_sweep_alert_filter import classify_sweep_output
 
 
 ENGINE_VERSION = "liquidity-sweep-phase1-1.0"
@@ -151,6 +152,11 @@ def _base_result(symbol: str, timestamp: str, current_candle_closed: bool) -> Di
         "engine_version": ENGINE_VERSION,
         "nearest_upside_sweep_zone": None,
         "nearest_downside_sweep_zone": None,
+        "sweep_map_status": "ACTIVE",
+        "sweep_event_status": "NO_ACTIVE_SWEEP",
+        "map_only": True,
+        "event_alert_candidate": False,
+        "possible_sweep_zones": [],
     }
 
 
@@ -191,6 +197,7 @@ def evaluate_liquidity_sweeps(
         use_supply_demand=use_supply_demand,
         use_support_resistance=use_support_resistance,
     )
+    result["possible_sweep_zones"] = candidates
     if not candidates:
         result["reason"] = "No clean market-structure levels are available for liquidity sweep evaluation."
         return result
@@ -308,7 +315,7 @@ def evaluate_liquidity_sweeps(
     status_rank = {"SWEEP_CONFIRMED": 4, "SWEEP_FORMING": 3, "SWEEP_FAILED_HELD": 2, "SWEEP_WATCH": 1}
     best = max(evaluated, key=lambda item: (status_rank[item["status"]], item["score"]))
     dashboard_eligible = best["score"] >= min_confidence_score or best["status"] in {"SWEEP_FORMING", "SWEEP_CONFIRMED", "SWEEP_FAILED_HELD"}
-    return {
+    output = {
         **result,
         "sweep_status": best["status"],
         "sweep_direction": best["direction"],
@@ -330,3 +337,10 @@ def evaluate_liquidity_sweeps(
         "telegram_eligible": best["status"] == "SWEEP_CONFIRMED" and best["score"] >= 75,
         "dashboard_eligible": dashboard_eligible,
     }
+    classification = classify_sweep_output(output)
+    output.update({
+        "sweep_event_status": output["sweep_status"],
+        "map_only": classification["sweep_map_only"],
+        "event_alert_candidate": classification["event_alert_candidate"],
+    })
+    return output

@@ -78,7 +78,10 @@ def evaluate_chop_mode(
             or summary.get("major_supply_area")
         )
     )
-    repeated_range_sweeps = sum(bool(record.get("inside_chop_range")) for record in recent_sweeps) >= 2
+    repeated_range_sweeps = (
+        any(bool(record.get("repeated_range_sweeps")) for record in recent_sweeps)
+        or sum(bool(record.get("inside_chop_range")) for record in recent_sweeps) >= 2
+    )
 
     active = False
     chop_type = ""

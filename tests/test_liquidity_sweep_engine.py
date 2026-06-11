@@ -422,6 +422,10 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
                     "sweep_direction": "ABOVE_LEVEL",
                     "level_source": "hod",
                     "telegram_sent": True,
+                    "event_alert_candidate": True,
+                    "telegram_filter_allowed": False,
+                    "suppression_type": "same_zone_cooldown",
+                    "repeated_range_sweeps": True,
                 },
             ],
         )
@@ -431,6 +435,8 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
         self.assertIn("Chop records strengthened by sweep risk: 1", summary)
         self.assertIn("Engine-based strategy sweep records: 1", summary)
         self.assertIn("Legacy fallback strategy sweep records: 0", summary)
+        self.assertIn("Sweep event candidates: 1", summary)
+        self.assertIn("Same-zone bucket suppressions: 1", summary)
 
 
 if __name__ == "__main__":

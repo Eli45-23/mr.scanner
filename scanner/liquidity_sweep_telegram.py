@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from .liquidity_sweep_alert_filter import is_meaningful_sweep_event, sweep_zone_bucket
 
 DISCLAIMER = "Heads-up only — confirm manually. Not a buy/sell signal."
 IMPORTANT_SOURCE_PARTS = (
@@ -191,27 +192,14 @@ def sweep_telegram_eligibility(payload: Dict[str, Any], config: Dict[str, Any]) 
     if not settings.get(enabled_key, True):
         return False, f"{status.lower()} Telegram disabled", alert_type
     score = int(payload.get("score") or 0)
-    threshold = int(
-        settings.get("telegram_confirmed_min_confidence", 65)
-        if status == "SWEEP_CONFIRMED" else settings.get("telegram_min_confidence", 55)
-    )
-    if score < threshold:
-        return False, f"sweep score {score} below {threshold}", alert_type
-    source = str(payload.get("level_source") or "").lower()
-    if not any(part in source for part in IMPORTANT_SOURCE_PARTS):
-        return False, "sweep level source is not important enough", alert_type
-    if payload.get("inside_chop_range") and status != "SWEEP_CONFIRMED" and score < 75:
-        return False, "chop mode allows only high-quality watch/forming sweeps", alert_type
-    return True, "important liquidity sweep context", alert_type
+    allowed, reason = is_meaningful_sweep_event(payload, config=config)
+    return allowed, reason, alert_type
 
 
 def sweep_dedupe_key(payload: Dict[str, Any]) -> str:
-    source = str(payload.get("level_source") or "unknown").upper()
-    direction = str(payload.get("sweep_direction") or "NONE").upper()
     status = str(payload.get("sweep_status") or "NO_ACTIVE_SWEEP").upper()
-    level = payload.get("sweep_level")
-    level_text = f"{float(level):.2f}" if isinstance(level, (int, float)) else "none"
-    return f"AAPL|{source}|{direction}|{status}|{level_text}"
+    event_group = "CONFIRMED" if status == "SWEEP_CONFIRMED" else "FORMING" if status == "SWEEP_FORMING" else status
+    return f"{sweep_zone_bucket(payload)}|{event_group}"
 
 
 def claim_sweep_delivery(

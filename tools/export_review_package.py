@@ -379,6 +379,14 @@ def build_review_summary(
     legacy_strategy_sweeps = sum(
         1 for record in alert_window if str(record.get("liquidity_sweep_source") or "").lower() == "legacy_fallback"
     )
+    sweep_map_updates = sum(1 for record in liquidity_sweep_records if record.get("map_only") or record.get("sweep_map_status"))
+    sweep_event_candidates = sum(1 for record in liquidity_sweep_records if record.get("event_alert_candidate"))
+    sweep_filter_allowed = sum(1 for record in liquidity_sweep_records if record.get("telegram_filter_allowed"))
+    sweep_filter_suppressed = sum(1 for record in liquidity_sweep_records if record.get("telegram_filter_allowed") is False)
+    same_zone_suppressed = sum(
+        1 for record in liquidity_sweep_records if str(record.get("suppression_type") or "") == "same_zone_cooldown"
+    )
+    repeated_range_periods = sum(1 for record in liquidity_sweep_records if record.get("repeated_range_sweeps"))
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -453,6 +461,11 @@ def build_review_summary(
 ## Liquidity Sweep Review
 - Engine-based strategy sweep records: {engine_strategy_sweeps}
 - Legacy fallback strategy sweep records: {legacy_strategy_sweeps}
+- Sweep map updates: {sweep_map_updates}
+- Sweep event candidates: {sweep_event_candidates}
+- Telegram filter allowed / suppressed: {sweep_filter_allowed} / {sweep_filter_suppressed}
+- Same-zone bucket suppressions: {same_zone_suppressed}
+- Repeated range sweep records: {repeated_range_periods}
 - Sweep watch records: {sweep_statuses.count("SWEEP_WATCH")}
 - Sweep forming records: {sweep_statuses.count("SWEEP_FORMING")}
 - Sweep confirmed records: {len(confirmed_sweeps)}

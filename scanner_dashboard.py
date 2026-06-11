@@ -27,6 +27,7 @@ from tools.preview_liquidity_sweeps import (
     build_liquidity_sweep_preview,
     write_log as write_liquidity_sweep_log,
 )
+from scanner.liquidity_sweep_alert_filter import classify_sweep_output, sweep_zone_bucket
 from tools.preview_market_structure import build_market_structure, write_logs as write_market_structure_logs
 
 APP_DIR = Path(__file__).resolve().parent
@@ -272,6 +273,11 @@ def load_liquidity_sweep_dashboard(
         "enabled": enabled,
         "context_only": True,
         "can_approve_trades": False,
+        "alert_state": "Dashboard only",
+        "zone_bucket": "Not enough clean data yet",
+        "map_only": True,
+        "event_alert_candidate": False,
+        "repeated_range_sweeps": False,
     }
     if not enabled:
         return {**empty, "source": "disabled", "message": "Liquidity sweep engine is disabled."}
@@ -310,6 +316,14 @@ def load_liquidity_sweep_dashboard(
         "source": "log_fallback",
         "updated_at": latest.get("timestamp"),
         "message": "Latest liquidity sweep log data",
+        "alert_state": (
+            "Telegram eligible" if latest.get("telegram_filter_allowed")
+            else f"Suppressed: {latest.get('suppression_type') or latest.get('dashboard_only_reason') or 'dashboard only'}"
+        ),
+        "zone_bucket": latest.get("zone_bucket") or "Not enough clean data yet",
+        "map_only": bool(latest.get("map_only", True)),
+        "event_alert_candidate": bool(latest.get("event_alert_candidate", False)),
+        "repeated_range_sweeps": bool(latest.get("repeated_range_sweeps", False)),
     }
     payload["copy_block"] = _liquidity_sweep_copy_block(payload)
     payload["context_summary"] = _liquidity_sweep_context_summary(payload)
@@ -471,6 +485,10 @@ def refresh_live_liquidity_sweeps(
         config=config,
         market_structure=market_structure,
     )
+    classification = classify_sweep_output(payload)
+    payload.update(classification)
+    payload["zone_bucket"] = sweep_zone_bucket(payload, float(settings.get("telegram_zone_bucket_bps", 12)))
+    payload["alert_state"] = "Event candidate; Telegram filter applies" if classification["event_alert_candidate"] else "Dashboard only"
     write_liquidity_sweep_log(payload, config)
     dashboard_payload = load_liquidity_sweep_dashboard(config)
     dashboard_payload["source"] = "live"
@@ -2592,6 +2610,8 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="label">Sweep Bias</span><div><strong>${esc(structureValue(data.sweep_bias_label))}</strong></div></div>
           <div><span class="label">Sweep Context</span><div><strong>${esc(structureValue(data.context_summary))}</strong></div></div>
           <div><span class="label">Confidence</span><div><strong>${esc(structureValue(event.confidence))} ${esc(structureValue(event.score))}</strong></div></div>
+          <div><span class="label">Alert State</span><div><strong>${esc(structureValue(data.alert_state))}</strong></div></div>
+          <div><span class="label">Zone Bucket</span><div><strong>${esc(structureValue(data.zone_bucket))}</strong></div></div>
           <div><span class="label">Data Source</span><div><strong>${esc(structureValue(data.source))}</strong></div></div>
         </div>
         <div class="structure-summary">
@@ -3730,6 +3750,11 @@ def run_tests() -> int:
                             "meaning": "Buyers may be trapped above the level.",
                             "wait_for": "Failed reclaim or lower high.",
                             "invalidation": "Clean reclaim and hold above 291.40-291.58.",
+                            "map_only": False,
+                            "event_alert_candidate": True,
+                            "zone_bucket": "AAPL|ABOVE_LEVEL|BEARISH|supply|5m|291.30",
+                            "telegram_filter_allowed": False,
+                            "suppression_type": "same_zone_cooldown",
                             "nearest_upside_sweep_zone": {
                                 "zone_low": 291.40,
                                 "zone_high": 291.58,
@@ -3761,6 +3786,8 @@ def run_tests() -> int:
             self.assertEqual(payload["context_summary"], "Confirmed upside sweep: buyers may be trapped.")
             self.assertEqual(len(payload["recent_events"]), 1)
             self.assertFalse(payload["can_approve_trades"])
+            self.assertIn("same_zone_cooldown", payload["alert_state"])
+            self.assertIn("AAPL|ABOVE_LEVEL", payload["zone_bucket"])
 
             for text in (
                 "Liquidity Sweep Zones",
@@ -3769,6 +3796,8 @@ def run_tests() -> int:
                 "Nearest Downside Sweep Zone",
                 "Current Sweep Event",
                 "Sweep Context",
+                "Alert State",
+                "Zone Bucket",
                 "Recent Sweep Events",
                 "Copy Liquidity Sweep Notes",
                 "/api/liquidity-sweeps",
