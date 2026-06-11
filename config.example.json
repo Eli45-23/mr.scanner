@@ -68,6 +68,22 @@
     "missed_clean_entry_lookback_minutes": 15,
     "missed_clean_entry_cooldown_minutes": 15
   },
+  "alert_orchestrator": {
+    "enabled": true,
+    "trend_context_enabled": true,
+    "trend_context_min_score": 75,
+    "trend_context_min_timeframes_aligned": 2,
+    "trend_context_require_vwap_ema_alignment": true,
+    "trend_context_allow_through_chop": true,
+    "trend_context_chop_forces_watch_only": true,
+    "trend_context_cooldown_minutes": 15,
+    "trend_context_aapl_only": true,
+    "sweep_event_uses_alert_filter": true,
+    "chop_blocks_trade_quality": true,
+    "chop_allows_trend_context": true,
+    "do_not_chase_context_enabled": true,
+    "dashboard_context_always": true
+  },
   "liquidity_sweep_engine": {
     "enabled": true,
     "timeframes": ["1m", "5m", "15m"],

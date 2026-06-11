@@ -68,6 +68,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 import requests
 from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
 from scanner.chop_mode_engine import clean_breakout_exits_chop, evaluate_chop_mode
+from scanner.alert_decision_orchestrator import orchestrate_alert_decision
 from scanner.liquidity_sweep_alert_filter import should_send_liquidity_sweep_telegram
 from scanner.liquidity_sweep_telegram import (
     append_sweep_telegram_log,
@@ -235,6 +236,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_missed_clean_entry_label": True,
         "missed_clean_entry_lookback_minutes": 15,
         "missed_clean_entry_cooldown_minutes": 15,
+    },
+    "alert_orchestrator": {
+        "enabled": True,
+        "trend_context_enabled": True,
+        "trend_context_min_score": 75,
+        "trend_context_min_timeframes_aligned": 2,
+        "trend_context_require_vwap_ema_alignment": True,
+        "trend_context_allow_through_chop": True,
+        "trend_context_chop_forces_watch_only": True,
+        "trend_context_cooldown_minutes": 15,
+        "trend_context_aapl_only": True,
+        "sweep_event_uses_alert_filter": True,
+        "chop_blocks_trade_quality": True,
+        "chop_allows_trend_context": True,
+        "do_not_chase_context_enabled": True,
+        "dashboard_context_always": True,
     },
     "liquidity_sweep_engine": {
         "enabled": True,
@@ -882,6 +899,21 @@ class Alert:
     liquidity_sweep_status: Optional[str] = None
     liquidity_sweep_can_approve_trades: bool = False
     sweep_trap_bias: Optional[str] = None
+    orchestrator_enabled: bool = False
+    orchestrator_final_alert_type: Optional[str] = None
+    orchestrator_final_direction: Optional[str] = None
+    orchestrator_final_priority: Optional[int] = None
+    orchestrator_telegram_allowed: bool = False
+    orchestrator_trade_ready: bool = False
+    orchestrator_watch_only: bool = False
+    orchestrator_context_only: bool = True
+    orchestrator_decision_reason: Optional[str] = None
+    orchestrator_block_reason: Optional[str] = None
+    orchestrator_suppression_reason: Optional[str] = None
+    orchestrator_engine_votes: Dict[str, Any] = field(default_factory=dict)
+    orchestrator_conflicts: List[str] = field(default_factory=list)
+    orchestrator_risk_notes: List[str] = field(default_factory=list)
+    orchestrator_wait_for: List[str] = field(default_factory=list)
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -3040,17 +3072,24 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
         watch = "A new pullback/retest before considering continuation."
     if alert.news_context_present:
         watch = f"{watch} Fresh AAPL news present — context only. Confirm price reaction."
+    if alert.orchestrator_wait_for:
+        watch = " ".join(alert.orchestrator_wait_for)
     main_risk = telegram_risk_warning_reason(alert)
     if not main_risk:
         main_risk = "none major; confirm manually"
+    if alert.orchestrator_risk_notes:
+        main_risk = " ".join(alert.orchestrator_risk_notes)
     title_detail = setup
     if alert.phone_conclusion == "MIXED / NO TRADE":
         bias = str(alert.current_structure_bias or direction or "mixed").title()
         title_detail = f"{bias} bias, signals conflict"
     elif alert.phone_conclusion in {"DO NOT CHASE", "CONTEXT ONLY"}:
         title_detail = f"{str(direction).title()} Bias" if str(direction).upper() in {"BULLISH", "BEARISH"} else setup
+    title = f"{alert.symbol} {alert.phone_conclusion} — {_short_phone_text(title_detail, 80)}"
+    if alert.orchestrator_final_alert_type == "TREND_CONTEXT":
+        title = f"{alert.symbol} {str(alert.orchestrator_final_direction or direction).title()} Trend Watch"
     lines = [
-        f"{alert.symbol} {alert.phone_conclusion} — {_short_phone_text(title_detail, 80)}",
+        title,
         "",
         f"Why: {_short_phone_text(_telegram_reason(alert, scenario), 170)}",
         f"Market: {' | '.join(market_bits)}",
@@ -4559,6 +4598,11 @@ class EliteScanner:
             self.config,
             self.latest_market_structure(),
         )
+        payload["alert_filter"] = {
+            **filter_metadata,
+            "telegram_filter_allowed": bool(filter_allowed),
+            "telegram_filter_reason": filter_reason,
+        }
         eligible = bool(eligible and filter_allowed)
         reason = reason if eligible else filter_reason
         log_fields: Dict[str, Any] = {
@@ -6986,13 +7030,127 @@ class EliteScanner:
         elapsed = (now_utc() - last).total_seconds()
         return elapsed >= cooldown_seconds
 
+    def apply_alert_orchestrator(self, alert: Alert) -> Dict[str, Any]:
+        settings = self.config.get("alert_orchestrator", {})
+        if not settings.get("enabled", True):
+            return {}
+        sweep_context = getattr(self, "latest_liquidity_sweep_context", {}).get(alert.symbol, {})
+        levels = alert.scenario_levels or alert.strategy_levels or {}
+        context = {
+            "symbol": alert.symbol,
+            "price": alert.price,
+            "direction": alert.direction,
+            "primary_setup": alert.primary_setup,
+            "strategy_results": alert.strategy_results,
+            "strategy_direction": alert.strategy_direction,
+            "strategy_confidence_score": alert.strategy_confidence_score,
+            "professional_setup": alert.professional_setup,
+            "setup_score": alert.setup_score,
+            "scenario_top": alert.scenario_top,
+            "scenario_score": alert.scenario_score,
+            "scenario_direction": alert.scenario_direction,
+            "scenario_conflict": alert.scenario_conflict,
+            "stock_setup_score": alert.stock_setup_score,
+            "confirmation_score": alert.confirmation_score,
+            "option_tradable": alert.option_tradable,
+            "option_quality": alert.option_quality,
+            "options_score": alert.options_score,
+            "market_alignment": alert.market_alignment,
+            "market_regime": alert.market_regime,
+            "trend_1m": alert.trend_1m,
+            "trend_5m": alert.trend_5m,
+            "trend_15m": alert.trend_15m,
+            "current_structure_bias": alert.current_structure_bias,
+            "vwap": levels.get("vwap"),
+            "ema9": levels.get("ema9"),
+            "chop_mode_active": alert.chop_mode_active,
+            "chop_warning_due": alert.chop_warning_sent,
+            "sweep_risk_active": alert.sweep_risk_active,
+            "liquidity_sweep_status": alert.liquidity_sweep_status or sweep_context.get("sweep_status"),
+            "liquidity_sweep_context": alert.liquidity_sweep_context or sweep_context.get("reason"),
+            "sweep_trap_bias": alert.sweep_trap_bias or sweep_context.get("trap_bias"),
+            "sweep_filter": sweep_context.get("alert_filter") or {},
+            "mixed_signal_detected": alert.mixed_signal_detected,
+            "do_not_chase": bool(alert.do_not_chase_warning or alert.entry_quality_label == "DO_NOT_CHASE"),
+            "risk_label": alert.risk_label,
+            "existing_trade_ready": bool(alert.sms_allowed),
+            "existing_user_alert": bool(alert.sms_allowed or alert.watch_allowed or alert.phase3_heads_up_sent),
+        }
+        trend_values = [str(value or "").upper() for value in (alert.trend_1m, alert.trend_5m, alert.trend_15m)]
+        trend_direction = (
+            "BULLISH"
+            if trend_values.count("BULLISH") > trend_values.count("BEARISH")
+            else "BEARISH"
+            if trend_values.count("BEARISH") > trend_values.count("BULLISH")
+            else "NEUTRAL"
+        )
+        trend_state_key = f"ORCHESTRATOR:TREND_CONTEXT:{alert.symbol}:{trend_direction}"
+        last_trend_context = self.state_store.get_last_alert_time(trend_state_key)
+        recent_state = {
+            "last_trend_context": {
+                "direction": trend_direction,
+                "timestamp": last_trend_context.isoformat(),
+            }
+        } if last_trend_context else None
+        decision = orchestrate_alert_decision(context, self.config, recent_state)
+        alert.orchestrator_enabled = True
+        alert.orchestrator_final_alert_type = decision["final_alert_type"]
+        alert.orchestrator_final_direction = decision["final_direction"]
+        alert.orchestrator_final_priority = decision["final_priority"]
+        alert.orchestrator_telegram_allowed = decision["telegram_allowed"]
+        alert.orchestrator_trade_ready = decision["trade_ready"]
+        alert.orchestrator_watch_only = decision["watch_only"]
+        alert.orchestrator_context_only = decision["context_only"]
+        alert.orchestrator_decision_reason = decision["decision_reason"]
+        alert.orchestrator_block_reason = decision["block_reason"]
+        alert.orchestrator_suppression_reason = decision["suppression_reason"]
+        alert.orchestrator_engine_votes = decision["engine_votes"]
+        alert.orchestrator_conflicts = decision["conflicts"]
+        alert.orchestrator_risk_notes = decision["risk_notes"]
+        alert.orchestrator_wait_for = decision["what_to_wait_for"]
+        if decision["final_alert_type"] == "TREND_CONTEXT" and decision["telegram_allowed"]:
+            alert.sms_allowed = False
+            alert.watch_allowed = True
+            alert.phase3_heads_up_sent = False
+            alert.phase3_heads_up_eligible = False
+            alert.category = f"WATCH {decision['final_direction']} TREND CONTEXT"
+            alert.direction = decision["final_direction"]
+            alert.setup_level = "WATCH"
+            alert.text_alert_reason = decision["decision_reason"]
+            alert.suppressed_by_chop = False
+            alert.notes.append("orchestrator: strong directional context allowed through Chop Mode as watch-only")
+        elif decision["final_alert_type"] == "DO_NOT_CHASE" and decision["telegram_allowed"]:
+            alert.sms_allowed = False
+            alert.watch_allowed = True
+            alert.phase3_heads_up_sent = False
+            alert.phase3_heads_up_eligible = False
+            alert.category = f"WATCH {decision['final_direction']} TREND EXTENDED"
+            alert.direction = decision["final_direction"]
+            alert.setup_level = "WATCH"
+            alert.text_alert_reason = decision["decision_reason"]
+            alert.suppressed_by_chop = False
+            alert.notes.append("orchestrator: strong trend remains visible, but move is do-not-chase")
+        try:
+            path = LOG_DIR / "alert_orchestrator.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "timestamp": alert.timestamp.isoformat(),
+                    "symbol": alert.symbol,
+                    **decision,
+                }, default=str, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning("Alert orchestrator log failed safely: %s", redact_notification_error(exc))
+        return decision
+
     def process_alert(self, alert: Alert) -> bool:
         quality_config = self.config.get("alert_quality", {})
         text_key: Optional[str] = None
         category_cooldown_allowed = self.cooldown_allows(alert)
         self.maybe_allow_trend_flip_watch(alert)
         self.apply_market_structure_decision_quality(alert)
-        if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
+        self.apply_alert_orchestrator(alert)
+        if not category_cooldown_allowed and not alert.sms_allowed and not alert.watch_allowed and not alert.phase3_heads_up_sent:
             return False
         if alert.sms_allowed:
             cooldown_seconds = int(quality_config.get("sms_symbol_cooldown_seconds", 180))
@@ -7014,7 +7172,7 @@ class EliteScanner:
                 text_key = None
         elif alert.phase3_heads_up_sent:
             text_key = self.phase3_heads_up_state_key(alert)
-        if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
+        if not category_cooldown_allowed and not alert.sms_allowed and not alert.watch_allowed and not alert.phase3_heads_up_sent:
             return False
         apply_risk_invalidation(alert)
         assign_professional_alert_tier(alert)
@@ -7024,6 +7182,15 @@ class EliteScanner:
             self.post_alert_tracker.register(alert)
         self.notifier.send(alert)
         self.state_store.set_last_alert_time(alert.dedupe_key(), now_utc())
+        if (
+            alert.orchestrator_final_alert_type == "TREND_CONTEXT"
+            and alert.orchestrator_telegram_allowed
+            and alert.watch_allowed
+        ):
+            self.state_store.set_last_alert_time(
+                f"ORCHESTRATOR:TREND_CONTEXT:{alert.symbol}:{alert.orchestrator_final_direction}",
+                now_utc(),
+            )
         if text_key:
             self.state_store.set_last_alert_time(text_key, now_utc())
             if alert.sms_allowed:
@@ -7275,6 +7442,23 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     )
     decision["missed_clean_entry_cooldown_minutes"] = env_int(
         "MISSED_CLEAN_ENTRY_COOLDOWN_MINUTES", int(decision.get("missed_clean_entry_cooldown_minutes", 15))
+    )
+    orchestrator = config.setdefault("alert_orchestrator", {})
+    orchestrator["enabled"] = env_bool("ENABLE_ALERT_ORCHESTRATOR", bool(orchestrator.get("enabled", True)))
+    orchestrator["trend_context_enabled"] = env_bool(
+        "TREND_CONTEXT_ALERTS_ENABLED", bool(orchestrator.get("trend_context_enabled", True))
+    )
+    orchestrator["trend_context_min_score"] = env_int(
+        "TREND_CONTEXT_MIN_SCORE", int(orchestrator.get("trend_context_min_score", 75))
+    )
+    orchestrator["trend_context_min_timeframes_aligned"] = env_int(
+        "TREND_CONTEXT_MIN_TIMEFRAMES_ALIGNED", int(orchestrator.get("trend_context_min_timeframes_aligned", 2))
+    )
+    orchestrator["trend_context_allow_through_chop"] = env_bool(
+        "TREND_CONTEXT_ALLOW_THROUGH_CHOP", bool(orchestrator.get("trend_context_allow_through_chop", True))
+    )
+    orchestrator["trend_context_cooldown_minutes"] = env_int(
+        "TREND_CONTEXT_COOLDOWN_MINUTES", int(orchestrator.get("trend_context_cooldown_minutes", 15))
     )
     sweep = config.setdefault("liquidity_sweep_engine", {})
     sweep["enabled"] = env_bool("ENABLE_LIQUIDITY_SWEEP_ENGINE", bool(sweep.get("enabled", True)))

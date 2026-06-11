@@ -428,6 +428,17 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
                     "repeated_range_sweeps": True,
                 },
             ],
+            orchestrator_records=[
+                {
+                    "final_alert_type": "TREND_CONTEXT",
+                    "watch_only": True,
+                    "engine_votes": {"chop_mode_active": True},
+                },
+                {
+                    "final_alert_type": "DASHBOARD_ONLY",
+                    "suppression_reason": "Trend context duplicate within cooldown",
+                },
+            ],
         )
         self.assertIn("Sweep watch records: 1", summary)
         self.assertIn("Sweep confirmed records: 1", summary)
@@ -437,6 +448,9 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
         self.assertIn("Legacy fallback strategy sweep records: 0", summary)
         self.assertIn("Sweep event candidates: 1", summary)
         self.assertIn("Same-zone bucket suppressions: 1", summary)
+        self.assertIn("Trend-context decisions: 1", summary)
+        self.assertIn("Watch-only decisions allowed through Chop Mode: 1", summary)
+        self.assertIn("Trend contexts blocked by dedupe: 1", summary)
 
 
 if __name__ == "__main__":

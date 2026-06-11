@@ -263,11 +263,13 @@ def build_review_summary(
     missed_entry_records: Optional[List[Dict[str, Any]]] = None,
     openai_records: Optional[List[Dict[str, Any]]] = None,
     liquidity_sweep_records: Optional[List[Dict[str, Any]]] = None,
+    orchestrator_records: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     chop_records = chop_records or []
     missed_entry_records = missed_entry_records or []
     openai_records = openai_records or []
     liquidity_sweep_records = liquidity_sweep_records or []
+    orchestrator_records = orchestrator_records or []
     market_status = latest_status_for_day(market_data_records)
     alert_rows = [
         [
@@ -387,6 +389,7 @@ def build_review_summary(
         1 for record in liquidity_sweep_records if str(record.get("suppression_type") or "") == "same_zone_cooldown"
     )
     repeated_range_periods = sum(1 for record in liquidity_sweep_records if record.get("repeated_range_sweeps"))
+    orchestrator_types = [str(record.get("final_alert_type") or "") for record in orchestrator_records]
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -458,6 +461,18 @@ def build_review_summary(
 - Alerts inside chop range: {len(inside_chop)}
 - OpenAI formatter success / fallback: {openai_success} / {openai_fallback}
 
+## Alert Orchestrator
+- Trade-quality decisions: {orchestrator_types.count("TRADE_QUALITY")}
+- Trend-context decisions: {orchestrator_types.count("TREND_CONTEXT")}
+- Sweep-event decisions: {orchestrator_types.count("SWEEP_EVENT")}
+- Chop warnings: {orchestrator_types.count("CHOP_WARNING")}
+- Do-not-chase warnings: {orchestrator_types.count("DO_NOT_CHASE")}
+- Mixed/no-trade warnings: {orchestrator_types.count("MIXED_NO_TRADE")}
+- Dashboard-only decisions: {orchestrator_types.count("DASHBOARD_ONLY")}
+- Watch-only decisions allowed through Chop Mode: {sum(1 for record in orchestrator_records if record.get("final_alert_type") == "TREND_CONTEXT" and record.get("watch_only") and (record.get("engine_votes") or {}).get("chop_mode_active"))}
+- Decisions blocked/suppressed by Chop Mode: {sum(1 for record in orchestrator_records if "chop" in str(record.get("block_reason") or record.get("suppression_reason") or "").lower())}
+- Trend contexts blocked by dedupe: {sum(1 for record in orchestrator_records if "duplicate" in str(record.get("suppression_reason") or "").lower())}
+
 ## Liquidity Sweep Review
 - Engine-based strategy sweep records: {engine_strategy_sweeps}
 - Legacy fallback strategy sweep records: {legacy_strategy_sweeps}
@@ -523,6 +538,7 @@ def build_review_summary(
 - `logs/liquidity_sweeps.jsonl`
 - `logs/chop_mode.jsonl` if available
 - `logs/missed_clean_entry.jsonl` if available
+- `logs/alert_orchestrator.jsonl` if available
 - `logs/openai_alert_formatter.jsonl` if available
 - `logs/premarket_discipline_message.jsonl` if available
 - latest scanner log if available
@@ -596,6 +612,7 @@ def export_review_package(
     premarket_discipline = records_for_day(read_jsonl(log_dir / "premarket_discipline_message.jsonl"), day_text)
     chop_mode = records_for_day(read_jsonl(log_dir / "chop_mode.jsonl"), day_text)
     missed_clean_entry = records_for_day(read_jsonl(log_dir / "missed_clean_entry.jsonl"), day_text)
+    alert_orchestrator = records_for_day(read_jsonl(log_dir / "alert_orchestrator.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -621,6 +638,8 @@ def export_review_package(
         write_jsonl(logs_out / "chop_mode.jsonl", chop_mode)
     if (log_dir / "missed_clean_entry.jsonl").exists():
         write_jsonl(logs_out / "missed_clean_entry.jsonl", missed_clean_entry)
+    if (log_dir / "alert_orchestrator.jsonl").exists():
+        write_jsonl(logs_out / "alert_orchestrator.jsonl", alert_orchestrator)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
@@ -639,6 +658,8 @@ def export_review_package(
         write_jsonl(window_out / "chop_mode_window.jsonl", records_in_window(chop_mode, start_dt, end_dt))
     if missed_clean_entry:
         write_jsonl(window_out / "missed_clean_entry_window.jsonl", records_in_window(missed_clean_entry, start_dt, end_dt))
+    if alert_orchestrator:
+        write_jsonl(window_out / "alert_orchestrator_window.jsonl", records_in_window(alert_orchestrator, start_dt, end_dt))
 
     if not alerts:
         notes.append("No alerts.jsonl records found for the requested date.")
@@ -701,6 +722,7 @@ def export_review_package(
         missed_entry_records=missed_clean_entry,
         openai_records=openai_formatter,
         liquidity_sweep_records=liquidity_sweeps,
+        orchestrator_records=alert_orchestrator,
     )
     summary_path = package_dir / "review_summary.md"
     summary_path.write_text(summary, encoding="utf-8")
