@@ -210,9 +210,10 @@ def render_pretty(payload: Dict[str, Any]) -> str:
             if not items:
                 lines.append("No clean zones detected.")
             for index, zone in enumerate(items, 1):
+                freshness = "fresh" if zone["fresh"] else f"tested {zone['times_tested']}x"
                 lines.append(
                     f"{index}) {zone['zone_low']:.2f}-{zone['zone_high']:.2f} | {zone['strength']} | "
-                    f"{'fresh' if zone['fresh'] else f'tested {zone['times_tested']}x'} | {zone['last_reaction']}"
+                    f"{freshness} | {zone['last_reaction']}"
                 )
     summary = payload["summary"]
     lines.extend(
