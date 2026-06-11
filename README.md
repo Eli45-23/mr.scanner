@@ -115,6 +115,24 @@ export TELEGRAM_SEND_TEST_ON_START="false"
 export TELEGRAM_TIMEOUT_SECONDS="8"
 ```
 
+The scanner can also send one protective `AAPL Morning Playbook` per weekday
+near 09:25 ET. It reuses the existing Telegram destination and summarizes
+PMH/PML/PDH/PDL/PDC, current market structure, liquidity-sweep context, and
+discipline reminders. The playbook is context-only, cannot approve trades, and
+does not change existing alert gates.
+
+```bash
+export ENABLE_MORNING_PLAYBOOK="true"
+export MORNING_PLAYBOOK_SEND_TIME_ET="09:25"
+export MORNING_PLAYBOOK_TELEGRAM_ENABLED="true"
+export MORNING_PLAYBOOK_MAX_CHARS="1200"
+```
+
+Send-once state is stored in `state/morning_playbook_state.json`. Delivery and
+failure records are written to `logs/morning_playbook.jsonl`. Both runtime
+paths are ignored by Git. Telegram failures are logged safely and do not stop
+the scanner.
+
 After messaging the bot once, find the chat ID and send a test:
 ```bash
 python tools/get_telegram_chat_id.py

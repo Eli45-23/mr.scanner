@@ -90,6 +90,17 @@
     "telegram_max_chars": 900,
     "telegram_include_structure": true
   },
+  "morning_playbook": {
+    "enabled": true,
+    "symbol": "AAPL",
+    "send_time_et": "09:25",
+    "telegram_enabled": true,
+    "send_once_per_day": true,
+    "include_market_structure": true,
+    "include_liquidity_sweeps": true,
+    "include_discipline_rules": true,
+    "max_chars": 1200
+  },
   "alert_quality": {
     "sms_symbol_cooldown_seconds": 1200,
     "watch_symbol_cooldown_seconds": 600,

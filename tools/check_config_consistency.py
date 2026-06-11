@@ -23,6 +23,7 @@ def build_report() -> dict:
     scanner.load_dotenv()
     config = scanner.load_config(None)
     identity = scanner.scanner_identity(config)
+    morning_playbook = config.get("morning_playbook", {})
     market = {}
     path = ROOT / "logs" / "market_data_status.jsonl"
     if path.exists():
@@ -37,6 +38,10 @@ def build_report() -> dict:
         "openai_alert_formatter_style": config.get("notifications", {}).get("openai_alert_formatter_style", "section"),
         "openai_alert_formatter_fallback": bool(config.get("notifications", {}).get("openai_alert_formatter_fallback", True)),
         "openai_alert_formatter_max_chars": config.get("notifications", {}).get("openai_alert_formatter_max_chars", 900),
+        "morning_playbook_enabled": bool(morning_playbook.get("enabled", True)),
+        "morning_playbook_send_time_et": morning_playbook.get("send_time_et", "09:25"),
+        "morning_playbook_telegram_enabled": bool(morning_playbook.get("telegram_enabled", True)),
+        "morning_playbook_max_chars": morning_playbook.get("max_chars", 1200),
         "stock_feed": str(config.get("market_data", {}).get("stock_feed", "unknown")).upper(),
         "options_feed": str(config.get("options", {}).get("feed", "unknown")).upper(),
         "max_option_quote_age_seconds": config.get("options", {}).get("max_quote_age_seconds", 60),

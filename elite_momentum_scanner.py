@@ -76,6 +76,14 @@ from scanner.liquidity_sweep_telegram import (
     validate_liquidity_sweep_message,
 )
 from scanner.missed_clean_entry import detect_missed_clean_entry
+from scanner.morning_playbook import (
+    append_morning_playbook_log,
+    build_morning_playbook_payload,
+    format_morning_playbook_message,
+    mark_morning_playbook_sent,
+    should_send_morning_playbook,
+    validate_morning_playbook_message,
+)
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
 from strategies.context import evaluate_multi_timeframe_context
@@ -101,6 +109,8 @@ MISSED_CLEAN_ENTRY_LOG = LOG_DIR / "missed_clean_entry.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE = STATE_DIR / "liquidity_sweep_telegram_dedupe.json"
+MORNING_PLAYBOOK_STATE = STATE_DIR / "morning_playbook_state.json"
+MORNING_PLAYBOOK_LOG = LOG_DIR / "morning_playbook.jsonl"
 
 logger = logging.getLogger("elite_scanner")
 logging.basicConfig(
@@ -246,6 +256,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "telegram_cooldown_minutes": 10,
         "telegram_max_chars": 900,
         "telegram_include_structure": True,
+    },
+    "morning_playbook": {
+        "enabled": True,
+        "symbol": "AAPL",
+        "send_time_et": "09:25",
+        "telegram_enabled": True,
+        "send_once_per_day": True,
+        "include_market_structure": True,
+        "include_liquidity_sweeps": True,
+        "include_discipline_rules": True,
+        "max_chars": 1200,
     },
     "market_data": {
         "stock_feed": "sip",
@@ -4571,6 +4592,122 @@ class EliteScanner:
         append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
         return bool(sent)
 
+    def process_morning_playbook(
+        self,
+        snap: Optional[SymbolSnapshot],
+        market_context: Optional[Dict[str, Any]] = None,
+        *,
+        now: Optional[datetime] = None,
+        state_path: Path = MORNING_PLAYBOOK_STATE,
+        log_path: Path = MORNING_PLAYBOOK_LOG,
+    ) -> bool:
+        settings = dict(self.config.get("morning_playbook", {}))
+        notifications = self.config.get("notifications", {})
+        settings["telegram_enabled"] = bool(
+            settings.get("telegram_enabled", True)
+            and notifications.get("telegram_enabled", False)
+        )
+        now = (now or now_et()).astimezone(ET)
+        eligible, reason = should_send_morning_playbook(now, settings, state_path)
+        if not eligible:
+            return False
+
+        payload: Dict[str, Any] = build_morning_playbook_payload(
+            "AAPL",
+            snap.latest_bar.c if snap and snap.latest_bar else None,
+            {
+                "pmh": snap.premarket_high if snap else None,
+                "pml": snap.premarket_low if snap else None,
+            },
+            market_context=market_context,
+        )
+        try:
+            known_levels: Dict[str, Any] = {
+                "pmh": snap.premarket_high if snap else None,
+                "pml": snap.premarket_low if snap else None,
+            }
+            structure: Dict[str, Any] = {}
+            if snap:
+                from tools.preview_market_structure import _known_levels, build_market_structure
+
+                known_levels.update(_known_levels(snap.recent_bars, snap.daily_bars, self.config))
+                if settings.get("include_market_structure", True):
+                    structure = build_market_structure(
+                        "AAPL",
+                        snap.recent_bars,
+                        daily_bars=snap.daily_bars,
+                        config=self.config,
+                    )
+            sweep = (
+                self.latest_liquidity_sweep_context.get("AAPL", {})
+                if settings.get("include_liquidity_sweeps", True)
+                else {}
+            )
+            option_context: Dict[str, Any] = {}
+            if snap:
+                spreads = [
+                    selection.contract.spread_pct
+                    for selection in (snap.best_call, snap.best_put)
+                    if selection.contract and selection.contract.spread_pct is not None
+                ]
+                if spreads and min(spreads) > float(self.config.get("options", {}).get("max_spread_pct", 12)):
+                    option_context["spread_warning"] = "Current option spreads are wide."
+            payload = build_morning_playbook_payload(
+                "AAPL",
+                snap.latest_bar.c if snap and snap.latest_bar else None,
+                known_levels,
+                market_structure=structure,
+                liquidity_sweep=sweep,
+                market_context=market_context,
+                option_context=option_context,
+            )
+            max_chars = int(settings.get("max_chars", 1200))
+            message = format_morning_playbook_message(payload, max_chars=max_chars)
+            valid, validation_reason = validate_morning_playbook_message(payload, message, max_chars=max_chars)
+            if not valid:
+                append_morning_playbook_log(
+                    log_path,
+                    payload,
+                    False,
+                    f"message validation failed: {validation_reason}",
+                    validation_passed=False,
+                )
+                mark_morning_playbook_sent(state_path, now.date().isoformat())
+                return False
+            sent, error = send_telegram_message(
+                token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+                message=message,
+                timeout_seconds=int(notifications.get("telegram_timeout_seconds", 8)),
+                alert_type="MORNING_PLAYBOOK",
+                alert_source="MORNING_PLAYBOOK",
+                symbol="AAPL",
+                sms_sent=False,
+                alert_tier="CONTEXT",
+                alert_tier_reason="Morning playbook is context-only and cannot approve trades",
+                message_source_path="scanner.morning_playbook",
+                phone_conclusion="WATCH ONLY",
+                phone_conclusion_reason="Morning preparation map; confirm manually",
+            )
+            append_morning_playbook_log(
+                log_path,
+                payload,
+                bool(sent),
+                "sent" if sent else error,
+                validation_passed=True,
+                message_length=len(message),
+            )
+            mark_morning_playbook_sent(state_path, now.date().isoformat())
+            if not sent:
+                logger.warning("Morning playbook Telegram send failed safely: %s", error)
+            return bool(sent)
+        except Exception as exc:
+            error = redact_notification_error(exc)
+            append_morning_playbook_log(log_path, payload, False, f"morning playbook failed safely: {error}")
+            mark_morning_playbook_sent(state_path, now.date().isoformat())
+            logger.warning("Morning playbook failed safely: %s", error)
+            return False
+
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
         start = session_history_start(self.config)
@@ -6882,6 +7019,7 @@ class EliteScanner:
                 continue
             if symbol == "AAPL":
                 self.process_liquidity_sweep_telegram(snap)
+                self.process_morning_playbook(snap, market_context)
             for alert in self.evaluate_symbol(snap, market_context, market_bars):
                 if self.process_alert(alert):
                     count += 1
@@ -7159,6 +7297,17 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     )
     sweep["telegram_include_structure"] = env_bool(
         "LIQUIDITY_SWEEP_TELEGRAM_INCLUDE_STRUCTURE", bool(sweep.get("telegram_include_structure", True))
+    )
+    playbook = config.setdefault("morning_playbook", {})
+    playbook["enabled"] = env_bool("ENABLE_MORNING_PLAYBOOK", bool(playbook.get("enabled", True)))
+    playbook["send_time_et"] = os.getenv(
+        "MORNING_PLAYBOOK_SEND_TIME_ET", str(playbook.get("send_time_et", "09:25"))
+    ).strip() or "09:25"
+    playbook["telegram_enabled"] = env_bool(
+        "MORNING_PLAYBOOK_TELEGRAM_ENABLED", bool(playbook.get("telegram_enabled", True))
+    )
+    playbook["max_chars"] = env_int(
+        "MORNING_PLAYBOOK_MAX_CHARS", int(playbook.get("max_chars", 1200))
     )
 
     quality = config.setdefault("alert_quality", {})
