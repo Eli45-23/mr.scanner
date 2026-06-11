@@ -322,6 +322,10 @@ def validate_openai_output(name: str, output: Dict[str, Any], facts: Dict[str, s
         failures.append("changed or omitted invalidation")
     if output["option"].strip() != facts["option"] or f"Option:\n{facts['option']}" not in message:
         failures.append("changed or omitted option quality")
+    locked_structure_numbers = re.findall(r"\d+(?:\.\d+)?", facts.get("structure", ""))
+    output_structure_numbers = re.findall(r"\d+(?:\.\d+)?", message)
+    if any(number not in output_structure_numbers for number in locked_structure_numbers):
+        failures.append("changed or omitted locked market-structure numeric level")
     if output["reminder"].strip() != DISCLAIMER or DISCLAIMER not in message:
         failures.append("changed or omitted disclaimer")
     direction = facts["direction"]

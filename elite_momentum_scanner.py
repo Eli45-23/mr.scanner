@@ -67,6 +67,8 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
 import requests
 from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
+from scanner.chop_mode_engine import clean_breakout_exits_chop, evaluate_chop_mode
+from scanner.missed_clean_entry import detect_missed_clean_entry
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
 from strategies.context import evaluate_multi_timeframe_context
@@ -87,6 +89,8 @@ MARKET_REGIME_LOG = LOG_DIR / "market_regime.jsonl"
 MULTI_TIMEFRAME_CONTEXT_LOG = LOG_DIR / "multi_timeframe_context.jsonl"
 POST_ALERT_PERFORMANCE_LOG = LOG_DIR / "post_alert_performance.jsonl"
 NEWS_CONTEXT_LOG = LOG_DIR / "news_context.jsonl"
+CHOP_MODE_LOG = LOG_DIR / "chop_mode.jsonl"
+MISSED_CLEAN_ENTRY_LOG = LOG_DIR / "missed_clean_entry.jsonl"
 PHASE3_TELEGRAM_DEDUPE_STATE = STATE_DIR / "phase3_telegram_dedupe.json"
 TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 
@@ -198,6 +202,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "can_confirm": True,
         "can_downgrade": True,
         "can_upgrade": False,
+        "enable_telegram": True,
+        "telegram_max_lines": 2,
+    },
+    "decision_quality": {
+        "enable_chop_mode": True,
+        "chop_mode_lookback_minutes": 15,
+        "chop_mode_min_flips": 2,
+        "chop_mode_min_mixed_alerts": 3,
+        "chop_mode_suppress_repeated_alerts": True,
+        "chop_mode_cooldown_minutes": 15,
+        "chop_mode_allow_breakout_exit": True,
+        "enable_missed_clean_entry_label": True,
+        "missed_clean_entry_lookback_minutes": 15,
+        "missed_clean_entry_cooldown_minutes": 15,
     },
     "market_data": {
         "stock_feed": "sip",
@@ -613,6 +631,11 @@ class Alert:
     plain_english_conclusion: Optional[str] = None
     alert_decision_label: Optional[str] = None
     alert_decision_explanation: Optional[str] = None
+    decision_tier: Optional[str] = None
+    decision_label: Optional[str] = None
+    decision_reason: Optional[str] = None
+    internal_risk_warning_reason: Optional[str] = None
+    risk_warning_is_actual_risk: bool = False
     no_trade_reason: Optional[str] = None
     mixed_signal_no_trade: bool = False
     telegram_message_version: Optional[str] = None
@@ -754,6 +777,29 @@ class Alert:
     context_symbols_expected: List[str] = field(default_factory=list)
     watch_only_late_move: Optional[bool] = None
     do_not_chase_watch: Optional[bool] = None
+    chop_mode_active: bool = False
+    chop_mode_type: Optional[str] = None
+    chop_mode_reason: Optional[str] = None
+    chop_suppression_active: bool = False
+    chop_suppression_reason: Optional[str] = None
+    chop_warning_sent: bool = False
+    suppressed_by_chop: bool = False
+    market_structure_summary: Optional[str] = None
+    market_structure_warning: Optional[str] = None
+    market_structure_range_low: Optional[float] = None
+    market_structure_range_high: Optional[float] = None
+    market_structure_near_demand: bool = False
+    market_structure_near_supply: bool = False
+    missed_clean_entry: bool = False
+    previous_clean_setup_time: Optional[str] = None
+    previous_clean_setup_name: Optional[str] = None
+    previous_clean_setup_score: Optional[int] = None
+    missed_clean_entry_reason: Optional[str] = None
+    lesson: Optional[str] = None
+    bearish_confirmation_quality: Optional[str] = None
+    bearish_confirmation_reason: Optional[str] = None
+    bearish_downgraded_by_structure: bool = False
+    bearish_downgrade_reason: Optional[str] = None
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -1884,6 +1930,19 @@ class AlertWriter:
                 "plain_english_conclusion": alert.plain_english_conclusion,
                 "alert_decision_label": alert.alert_decision_label,
                 "alert_decision_explanation": alert.alert_decision_explanation,
+                "decision_tier": alert.decision_tier,
+                "decision_label": alert.decision_label,
+                "decision_reason": alert.decision_reason,
+                "internal_risk_warning_reason": alert.internal_risk_warning_reason,
+                "risk_warning_is_actual_risk": alert.risk_warning_is_actual_risk,
+                "chop_mode_active": alert.chop_mode_active,
+                "chop_mode_type": alert.chop_mode_type,
+                "chop_mode_reason": alert.chop_mode_reason,
+                "suppressed_by_chop": alert.suppressed_by_chop,
+                "missed_clean_entry": alert.missed_clean_entry,
+                "bearish_confirmation_quality": alert.bearish_confirmation_quality,
+                "bearish_downgraded_by_structure": alert.bearish_downgraded_by_structure,
+                "bearish_downgrade_reason": alert.bearish_downgrade_reason,
                 "telegram_message_version": alert.telegram_message_version,
                 "old_format_removed": alert.old_format_removed,
                 "conflict_warning_added": alert.conflict_warning_added,
@@ -1969,6 +2028,41 @@ class AlertWriter:
                 "sms_allowed": alert.sms_allowed,
             },
         )
+        self._append_jsonl(
+            CHOP_MODE_LOG,
+            {
+                "timestamp": alert.timestamp.isoformat(),
+                "symbol": alert.symbol,
+                "chop_mode_active": alert.chop_mode_active,
+                "chop_mode_type": alert.chop_mode_type,
+                "chop_mode_reason": alert.chop_mode_reason,
+                "range_low": alert.market_structure_range_low,
+                "range_high": alert.market_structure_range_high,
+                "suppression_active": alert.chop_suppression_active,
+                "suppressed_alert_type": alert.phone_conclusion if alert.suppressed_by_chop else None,
+                "suppressed_setup": alert.setup_name if alert.suppressed_by_chop else None,
+                "exit_condition_met": not alert.chop_mode_active,
+                "market_structure_summary": alert.market_structure_summary,
+                "git_commit": git_value("rev-parse", "--short", "HEAD"),
+            },
+        )
+        if alert.missed_clean_entry:
+            self._append_jsonl(
+                MISSED_CLEAN_ENTRY_LOG,
+                {
+                    "timestamp": alert.timestamp.isoformat(),
+                    "symbol": alert.symbol,
+                    "setup_name": alert.setup_name or alert.primary_setup,
+                    "direction": alert.scenario_direction or alert.direction,
+                    "previous_clean_setup_time": alert.previous_clean_setup_time,
+                    "previous_clean_setup_score": alert.previous_clean_setup_score,
+                    "current_stage": alert.scenario_stage or alert.setup_stage,
+                    "current_price": alert.price,
+                    "reason": alert.missed_clean_entry_reason,
+                    "lesson": alert.lesson,
+                    "git_commit": git_value("rev-parse", "--short", "HEAD"),
+                },
+            )
         self._append_jsonl(
             self.phase3_heads_up_jsonl_path,
             {
@@ -2303,7 +2397,13 @@ def assign_phone_conclusion(alert: Alert) -> Alert:
     if alert.confirmation_score is not None and alert.confirmation_score < 60:
         specific_risks.append("confirmation below 60")
 
-    if mixed:
+    if alert.chop_mode_active:
+        conclusion = "CHOP MODE"
+        reason = alert.chop_mode_reason or "No clean edge inside the active range."
+    elif alert.missed_clean_entry:
+        conclusion = "DO NOT CHASE"
+        reason = alert.missed_clean_entry_reason or "Earlier clean setup is now late."
+    elif mixed:
         conclusion = "MIXED / NO TRADE"
         reason = "Signals conflict. Wait for a cleaner setup."
         alert.mixed_signal_detected = True
@@ -2330,6 +2430,43 @@ def assign_phone_conclusion(alert: Alert) -> Alert:
     alert.plain_english_conclusion = reason
     alert.alert_decision_label = conclusion
     alert.alert_decision_explanation = reason
+    actual_option_risk = option_quality in {
+        "WIDE_SPREAD", "POOR_QUALITY", "STALE", "INVALID", "TOO_RISKY_0DTE", "LOW_LIQUIDITY"
+    }
+    if alert.chop_mode_active:
+        alert.decision_tier = "CHOP_MODE"
+        alert.decision_label = "CHOP_MODE"
+        alert.decision_reason = alert.chop_mode_reason or "No clean edge inside the active range"
+    elif alert.missed_clean_entry:
+        alert.decision_tier = "DO_NOT_CHASE"
+        alert.decision_label = "MISSED_CLEAN_ENTRY_NOW_LATE"
+        alert.decision_reason = alert.missed_clean_entry_reason
+    elif conclusion == "MIXED / NO TRADE":
+        alert.decision_tier = "MIXED_NO_TRADE"
+        alert.decision_label = "MIXED_NO_TRADE"
+        alert.decision_reason = reason
+    elif conclusion == "DO NOT CHASE":
+        alert.decision_tier = "DO_NOT_CHASE"
+        alert.decision_label = "DO_NOT_CHASE"
+        alert.decision_reason = reason
+    elif actual_option_risk:
+        alert.decision_tier = "RISK_WARNING"
+        alert.decision_label = "RISK_WARNING"
+        alert.decision_reason = option_quality_message(option_quality)
+    elif conclusion == "TRADE QUALITY WATCH":
+        alert.decision_tier = "TRADE_QUALITY_WATCH"
+        alert.decision_label = "TRADE_QUALITY_WATCH"
+        alert.decision_reason = reason
+    elif conclusion == "WATCH ONLY":
+        alert.decision_tier = "WATCH_ONLY"
+        alert.decision_label = "WATCH_ONLY"
+        alert.decision_reason = reason
+    else:
+        alert.decision_tier = "CONTEXT_ONLY"
+        alert.decision_label = "CONTEXT_ONLY"
+        alert.decision_reason = reason
+    alert.risk_warning_is_actual_risk = actual_option_risk
+    alert.internal_risk_warning_reason = option_quality_message(option_quality) if actual_option_risk else None
     alert.telegram_message_version = "CONCLUSION_FIRST_V2"
     alert.old_format_removed = True
     return alert
@@ -2388,6 +2525,10 @@ def _telegram_title(symbol: str, alert_type: str) -> str:
 
 
 def _telegram_reason(alert: Alert, scenario: Dict[str, Any]) -> str:
+    if alert.chop_mode_active:
+        return alert.chop_mode_reason or "AAPL is trading without a clean edge."
+    if alert.missed_clean_entry:
+        return alert.missed_clean_entry_reason or "Earlier clean setup is now late."
     if alert.mixed_signal_no_trade:
         return alert.phone_conclusion_reason or "Signals conflict. Wait for a cleaner setup."
     if alert.setup_reason:
@@ -2789,19 +2930,27 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
         market_bits.append(f"SPY {alert.spy_alignment}")
     if alert.qqq_alignment:
         market_bits.append(f"QQQ {alert.qqq_alignment}")
-    structure_bits = [
-        f"1m {alert.trend_1m or 'UNKNOWN'}",
-        f"5m {alert.trend_5m or 'UNKNOWN'}",
-        f"15m {alert.trend_15m or 'UNKNOWN'}",
-    ]
-    if alert.current_structure_bias:
-        structure_bits.append(f"bias {alert.current_structure_bias}")
+    structure_text = alert.market_structure_summary
+    if not structure_text:
+        structure_bits = [
+            f"1m {alert.trend_1m or 'UNKNOWN'}",
+            f"5m {alert.trend_5m or 'UNKNOWN'}",
+            f"15m {alert.trend_15m or 'UNKNOWN'}",
+        ]
+        if alert.current_structure_bias:
+            structure_bits.append(f"bias {alert.current_structure_bias}")
+        structure_text = " | ".join(structure_bits)
     invalidation = (
         f"{alert.invalidation_level:.2f} — {alert.invalidation_reason}"
         if alert.invalidation_level is not None
         else alert.invalidation_reason or "No clean invalidation — watch only"
     )
     watch = alert.setup_watch_text or confirmation_required_for_tier(alert)
+    if alert.chop_mode_active:
+        watch = "Clean break-and-hold outside the range with 5m confirmation and SPY/QQQ alignment."
+        option_quality = "Do not touch options while setup is mixed/choppy."
+    elif alert.missed_clean_entry:
+        watch = "A new pullback/retest before considering continuation."
     if alert.news_context_present:
         watch = f"{watch} Fresh AAPL news present — context only. Confirm price reaction."
     main_risk = telegram_risk_warning_reason(alert)
@@ -2818,7 +2967,7 @@ def professional_telegram_message(alert: Alert, alert_type: str) -> str:
         "",
         f"Why: {_short_phone_text(_telegram_reason(alert, scenario), 170)}",
         f"Market: {' | '.join(market_bits)}",
-        f"Structure: {' | '.join(structure_bits)}",
+        f"Structure: {_short_phone_text(structure_text, 170)}",
         f"Risk: {_short_phone_text(main_risk, 140)}",
         f"Wait for: {_short_phone_text(watch, 170)}",
         f"Invalidation: {_short_phone_text(invalidation, 170)}",
@@ -4078,6 +4227,146 @@ class EliteScanner:
             intervals=performance_config.get("interval_minutes", [1, 3, 5, 10, 15]),
             target_move_pct=float(performance_config.get("target_move_pct", 0.30)),
         )
+        self.decision_history: List[Dict[str, Any]] = []
+        self.last_chop_warning_at: Optional[datetime] = None
+        self.last_missed_entry_alerts: Dict[str, datetime] = {}
+
+    def latest_market_structure(self) -> Dict[str, Any]:
+        path = LOG_DIR / "market_structure.jsonl"
+        if not path.exists():
+            return {}
+        try:
+            for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()):
+                record = json.loads(line)
+                if str(record.get("symbol") or "").upper() == "AAPL":
+                    return record
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return {}
+
+    def apply_market_structure_decision_quality(self, alert: Alert) -> None:
+        structure_record = self.latest_market_structure()
+        structure = structure_record.get("summary") if isinstance(structure_record.get("summary"), dict) else structure_record
+        alert.market_structure_summary = structure.get("current_price_location_summary")
+        alert.market_structure_warning = structure.get("structure_warning")
+        alert.market_structure_range_low = structure.get("range_low")
+        alert.market_structure_range_high = structure.get("range_high")
+        warning = str(alert.market_structure_warning or "").lower()
+        alert.market_structure_near_demand = "near demand" in warning
+        alert.market_structure_near_supply = "near supply" in warning
+
+        decision_config = self.config.get("decision_quality", {})
+        chop = evaluate_chop_mode(
+            self.decision_history,
+            structure_record,
+            now=alert.timestamp,
+            lookback_minutes=int(decision_config.get("chop_mode_lookback_minutes", 15)),
+            min_flips=int(decision_config.get("chop_mode_min_flips", 2)),
+            min_mixed_alerts=int(decision_config.get("chop_mode_min_mixed_alerts", 3)),
+        )
+        if decision_config.get("enable_chop_mode", True):
+            alert.chop_mode_active = bool(chop["chop_mode_active"])
+            alert.chop_mode_type = chop["chop_mode_type"] or None
+            alert.chop_mode_reason = chop["chop_mode_reason"] or None
+            alert.chop_suppression_active = bool(chop["suppression_active"])
+            alert.chop_suppression_reason = chop["suppression_reason"] or None
+
+        direction = str(alert.scenario_direction or alert.setup_direction or alert.direction or "").upper()
+        setup_name = str(alert.setup_name or alert.primary_setup or (alert.scenario_top or {}).get("scenario_name") or "")
+        stage = str(alert.scenario_stage or alert.setup_stage or (alert.scenario_top or {}).get("stage") or "").upper()
+        if direction == "BEARISH" and ("PULLBACK" in setup_name.upper() or "REJECTION" in setup_name.upper()):
+            reasons: List[str] = []
+            vwap = alert.scenario_levels.get("vwap") if alert.scenario_levels else None
+            ema9 = alert.scenario_levels.get("ema9") if alert.scenario_levels else None
+            if isinstance(vwap, (int, float)) and alert.price > vwap:
+                reasons.append("Bearish rejection is weak because price is still above VWAP.")
+            if isinstance(ema9, (int, float)) and alert.price > ema9:
+                reasons.append("Price is above EMA9.")
+            if alert.volume_label == "WEAK":
+                reasons.append("Volume is weak.")
+            if alert.market_alignment == "OPPOSED":
+                reasons.append("SPY/QQQ oppose the bearish setup.")
+            if alert.market_structure_near_demand:
+                reasons.append("Price is near demand.")
+            if alert.chop_mode_active:
+                reasons.append("Market structure is inside a chop range.")
+            if reasons:
+                alert.bearish_confirmation_quality = "WEAK"
+                alert.bearish_confirmation_reason = " ".join(reasons)
+                alert.bearish_downgraded_by_structure = bool(alert.market_structure_near_demand or alert.chop_mode_active)
+                alert.bearish_downgrade_reason = " / ".join(reasons)
+                alert.sms_allowed = False
+                alert.scenario_would_sms = False if alert.scenario_would_sms is not None else None
+                alert.scenario_sms_allowed = False if alert.scenario_sms_allowed is not None else None
+                alert.watch_allowed = bool(alert.watch_allowed)
+                if alert.bearish_confirmation_reason not in alert.strategy_warnings:
+                    alert.strategy_warnings.insert(0, alert.bearish_confirmation_reason)
+            else:
+                alert.bearish_confirmation_quality = "STRONG"
+                alert.bearish_confirmation_reason = "Below VWAP/EMA9 with no structure conflict detected."
+
+        if decision_config.get("enable_missed_clean_entry_label", True):
+            missed = detect_missed_clean_entry(
+                self.decision_history,
+                setup_name=setup_name,
+                direction=direction,
+                current_stage=stage,
+                now=alert.timestamp,
+                lookback_minutes=int(decision_config.get("missed_clean_entry_lookback_minutes", 15)),
+            )
+            if missed.get("missed_clean_entry"):
+                key = f"{setup_name}|{direction}"
+                last = self.last_missed_entry_alerts.get(key)
+                cooldown = int(decision_config.get("missed_clean_entry_cooldown_minutes", 15))
+                if not last or (alert.timestamp - last).total_seconds() >= cooldown * 60:
+                    alert.missed_clean_entry = True
+                    alert.previous_clean_setup_time = missed.get("previous_clean_setup_time")
+                    alert.previous_clean_setup_name = missed.get("previous_clean_setup_name")
+                    alert.previous_clean_setup_score = missed.get("previous_clean_setup_score")
+                    alert.missed_clean_entry_reason = missed.get("missed_clean_entry_reason")
+                    alert.lesson = missed.get("lesson")
+                    self.last_missed_entry_alerts[key] = alert.timestamp
+
+        clean_exit = clean_breakout_exits_chop(
+            chop,
+            price=alert.price,
+            stage=stage,
+            option_tradable=bool(alert.option_tradable),
+            market_alignment=str(alert.market_alignment or ""),
+            mixed_signal=bool(alert.mixed_signal_detected or alert.scenario_conflict),
+            structure_warning=str(alert.market_structure_warning or ""),
+        )
+        if alert.chop_mode_active and not clean_exit and decision_config.get("chop_mode_suppress_repeated_alerts", True):
+            cooldown = int(decision_config.get("chop_mode_cooldown_minutes", 15))
+            warning_due = not self.last_chop_warning_at or (
+                alert.timestamp - self.last_chop_warning_at
+            ).total_seconds() >= cooldown * 60
+            alert.sms_allowed = False
+            alert.watch_allowed = False
+            alert.phase3_heads_up_sent = bool(warning_due)
+            alert.phase3_heads_up_eligible = bool(warning_due)
+            alert.phase3_heads_up_type = "STOCK_ONLY_WARNING" if warning_due else "BLOCKED"
+            alert.chop_warning_sent = bool(warning_due)
+            alert.suppressed_by_chop = not warning_due
+            if warning_due:
+                self.last_chop_warning_at = alert.timestamp
+            else:
+                alert.phase3_heads_up_block_reason = "Suppressed: Chop Mode already warned inside cooldown"
+
+        self.decision_history.append({
+            "timestamp": alert.timestamp.isoformat(),
+            "setup_name": setup_name,
+            "direction": direction,
+            "stage": stage,
+            "score": alert.scenario_score or alert.setup_score,
+            "phone_conclusion": alert.phone_conclusion,
+            "decision_label": alert.decision_label,
+        })
+        cutoff = alert.timestamp - timedelta(minutes=max(30, int(decision_config.get("chop_mode_lookback_minutes", 15)) * 2))
+        self.decision_history = [
+            record for record in self.decision_history
+            if datetime.fromisoformat(record["timestamp"]) >= cutoff
+        ]
 
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
@@ -6326,6 +6615,7 @@ class EliteScanner:
         text_key: Optional[str] = None
         category_cooldown_allowed = self.cooldown_allows(alert)
         self.maybe_allow_trend_flip_watch(alert)
+        self.apply_market_structure_decision_quality(alert)
         if not category_cooldown_allowed and not alert.sms_allowed and not alert.phase3_heads_up_sent:
             return False
         if alert.sms_allowed:
@@ -6574,6 +6864,39 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     structure["can_confirm"] = env_bool("MARKET_STRUCTURE_CAN_CONFIRM", bool(structure.get("can_confirm", True)))
     structure["can_downgrade"] = env_bool("MARKET_STRUCTURE_CAN_DOWNGRADE", bool(structure.get("can_downgrade", True)))
     structure["can_upgrade"] = env_bool("MARKET_STRUCTURE_CAN_UPGRADE", bool(structure.get("can_upgrade", False)))
+    structure["enable_telegram"] = env_bool(
+        "ENABLE_MARKET_STRUCTURE_TELEGRAM", bool(structure.get("enable_telegram", True))
+    )
+    structure["telegram_max_lines"] = env_int(
+        "MARKET_STRUCTURE_TELEGRAM_MAX_LINES", int(structure.get("telegram_max_lines", 2))
+    )
+    decision = config.setdefault("decision_quality", {})
+    decision["enable_chop_mode"] = env_bool("ENABLE_CHOP_MODE", bool(decision.get("enable_chop_mode", True)))
+    decision["chop_mode_lookback_minutes"] = env_int(
+        "CHOP_MODE_LOOKBACK_MINUTES", int(decision.get("chop_mode_lookback_minutes", 15))
+    )
+    decision["chop_mode_min_flips"] = env_int("CHOP_MODE_MIN_FLIPS", int(decision.get("chop_mode_min_flips", 2)))
+    decision["chop_mode_min_mixed_alerts"] = env_int(
+        "CHOP_MODE_MIN_MIXED_ALERTS", int(decision.get("chop_mode_min_mixed_alerts", 3))
+    )
+    decision["chop_mode_suppress_repeated_alerts"] = env_bool(
+        "CHOP_MODE_SUPPRESS_REPEATED_ALERTS", bool(decision.get("chop_mode_suppress_repeated_alerts", True))
+    )
+    decision["chop_mode_cooldown_minutes"] = env_int(
+        "CHOP_MODE_COOLDOWN_MINUTES", int(decision.get("chop_mode_cooldown_minutes", 15))
+    )
+    decision["chop_mode_allow_breakout_exit"] = env_bool(
+        "CHOP_MODE_ALLOW_BREAKOUT_EXIT", bool(decision.get("chop_mode_allow_breakout_exit", True))
+    )
+    decision["enable_missed_clean_entry_label"] = env_bool(
+        "ENABLE_MISSED_CLEAN_ENTRY_LABEL", bool(decision.get("enable_missed_clean_entry_label", True))
+    )
+    decision["missed_clean_entry_lookback_minutes"] = env_int(
+        "MISSED_CLEAN_ENTRY_LOOKBACK_MINUTES", int(decision.get("missed_clean_entry_lookback_minutes", 15))
+    )
+    decision["missed_clean_entry_cooldown_minutes"] = env_int(
+        "MISSED_CLEAN_ENTRY_COOLDOWN_MINUTES", int(decision.get("missed_clean_entry_cooldown_minutes", 15))
+    )
 
     quality = config.setdefault("alert_quality", {})
     quality["sms_min_confirmation_score"] = env_int(

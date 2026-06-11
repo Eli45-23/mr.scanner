@@ -259,7 +259,13 @@ def build_review_summary(
     option_window: List[Dict[str, Any]],
     market_data_records: List[Dict[str, Any]],
     notes: List[str],
+    chop_records: Optional[List[Dict[str, Any]]] = None,
+    missed_entry_records: Optional[List[Dict[str, Any]]] = None,
+    openai_records: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    chop_records = chop_records or []
+    missed_entry_records = missed_entry_records or []
+    openai_records = openai_records or []
     market_status = latest_status_for_day(market_data_records)
     alert_rows = [
         [
@@ -330,6 +336,19 @@ def build_review_summary(
             "RISK WARNING",
         )
     }
+    decision_tiers = [
+        str(record.get("decision_tier") or "").upper()
+        for record in alert_window
+        if record.get("decision_tier")
+    ]
+    decision_counts = {label: decision_tiers.count(label) for label in sorted(set(decision_tiers))}
+    suppressed = [record for record in alert_window if record.get("suppressed_by_chop")]
+    structure_downgrades = [record for record in alert_window if record.get("bearish_downgraded_by_structure")]
+    near_demand = [record for record in alert_window if record.get("market_structure_near_demand")]
+    near_supply = [record for record in alert_window if record.get("market_structure_near_supply")]
+    inside_chop = [record for record in alert_window if record.get("chop_mode_active")]
+    openai_success = sum(1 for record in openai_records if record.get("formatter_success"))
+    openai_fallback = sum(1 for record in openai_records if record.get("fallback_used"))
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -388,6 +407,19 @@ def build_review_summary(
 - Context Only: {conclusion_counts["CONTEXT ONLY"]}
 - Risk Warning: {conclusion_counts["RISK WARNING"]}
 
+## Decision Quality Cleanup
+- Decision tier counts: {json.dumps(decision_counts, sort_keys=True)}
+- CHOP_MODE records: {sum(1 for record in chop_records if record.get("chop_mode_active"))}
+- Alerts suppressed by chop: {len(suppressed)}
+- Mixed alerts suppressed by chop: {sum(1 for record in suppressed if str(record.get("phone_conclusion", "")).upper() == "MIXED / NO TRADE")}
+- Do-not-chase alerts suppressed by chop: {sum(1 for record in suppressed if str(record.get("phone_conclusion", "")).upper() == "DO NOT CHASE")}
+- Missed clean entry records: {len(missed_entry_records)}
+- Bearish downgrades by structure: {len(structure_downgrades)}
+- Alerts near demand: {len(near_demand)}
+- Alerts near supply: {len(near_supply)}
+- Alerts inside chop range: {len(inside_chop)}
+- OpenAI formatter success / fallback: {openai_success} / {openai_fallback}
+
 ### Premarket
 {markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(premarket))}
 
@@ -425,6 +457,8 @@ def build_review_summary(
 - `logs/support_resistance_levels.jsonl`
 - `logs/supply_demand_zones.jsonl`
 - `logs/market_structure.jsonl`
+- `logs/chop_mode.jsonl` if available
+- `logs/missed_clean_entry.jsonl` if available
 - `logs/openai_alert_formatter.jsonl` if available
 - `logs/premarket_discipline_message.jsonl` if available
 - latest scanner log if available
@@ -494,6 +528,8 @@ def export_review_package(
     market_structure = records_for_day(read_jsonl(log_dir / "market_structure.jsonl"), day_text)
     openai_formatter = records_for_day(read_jsonl(log_dir / "openai_alert_formatter.jsonl"), day_text)
     premarket_discipline = records_for_day(read_jsonl(log_dir / "premarket_discipline_message.jsonl"), day_text)
+    chop_mode = records_for_day(read_jsonl(log_dir / "chop_mode.jsonl"), day_text)
+    missed_clean_entry = records_for_day(read_jsonl(log_dir / "missed_clean_entry.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -514,6 +550,10 @@ def export_review_package(
         write_jsonl(logs_out / "openai_alert_formatter.jsonl", openai_formatter)
     if (log_dir / "premarket_discipline_message.jsonl").exists():
         write_jsonl(logs_out / "premarket_discipline_message.jsonl", premarket_discipline)
+    if (log_dir / "chop_mode.jsonl").exists():
+        write_jsonl(logs_out / "chop_mode.jsonl", chop_mode)
+    if (log_dir / "missed_clean_entry.jsonl").exists():
+        write_jsonl(logs_out / "missed_clean_entry.jsonl", missed_clean_entry)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
@@ -527,6 +567,10 @@ def export_review_package(
     write_jsonl(window_out / "support_resistance_levels_window.jsonl", records_in_window(support_resistance, start_dt, end_dt))
     write_jsonl(window_out / "supply_demand_zones_window.jsonl", records_in_window(supply_demand, start_dt, end_dt))
     write_jsonl(window_out / "market_structure_window.jsonl", records_in_window(market_structure, start_dt, end_dt))
+    if chop_mode:
+        write_jsonl(window_out / "chop_mode_window.jsonl", records_in_window(chop_mode, start_dt, end_dt))
+    if missed_clean_entry:
+        write_jsonl(window_out / "missed_clean_entry_window.jsonl", records_in_window(missed_clean_entry, start_dt, end_dt))
 
     if not alerts:
         notes.append("No alerts.jsonl records found for the requested date.")
@@ -583,6 +627,9 @@ def export_review_package(
         option_window=records_in_window(options, start_dt, end_dt),
         market_data_records=market_data,
         notes=notes,
+        chop_records=chop_mode,
+        missed_entry_records=missed_clean_entry,
+        openai_records=openai_formatter,
     )
     summary_path = package_dir / "review_summary.md"
     summary_path.write_text(summary, encoding="utf-8")

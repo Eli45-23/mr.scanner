@@ -52,7 +52,21 @@
     "min_zone_strength": 55,
     "can_confirm": true,
     "can_downgrade": true,
-    "can_upgrade": false
+    "can_upgrade": false,
+    "enable_telegram": true,
+    "telegram_max_lines": 2
+  },
+  "decision_quality": {
+    "enable_chop_mode": true,
+    "chop_mode_lookback_minutes": 15,
+    "chop_mode_min_flips": 2,
+    "chop_mode_min_mixed_alerts": 3,
+    "chop_mode_suppress_repeated_alerts": true,
+    "chop_mode_cooldown_minutes": 15,
+    "chop_mode_allow_breakout_exit": true,
+    "enable_missed_clean_entry_label": true,
+    "missed_clean_entry_lookback_minutes": 15,
+    "missed_clean_entry_cooldown_minutes": 15
   },
   "alert_quality": {
     "sms_symbol_cooldown_seconds": 1200,
