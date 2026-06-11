@@ -184,6 +184,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "stale_after_minutes": 20,
         "min_recent_bars": 10,
     },
+    "market_structure_engines": {
+        "enable_support_resistance_engine": True,
+        "enable_supply_demand_engine": True,
+        "support_resistance_timeframes": ["1m", "5m", "15m"],
+        "supply_demand_timeframes": ["1m", "5m", "15m"],
+        "max_levels_per_timeframe": 3,
+        "max_zones_per_timeframe": 3,
+        "refresh_seconds": 15,
+        "min_level_strength": 55,
+        "min_zone_strength": 55,
+        "can_confirm": True,
+        "can_downgrade": True,
+        "can_upgrade": False,
+    },
     "market_data": {
         "stock_feed": "sip",
         "api_rate_limit_mode": "Algo Trader Plus expected",
@@ -6520,6 +6534,41 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
             for part in raw_news_symbols.split(",")
             if part.strip()
         ]
+
+    structure = config.setdefault("market_structure_engines", {})
+    structure["enable_support_resistance_engine"] = env_bool(
+        "ENABLE_SUPPORT_RESISTANCE_ENGINE",
+        bool(structure.get("enable_support_resistance_engine", True)),
+    )
+    structure["enable_supply_demand_engine"] = env_bool(
+        "ENABLE_SUPPLY_DEMAND_ENGINE",
+        bool(structure.get("enable_supply_demand_engine", True)),
+    )
+    for env_name, key in (
+        ("SUPPORT_RESISTANCE_TIMEFRAMES", "support_resistance_timeframes"),
+        ("SUPPLY_DEMAND_TIMEFRAMES", "supply_demand_timeframes"),
+    ):
+        raw = os.getenv(env_name)
+        if raw is not None:
+            structure[key] = [part.strip() for part in raw.split(",") if part.strip()]
+    structure["max_levels_per_timeframe"] = env_int(
+        "MAX_LEVELS_PER_TIMEFRAME", int(structure.get("max_levels_per_timeframe", 3))
+    )
+    structure["max_zones_per_timeframe"] = env_int(
+        "MAX_ZONES_PER_TIMEFRAME", int(structure.get("max_zones_per_timeframe", 3))
+    )
+    structure["refresh_seconds"] = env_int(
+        "MARKET_STRUCTURE_REFRESH_SECONDS", int(structure.get("refresh_seconds", 15))
+    )
+    structure["min_level_strength"] = env_int(
+        "MARKET_STRUCTURE_MIN_LEVEL_STRENGTH", int(structure.get("min_level_strength", 55))
+    )
+    structure["min_zone_strength"] = env_int(
+        "MARKET_STRUCTURE_MIN_ZONE_STRENGTH", int(structure.get("min_zone_strength", 55))
+    )
+    structure["can_confirm"] = env_bool("MARKET_STRUCTURE_CAN_CONFIRM", bool(structure.get("can_confirm", True)))
+    structure["can_downgrade"] = env_bool("MARKET_STRUCTURE_CAN_DOWNGRADE", bool(structure.get("can_downgrade", True)))
+    structure["can_upgrade"] = env_bool("MARKET_STRUCTURE_CAN_UPGRADE", bool(structure.get("can_upgrade", False)))
 
     quality = config.setdefault("alert_quality", {})
     quality["sms_min_confirmation_score"] = env_int(

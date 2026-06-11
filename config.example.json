@@ -39,6 +39,20 @@
     "api_rate_limit_mode": "Algo Trader Plus expected",
     "websocket_symbol_limit": "paid/unlimited expected"
   },
+  "market_structure_engines": {
+    "enable_support_resistance_engine": true,
+    "enable_supply_demand_engine": true,
+    "support_resistance_timeframes": ["1m", "5m", "15m"],
+    "supply_demand_timeframes": ["1m", "5m", "15m"],
+    "max_levels_per_timeframe": 3,
+    "max_zones_per_timeframe": 3,
+    "refresh_seconds": 15,
+    "min_level_strength": 55,
+    "min_zone_strength": 55,
+    "can_confirm": true,
+    "can_downgrade": true,
+    "can_upgrade": false
+  },
   "alert_quality": {
     "sms_symbol_cooldown_seconds": 1200,
     "watch_symbol_cooldown_seconds": 600,
