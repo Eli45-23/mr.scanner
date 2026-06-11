@@ -42,6 +42,7 @@
   "market_structure_engines": {
     "enable_support_resistance_engine": true,
     "enable_supply_demand_engine": true,
+    "enable_dashboard": true,
     "support_resistance_timeframes": ["1m", "5m", "15m"],
     "supply_demand_timeframes": ["1m", "5m", "15m"],
     "max_levels_per_timeframe": 3,

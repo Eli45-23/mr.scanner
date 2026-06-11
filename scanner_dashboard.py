@@ -18,13 +18,176 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import elite_momentum_scanner as scanner_app
 import requests
 from tools import dashboard_snapshot_exporter as snapshot_exporter
+from tools.preview_market_structure import build_market_structure, write_logs as write_market_structure_logs
 
 APP_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("scanner_dashboard")
+ET = ZoneInfo("America/New_York")
+MARKET_STRUCTURE_LOG_PATHS = {
+    "support_resistance": APP_DIR / "logs" / "support_resistance_levels.jsonl",
+    "supply_demand": APP_DIR / "logs" / "supply_demand_zones.jsonl",
+    "summary": APP_DIR / "logs" / "market_structure.jsonl",
+}
+
+
+def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _latest_by_timeframe(records: List[Dict[str, Any]], symbol: str = "AAPL") -> Dict[str, Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        timeframe = str(record.get("timeframe") or "")
+        if timeframe not in {"1m", "5m", "15m"} or str(record.get("symbol") or "").upper() != symbol:
+            continue
+        latest[timeframe] = record
+    return latest
+
+
+def _market_session_label(now: Optional[datetime] = None) -> str:
+    current = (now or datetime.now(timezone.utc)).astimezone(ET)
+    minutes = current.hour * 60 + current.minute
+    if current.weekday() >= 5 or minutes < 4 * 60 or minutes >= 20 * 60:
+        return "After-hours / limited structure"
+    if minutes < 9 * 60 + 30 or minutes >= 16 * 60:
+        return "After-hours / limited structure"
+    return "Live scanner data"
+
+
+def load_market_structure_dashboard(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    paths: Optional[Dict[str, Path]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    config = config or scanner_app.load_config(STATE.config_path)
+    settings = config.get("market_structure_engines", {})
+    enabled = bool(settings.get("enable_dashboard", True))
+    support_enabled = bool(settings.get("enable_support_resistance_engine", True))
+    supply_enabled = bool(settings.get("enable_supply_demand_engine", True))
+    empty = {
+        "enabled": enabled,
+        "engine_status": "ON" if enabled and (support_enabled or supply_enabled) else "OFF",
+        "support_resistance_status": "ON" if support_enabled else "OFF",
+        "supply_demand_status": "ON" if supply_enabled else "OFF",
+        "last_updated": None,
+        "data_mode": "waiting for data",
+        "message": "Waiting for market structure data.",
+        "summary": {},
+        "nearest": {"support": {}, "resistance": {}, "demand": {}, "supply": {}},
+        "copy_summary": "Not enough clean data yet",
+        "support_resistance": {frame: {} for frame in ("1m", "5m", "15m")},
+        "supply_demand": {frame: {} for frame in ("1m", "5m", "15m")},
+        "can_upgrade": bool(settings.get("can_upgrade", False)),
+        "context_only": True,
+    }
+    if not enabled:
+        return {**empty, "data_mode": "disabled", "message": "Market structure dashboard is disabled."}
+
+    source_paths = paths or MARKET_STRUCTURE_LOG_PATHS
+    summary_records = [
+        record
+        for record in _read_jsonl_records(source_paths["summary"])
+        if str(record.get("symbol") or "").upper() == "AAPL"
+    ]
+    support_records = _latest_by_timeframe(_read_jsonl_records(source_paths["support_resistance"]))
+    supply_records = _latest_by_timeframe(_read_jsonl_records(source_paths["supply_demand"]))
+    summary = summary_records[-1] if summary_records else {}
+    timestamps = [
+        str(record.get("timestamp"))
+        for record in list(support_records.values()) + list(supply_records.values()) + ([summary] if summary else [])
+        if record.get("timestamp")
+    ]
+    if not summary and not support_records and not supply_records:
+        return empty
+
+    current_price = summary.get("current_price")
+
+    def nearest_record(
+        records: Dict[str, Dict[str, Any]],
+        group: str,
+        item_type: str,
+        price_field: str,
+        below: bool,
+    ) -> Dict[str, Any]:
+        candidates: List[Dict[str, Any]] = []
+        for timeframe, record in records.items():
+            for item in (record.get(group) or {}).get(item_type, []):
+                value = item.get(price_field)
+                if isinstance(value, (int, float)):
+                    candidates.append({**item, "timeframe": timeframe})
+        if not candidates or not isinstance(current_price, (int, float)):
+            return {}
+        eligible = [
+            item
+            for item in candidates
+            if (item[price_field] <= current_price if below else item[price_field] >= current_price)
+        ]
+        return min(eligible, key=lambda item: abs(item[price_field] - current_price), default={})
+
+    nearest = {
+        "support": nearest_record(support_records, "levels", "support", "price", True),
+        "resistance": nearest_record(support_records, "levels", "resistance", "price", False),
+        "demand": nearest_record(supply_records, "zones", "demand", "midpoint", True),
+        "supply": nearest_record(supply_records, "zones", "supply", "midpoint", False),
+    }
+
+    copy_lines: List[str] = []
+    for timeframe in ("1m", "5m", "15m"):
+        support_record = support_records.get(timeframe, {})
+        supply_record = supply_records.get(timeframe, {})
+        for label, key in (("Support", "support"), ("Resistance", "resistance")):
+            levels = (support_record.get("levels") or {}).get(key, [])
+            if levels:
+                item = levels[0]
+                copy_lines.append(
+                    f"{timeframe} {label}: {float(item['price']):.2f} | {item.get('strength', 'Not enough clean data yet')} | "
+                    f"{item.get('source') or item.get('reason') or 'Not enough clean data yet'}"
+                )
+        for label, key in (("Demand", "demand"), ("Supply", "supply")):
+            zones = (supply_record.get("zones") or {}).get(key, [])
+            if zones:
+                item = zones[0]
+                tested = "Fresh" if item.get("fresh") else f"Tested {item.get('times_tested', 0)}x"
+                copy_lines.append(
+                    f"{timeframe} {label}: {float(item['zone_low']):.2f}-{float(item['zone_high']):.2f} | "
+                    f"{item.get('strength', 'Not enough clean data yet')} | {tested} | "
+                    f"{item.get('last_reaction') or item.get('reason') or 'Not enough clean data yet'}"
+                )
+    session_label = _market_session_label(now)
+    data_mode = session_label if session_label.startswith("After-hours") else "latest log fallback"
+    return {
+        **empty,
+        "last_updated": max(timestamps) if timestamps else None,
+        "data_mode": data_mode,
+        "message": "After-hours / limited structure" if session_label.startswith("After-hours") else "Latest market-structure log data",
+        "summary": summary,
+        "nearest": nearest,
+        "copy_summary": "\n".join(copy_lines) if copy_lines else "Not enough clean data yet",
+        "support_resistance": {frame: support_records.get(frame, {}) for frame in ("1m", "5m", "15m")},
+        "supply_demand": {frame: supply_records.get(frame, {}) for frame in ("1m", "5m", "15m")},
+    }
 
 
 class DashboardState:
@@ -44,6 +207,8 @@ class DashboardState:
         self.worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.config_path: Optional[Path] = None
+        self.market_structure_live: Optional[Dict[str, Any]] = None
+        self.market_structure_updated_monotonic = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
         config = scanner_app.load_config(self.config_path)
@@ -51,6 +216,13 @@ class DashboardState:
         notification_status = scanner_app.latest_notification_status(config)
         scanner_identity = scanner_app.scanner_identity(config)
         with self.lock:
+            live_structure = self.market_structure_live
+        fallback_structure = live_structure or load_market_structure_dashboard(config)
+        with self.lock:
+            market_structure = dict(self.market_structure_live or fallback_structure)
+            if _market_session_label().startswith("After-hours") and market_structure.get("last_updated"):
+                market_structure["data_mode"] = "After-hours / limited structure"
+                market_structure["message"] = "After-hours / limited structure"
             return {
                 "running": self.running,
                 "mode": self.mode,
@@ -76,6 +248,7 @@ class DashboardState:
                 "market_data_status": market_data_status,
                 "notification_status": notification_status,
                 "scanner_identity": scanner_identity,
+                "market_structure": market_structure,
             }
 
 
@@ -95,6 +268,38 @@ AI_REVIEW_DISCLAIMER = (
     "AI Review analyzes scanner output for timing, direction quality, missed context, and possible rule tuning. "
     "It does not place trades, send alerts, change scanner logic, or replace Alpaca data."
 )
+
+
+def refresh_live_market_structure(
+    snapshots: Dict[str, scanner_app.SymbolSnapshot],
+    config: Dict[str, Any],
+    *,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    settings = config.get("market_structure_engines", {})
+    if not settings.get("enable_dashboard", True):
+        return None
+    refresh_seconds = max(1, int(settings.get("refresh_seconds", 15)))
+    current_monotonic = time.monotonic()
+    with STATE.lock:
+        if (
+            not force
+            and STATE.market_structure_live
+            and current_monotonic - STATE.market_structure_updated_monotonic < refresh_seconds
+        ):
+            return STATE.market_structure_live
+    snap = snapshots.get("AAPL")
+    if not snap or not snap.recent_bars:
+        return None
+    payload = build_market_structure("AAPL", snap.recent_bars, daily_bars=snap.daily_bars, config=config)
+    write_market_structure_logs(payload, config)
+    dashboard_payload = load_market_structure_dashboard(config)
+    dashboard_payload["data_mode"] = _market_session_label()
+    dashboard_payload["message"] = "Live scanner candle data"
+    with STATE.lock:
+        STATE.market_structure_live = dashboard_payload
+        STATE.market_structure_updated_monotonic = current_monotonic
+    return dashboard_payload
 
 
 def iso_now() -> str:
@@ -1165,6 +1370,10 @@ def scan_once(app: scanner_app.EliteScanner, source_map: Dict[str, str]) -> tupl
         logger.info("Outside scan window. No scan performed.")
         return 0, []
     snapshots = app.build_snapshots()
+    try:
+        refresh_live_market_structure(snapshots, app.config)
+    except Exception as exc:
+        logger.warning("Market-structure dashboard refresh failed without affecting scanner alerts: %s", exc)
     market_context = app.build_market_context(snapshots)
     market_bars = {
         symbol: snap.recent_bars
@@ -1268,6 +1477,8 @@ def clear_dashboard_data() -> Dict[str, Any]:
         STATE.last_symbol_count = 0
         STATE.last_discovery_count = 0
         STATE.symbol_rows = []
+        STATE.market_structure_live = None
+        STATE.market_structure_updated_monotonic = 0.0
 
     csv_path = Path(config["outputs"]["csv_log"])
     jsonl_path = Path(config["outputs"]["jsonl_log"])
@@ -1397,6 +1608,62 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       display: grid;
       gap: 16px;
+    }
+    .structure-body {
+      padding: 14px 16px 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .structure-status,
+    .structure-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .structure-status > div,
+    .structure-summary > div {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px;
+      min-width: 0;
+    }
+    .structure-wide {
+      grid-column: 1 / -1;
+    }
+    .structure-table-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .structure-table {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow-x: auto;
+    }
+    .structure-table h3 {
+      margin: 0;
+      padding: 9px 10px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+    .structure-table table {
+      min-width: 760px;
+      font-size: 12px;
+    }
+    .structure-table th,
+    .structure-table td {
+      padding: 7px 8px;
+    }
+    .copy-levels {
+      margin: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fbfcfd;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
     }
     .panel-title {
       margin: 0 0 14px;
@@ -1767,6 +2034,7 @@ INDEX_HTML = r"""<!doctype html>
       main { grid-template-columns: 1fr; }
       .controls { grid-template-columns: 1fr; }
       .options-view { grid-template-columns: 1fr; }
+      .structure-status, .structure-summary { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -1844,6 +2112,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="content">
       <section>
         <div class="table-head">
+          <h2>Live Market Structure</h2>
+          <span class="muted" id="marketStructureUpdated">Waiting for data</span>
+        </div>
+        <div class="structure-body" id="liveMarketStructure"></div>
+      </section>
+      <section>
+        <div class="table-head">
           <h2>Market View</h2>
           <span class="muted" id="lastScan">No scan yet</span>
         </div>
@@ -1902,6 +2177,8 @@ INDEX_HTML = r"""<!doctype html>
       alertCount: document.getElementById('alertCount'),
       market: document.getElementById('market'),
       alerts: document.getElementById('alerts'),
+      liveMarketStructure: document.getElementById('liveMarketStructure'),
+      marketStructureUpdated: document.getElementById('marketStructureUpdated'),
     };
 
     async function api(path, options = {}) {
@@ -1991,6 +2268,104 @@ INDEX_HTML = r"""<!doctype html>
       const values = (items || []).filter(Boolean);
       if (!values.length) return '<span class="muted">None</span>';
       return `<ul>${values.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>`;
+    }
+
+    function structureValue(value) {
+      return value === null || value === undefined || value === '' ? 'Not enough clean data yet' : value;
+    }
+
+    function structureMoney(value) {
+      return value === null || value === undefined ? 'Not enough clean data yet' : Number(value).toFixed(2);
+    }
+
+    function renderNearestLevel(label, item, zone = false) {
+      if (!item || !Object.keys(item).length) return `${label}: Not enough clean data yet`;
+      const price = zone
+        ? `${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)}`
+        : structureMoney(item.price);
+      return `${label}: ${price} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
+    }
+
+    function renderStructureLevelTable(timeframe, record) {
+      const support = ((record || {}).levels || {}).support || [];
+      const resistance = ((record || {}).levels || {}).resistance || [];
+      const rows = [
+        ...support.map((item) => ({...item, type: 'Support'})),
+        ...resistance.map((item) => ({...item, type: 'Resistance'})),
+      ];
+      if (!rows.length) {
+        return `<div class="empty">No clean ${esc(timeframe)} support or resistance detected yet</div>`;
+      }
+      return `<table>
+        <thead><tr><th>Type</th><th>Price</th><th>Strength</th><th>Score</th><th>Tested</th><th>Fresh</th><th>Source</th><th>Reason</th></tr></thead>
+        <tbody>${rows.map((item) => `<tr>
+          <td>${esc(item.type)}</td><td>${structureMoney(item.price)}</td><td>${esc(structureValue(item.strength))}</td>
+          <td>${esc(structureValue(item.score))}</td><td>${esc(structureValue(item.times_tested))}</td>
+          <td>${item.fresh ? 'Fresh' : 'Tested'}</td><td>${esc(structureValue(item.source))}</td><td>${esc(structureValue(item.reason))}</td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+    }
+
+    function renderStructureZoneTable(timeframe, record) {
+      const demand = ((record || {}).zones || {}).demand || [];
+      const supply = ((record || {}).zones || {}).supply || [];
+      const rows = [
+        ...demand.map((item) => ({...item, type: 'Demand'})),
+        ...supply.map((item) => ({...item, type: 'Supply'})),
+      ];
+      if (!rows.length) return `<div class="empty">No clean ${esc(timeframe)} zones detected yet</div>`;
+      return `<table>
+        <thead><tr><th>Type</th><th>Zone</th><th>Strength</th><th>Score</th><th>Tested</th><th>Fresh</th><th>Reaction</th><th>Invalidation</th><th>Reason</th></tr></thead>
+        <tbody>${rows.map((item) => `<tr>
+          <td>${esc(item.type)}</td><td>${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)}</td>
+          <td>${esc(structureValue(item.strength))}</td><td>${esc(structureValue(item.score))}</td>
+          <td>${esc(structureValue(item.times_tested))}</td><td>${item.fresh ? 'Fresh' : 'Tested'}</td>
+          <td>${esc(structureValue(item.last_reaction))}</td><td>${esc(structureValue(item.invalidation))}</td>
+          <td>${esc(structureValue(item.reason))}</td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+    }
+
+    function renderLiveMarketStructure(data) {
+      const summary = data.summary || {};
+      const nearest = data.nearest || {};
+      const sr = data.support_resistance || {};
+      const sd = data.supply_demand || {};
+      els.marketStructureUpdated.textContent = data.last_updated ? `Last updated ${fmtTime(data.last_updated)}` : 'Waiting for data';
+      if (!data.enabled || !data.last_updated) {
+        els.liveMarketStructure.innerHTML = `<div class="empty">${esc(data.message || 'Waiting for market structure data.')}</div>`;
+        return;
+      }
+      els.liveMarketStructure.innerHTML = `
+        <div class="structure-status">
+          <div><span class="label">Market Structure Engine</span><div><strong>${esc(structureValue(data.engine_status))}</strong></div></div>
+          <div><span class="label">Support / Resistance</span><div><strong>${esc(structureValue(data.support_resistance_status))}</strong></div></div>
+          <div><span class="label">Supply / Demand</span><div><strong>${esc(structureValue(data.supply_demand_status))}</strong></div></div>
+          <div><span class="label">Data Mode</span><div><strong>${esc(structureValue(data.data_mode))}</strong></div></div>
+        </div>
+        <div class="structure-summary">
+          <div><span class="label">Current Price</span><div><strong>${structureMoney(summary.current_price)}</strong></div></div>
+          <div><span class="label">Structure</span><div><strong>${esc(structureValue(summary.market_structure_bias))}</strong></div></div>
+          <div><span class="label">Quality</span><div><strong>${esc(structureValue(summary.structure_quality))}</strong></div></div>
+          <div><span class="label">Warning</span><div><strong>${esc(structureValue(summary.structure_warning))}</strong></div></div>
+          <div class="structure-wide"><span class="label">Location</span><div><strong>${esc(structureValue(summary.current_price_location_summary))}</strong></div></div>
+          <div class="structure-wide"><span class="label">Nearest Levels</span><div>
+            ${esc(renderNearestLevel('Support', nearest.support))}<br>
+            ${esc(renderNearestLevel('Resistance', nearest.resistance))}<br>
+            ${esc(renderNearestLevel('Demand', nearest.demand, true))}<br>
+            ${esc(renderNearestLevel('Supply', nearest.supply, true))}
+          </div></div>
+          <div class="structure-wide"><span class="label">Confluence</span><div><strong>${esc(structureValue(summary.confluence_reason))}</strong></div></div>
+        </div>
+        <div class="structure-table-grid">
+          ${['1m', '5m', '15m'].map((frame) => `<div class="structure-table"><h3>${frame} Support / Resistance</h3>${renderStructureLevelTable(frame, sr[frame])}</div>`).join('')}
+          ${['1m', '5m', '15m'].map((frame) => `<div class="structure-table"><h3>${frame} Supply / Demand</h3>${renderStructureZoneTable(frame, sd[frame])}</div>`).join('')}
+        </div>
+        <div>
+          <h3>Copy Levels</h3>
+          <pre class="copy-levels">${esc(structureValue(data.copy_summary))}</pre>
+        </div>
+      `;
     }
 
     function renderLevels(levels) {
@@ -2234,6 +2609,7 @@ INDEX_HTML = r"""<!doctype html>
       renderMarketDataStatus(data.market_data_status || {});
       renderScannerIdentityStatus(data.scanner_identity || {}, data.market_data_status || {});
       renderNotificationStatus(data.notification_status || {});
+      renderLiveMarketStructure(data.market_structure || {});
     }
 
     function renderScannerIdentityStatus(identity, market) {
@@ -2651,6 +3027,7 @@ def main() -> int:
 
 def run_tests() -> int:
     import unittest
+    from unittest import mock
 
     class DashboardTests(unittest.TestCase):
         def setUp(self) -> None:
@@ -2924,6 +3301,152 @@ def run_tests() -> int:
             self.assertIn("Idea is wrong", INDEX_HTML)
             self.assertIn("Pullback required", INDEX_HTML)
 
+        def test_live_market_structure_dashboard_reads_logs_and_renders_sections(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                paths = {
+                    "support_resistance": root / "support.jsonl",
+                    "supply_demand": root / "zones.jsonl",
+                    "summary": root / "summary.jsonl",
+                }
+                timestamp = "2026-06-10T20:05:00+00:00"
+                paths["support_resistance"].write_text(
+                    "\n".join(
+                        json.dumps(
+                            {
+                                "timestamp": timestamp,
+                                "symbol": "AAPL",
+                                "timeframe": frame,
+                                "current_price": 291.25,
+                                "levels": {
+                                    "support": [{"price": 290.2, "strength": "HIGH", "score": 82, "times_tested": 3, "fresh": False, "source": "swing_low/VWAP", "reason": "Bounced three times"}],
+                                    "resistance": [{"price": 291.6, "strength": "HIGH", "score": 78, "times_tested": 2, "fresh": True, "source": "swing_high", "reason": "Rejected twice"}],
+                                },
+                            }
+                        )
+                        for frame in ("1m", "5m")
+                    ),
+                    encoding="utf-8",
+                )
+                paths["supply_demand"].write_text(
+                    json.dumps(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": "AAPL",
+                            "timeframe": "5m",
+                            "current_price": 291.25,
+                            "zones": {
+                                "demand": [{"zone_low": 289.8, "zone_high": 290.1, "midpoint": 289.95, "strength": "HIGH", "score": 84, "times_tested": 0, "fresh": True, "last_reaction": "bullish_impulse", "invalidation": "Clean break below 289.80", "reason": "Buyers defended zone"}],
+                                "supply": [{"zone_low": 291.5, "zone_high": 291.8, "midpoint": 291.65, "strength": "MEDIUM", "score": 68, "times_tested": 2, "fresh": False, "last_reaction": "bearish_rejection", "invalidation": "Clean hold above 291.80", "reason": "Sellers rejected zone"}],
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                paths["summary"].write_text(
+                    json.dumps(
+                        {
+                            "timestamp": timestamp,
+                            "symbol": "AAPL",
+                            "current_price": 291.25,
+                            "market_structure_bias": "MIXED",
+                            "structure_quality": "MEDIUM",
+                            "structure_warning": "near demand",
+                            "current_price_location_summary": "AAPL is between 5m demand near 290.00 and 5m supply near 291.70",
+                            "confluence_reason": "5m demand overlaps with support near 290.00",
+                            "can_approve_trades": False,
+                            "context_only": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload = load_market_structure_dashboard(
+                    scanner_app.load_config(None),
+                    paths=paths,
+                    now=datetime(2026, 6, 10, 22, 0, tzinfo=timezone.utc),
+                )
+                self.assertEqual(payload["summary"]["current_price"], 291.25)
+                self.assertEqual(payload["summary"]["market_structure_bias"], "MIXED")
+                self.assertEqual(payload["summary"]["structure_warning"], "near demand")
+                self.assertEqual(payload["nearest"]["support"]["price"], 290.2)
+                self.assertEqual(payload["nearest"]["resistance"]["price"], 291.6)
+                self.assertEqual(payload["nearest"]["demand"]["zone_low"], 289.8)
+                self.assertEqual(payload["nearest"]["supply"]["zone_high"], 291.8)
+                self.assertEqual(payload["support_resistance"]["15m"], {})
+                self.assertIn("After-hours / limited structure", payload["data_mode"])
+                self.assertIn("5m Demand:", payload["copy_summary"])
+                self.assertFalse(payload["can_upgrade"])
+                serialized = json.dumps(payload)
+                self.assertNotIn("ALPACA_API_KEY", serialized)
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", serialized)
+                self.assertNotIn("OPENAI_API_KEY", serialized)
+
+            for text in (
+                "Live Market Structure",
+                "renderLiveMarketStructure",
+                "Current Price",
+                "Structure",
+                "Quality",
+                "Warning",
+                "Nearest Levels",
+                "Confluence",
+                "['1m', '5m', '15m']",
+                "${frame} Support / Resistance",
+                "${frame} Supply / Demand",
+                "Copy Levels",
+                "No clean ${esc(timeframe)} zones detected yet",
+                "Not enough clean data yet",
+            ):
+                self.assertIn(text, INDEX_HTML)
+
+        def test_live_market_structure_dashboard_missing_data_is_clean(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                payload = load_market_structure_dashboard(
+                    scanner_app.load_config(None),
+                    paths={
+                        "support_resistance": root / "missing-support.jsonl",
+                        "supply_demand": root / "missing-zones.jsonl",
+                        "summary": root / "missing-summary.jsonl",
+                    },
+                )
+            self.assertEqual(payload["data_mode"], "waiting for data")
+            self.assertEqual(payload["message"], "Waiting for market structure data.")
+            self.assertEqual(payload["copy_summary"], "Not enough clean data yet")
+            self.assertFalse(payload["can_upgrade"])
+
+        def test_live_market_structure_refresh_reuses_aapl_snapshot_without_alert_changes(self) -> None:
+            config = scanner_app.load_config(None)
+            now = scanner_app.now_utc()
+            bars = [
+                scanner_app.Bar(t=now - timedelta(minutes=20 - index), o=100, h=100.2, l=99.8, c=100.0 + index * 0.01, v=100000)
+                for index in range(21)
+            ]
+            snapshots = {"AAPL": scanner_app.SymbolSnapshot(symbol="AAPL", latest_bar=bars[-1], recent_bars=bars)}
+            live_payload = {"symbol": "AAPL", "timestamp": now.isoformat()}
+            dashboard_payload = {
+                "last_updated": now.isoformat(),
+                "data_mode": "latest log fallback",
+                "message": "Latest market-structure log data",
+                "context_only": True,
+                "can_upgrade": False,
+            }
+            with (
+                mock.patch.object(sys.modules[__name__], "build_market_structure", return_value=live_payload) as build,
+                mock.patch.object(sys.modules[__name__], "write_market_structure_logs") as write,
+                mock.patch.object(sys.modules[__name__], "load_market_structure_dashboard", return_value=dashboard_payload),
+            ):
+                with STATE.lock:
+                    STATE.market_structure_live = None
+                    STATE.market_structure_updated_monotonic = 0.0
+                result = refresh_live_market_structure(snapshots, config, force=True)
+            self.assertIn(result["data_mode"], {"Live scanner data", "After-hours / limited structure"})
+            self.assertEqual(result["message"], "Live scanner candle data")
+            self.assertTrue(result["context_only"])
+            self.assertFalse(result["can_upgrade"])
+            build.assert_called_once()
+            write.assert_called_once()
+
         def test_dashboard_status_includes_telegram_without_exposing_token(self) -> None:
             old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
             old_chat = os.environ.get("TELEGRAM_CHAT_ID")
@@ -3097,6 +3620,17 @@ def run_tests() -> int:
                     + "\n",
                     encoding="utf-8",
                 )
+                for name in (
+                    "support_resistance_levels.jsonl",
+                    "supply_demand_zones.jsonl",
+                    "market_structure.jsonl",
+                    "openai_alert_formatter.jsonl",
+                    "premarket_discipline_message.jsonl",
+                ):
+                    (log_dir / name).write_text(
+                        json.dumps({"timestamp": "2026-06-04T16:04:00+00:00", "symbol": "AAPL", "token": "super-secret-token"}) + "\n",
+                        encoding="utf-8",
+                    )
                 (snapshot_dir / "dashboard_snapshot_latest.md").write_text("token=super-secret-token", encoding="utf-8")
                 (snapshot_dir / "dashboard_snapshot_latest.json").write_text(
                     json.dumps({"client_secret": "super-secret-client"}),
@@ -3146,6 +3680,11 @@ def run_tests() -> int:
                 self.assertTrue((package_dir / "logs" / "phase3_heads_up.jsonl").exists())
                 self.assertTrue((package_dir / "logs" / "market_data_status.jsonl").exists())
                 self.assertTrue((package_dir / "window" / "phase3_heads_up_window.jsonl").exists())
+                self.assertTrue((package_dir / "logs" / "support_resistance_levels.jsonl").exists())
+                self.assertTrue((package_dir / "logs" / "supply_demand_zones.jsonl").exists())
+                self.assertTrue((package_dir / "logs" / "market_structure.jsonl").exists())
+                self.assertTrue((package_dir / "logs" / "openai_alert_formatter.jsonl").exists())
+                self.assertTrue((package_dir / "logs" / "premarket_discipline_message.jsonl").exists())
 
         def test_watchlist_scope_keeps_configured_symbols(self) -> None:
             config = scanner_app.load_config(None)

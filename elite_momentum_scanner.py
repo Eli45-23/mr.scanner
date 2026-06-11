@@ -187,6 +187,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "market_structure_engines": {
         "enable_support_resistance_engine": True,
         "enable_supply_demand_engine": True,
+        "enable_dashboard": True,
         "support_resistance_timeframes": ["1m", "5m", "15m"],
         "supply_demand_timeframes": ["1m", "5m", "15m"],
         "max_levels_per_timeframe": 3,
@@ -6543,6 +6544,10 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     structure["enable_supply_demand_engine"] = env_bool(
         "ENABLE_SUPPLY_DEMAND_ENGINE",
         bool(structure.get("enable_supply_demand_engine", True)),
+    )
+    structure["enable_dashboard"] = env_bool(
+        "ENABLE_MARKET_STRUCTURE_DASHBOARD",
+        bool(structure.get("enable_dashboard", True)),
     )
     for env_name, key in (
         ("SUPPORT_RESISTANCE_TIMEFRAMES", "support_resistance_timeframes"),

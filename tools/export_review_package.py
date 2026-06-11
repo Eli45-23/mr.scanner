@@ -422,6 +422,11 @@ def build_review_summary(
 - `logs/multi_timeframe_context.jsonl`
 - `logs/post_alert_performance.jsonl`
 - `logs/news_context.jsonl`
+- `logs/support_resistance_levels.jsonl`
+- `logs/supply_demand_zones.jsonl`
+- `logs/market_structure.jsonl`
+- `logs/openai_alert_formatter.jsonl` if available
+- `logs/premarket_discipline_message.jsonl` if available
 - latest scanner log if available
 - `dashboard_snapshot_latest.md`
 - `dashboard_snapshot_latest.json`
@@ -433,6 +438,9 @@ def build_review_summary(
 - `window/market_data_status_window.jsonl`
 - `window/post_alert_performance_window.jsonl`
 - `window/news_context_window.jsonl`
+- `window/support_resistance_levels_window.jsonl`
+- `window/supply_demand_zones_window.jsonl`
+- `window/market_structure_window.jsonl`
 - `alert_performance_{day_text}.md` if generated
 
 ## Export Notes
@@ -481,6 +489,11 @@ def export_review_package(
     option_diagnostics = records_for_day(read_jsonl(log_dir / "option_freshness_diagnostic.jsonl"), day_text)
     post_alert_performance = records_for_day(read_jsonl(log_dir / "post_alert_performance.jsonl"), day_text)
     news_context = records_for_day(read_jsonl(log_dir / "news_context.jsonl"), day_text)
+    support_resistance = records_for_day(read_jsonl(log_dir / "support_resistance_levels.jsonl"), day_text)
+    supply_demand = records_for_day(read_jsonl(log_dir / "supply_demand_zones.jsonl"), day_text)
+    market_structure = records_for_day(read_jsonl(log_dir / "market_structure.jsonl"), day_text)
+    openai_formatter = records_for_day(read_jsonl(log_dir / "openai_alert_formatter.jsonl"), day_text)
+    premarket_discipline = records_for_day(read_jsonl(log_dir / "premarket_discipline_message.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -494,6 +507,13 @@ def export_review_package(
     write_jsonl(logs_out / "option_freshness_diagnostic.jsonl", option_diagnostics)
     write_jsonl(logs_out / "post_alert_performance.jsonl", post_alert_performance)
     write_jsonl(logs_out / "news_context.jsonl", news_context)
+    write_jsonl(logs_out / "support_resistance_levels.jsonl", support_resistance)
+    write_jsonl(logs_out / "supply_demand_zones.jsonl", supply_demand)
+    write_jsonl(logs_out / "market_structure.jsonl", market_structure)
+    if (log_dir / "openai_alert_formatter.jsonl").exists():
+        write_jsonl(logs_out / "openai_alert_formatter.jsonl", openai_formatter)
+    if (log_dir / "premarket_discipline_message.jsonl").exists():
+        write_jsonl(logs_out / "premarket_discipline_message.jsonl", premarket_discipline)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
@@ -504,6 +524,9 @@ def export_review_package(
     write_jsonl(window_out / "notification_status_window.jsonl", records_in_window(notifications, start_dt, end_dt))
     write_jsonl(window_out / "post_alert_performance_window.jsonl", records_in_window(post_alert_performance, start_dt, end_dt))
     write_jsonl(window_out / "news_context_window.jsonl", records_in_window(news_context, start_dt, end_dt))
+    write_jsonl(window_out / "support_resistance_levels_window.jsonl", records_in_window(support_resistance, start_dt, end_dt))
+    write_jsonl(window_out / "supply_demand_zones_window.jsonl", records_in_window(supply_demand, start_dt, end_dt))
+    write_jsonl(window_out / "market_structure_window.jsonl", records_in_window(market_structure, start_dt, end_dt))
 
     if not alerts:
         notes.append("No alerts.jsonl records found for the requested date.")
@@ -525,6 +548,12 @@ def export_review_package(
         notes.append("No post_alert_performance.jsonl records found for the requested date.")
     if not news_context:
         notes.append("No news_context.jsonl records found for the requested date.")
+    if not support_resistance:
+        notes.append("No support_resistance_levels.jsonl records found for the requested date.")
+    if not supply_demand:
+        notes.append("No supply_demand_zones.jsonl records found for the requested date.")
+    if not market_structure:
+        notes.append("No market_structure.jsonl records found for the requested date.")
 
     scanner_log = log_dir / "scanner.log"
     if not scanner_log.exists():

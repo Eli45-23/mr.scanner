@@ -149,6 +149,7 @@ class MultiTimeframeAndPreviewTests(unittest.TestCase):
     def test_market_structure_can_upgrade_defaults_false(self) -> None:
         config = scanner_app.load_config(None)
         self.assertFalse(config["market_structure_engines"]["can_upgrade"])
+        self.assertTrue(config["market_structure_engines"]["enable_dashboard"])
 
     def test_preview_build_and_render_are_read_only_and_json_safe(self) -> None:
         bars = bars_from_closes([100 + ((index % 8) - 4) * 0.12 for index in range(60)])
