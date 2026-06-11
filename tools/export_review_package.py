@@ -373,6 +373,12 @@ def build_review_summary(
         if "5m_supply" in str(record.get("level_source") or "").lower()
         or "5m_demand" in str(record.get("level_source") or "").lower()
     )
+    engine_strategy_sweeps = sum(
+        1 for record in alert_window if str(record.get("liquidity_sweep_source") or "").lower() == "engine"
+    )
+    legacy_strategy_sweeps = sum(
+        1 for record in alert_window if str(record.get("liquidity_sweep_source") or "").lower() == "legacy_fallback"
+    )
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
     return f"""# Bot Review Package — {day_text}
 
@@ -445,6 +451,8 @@ def build_review_summary(
 - OpenAI formatter success / fallback: {openai_success} / {openai_fallback}
 
 ## Liquidity Sweep Review
+- Engine-based strategy sweep records: {engine_strategy_sweeps}
+- Legacy fallback strategy sweep records: {legacy_strategy_sweeps}
 - Sweep watch records: {sweep_statuses.count("SWEEP_WATCH")}
 - Sweep forming records: {sweep_statuses.count("SWEEP_FORMING")}
 - Sweep confirmed records: {len(confirmed_sweeps)}

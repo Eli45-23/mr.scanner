@@ -14,6 +14,7 @@ class StrategyContext:
     levels: Dict[str, Optional[float]]
     relative_volume: Optional[float] = None
     market_alignment: str = "UNKNOWN"
+    liquidity_sweep_context: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -26,7 +27,7 @@ class StrategyResult:
     confidence_label: str = "LOW"
     reasons: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    levels: Dict[str, float] = field(default_factory=dict)
+    levels: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

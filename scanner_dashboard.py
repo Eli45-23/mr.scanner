@@ -340,6 +340,7 @@ class DashboardState:
         self.market_structure_engine_live: Optional[Dict[str, Any]] = None
         self.market_structure_updated_monotonic = 0.0
         self.liquidity_sweep_live: Optional[Dict[str, Any]] = None
+        self.liquidity_sweep_engine_live: Optional[Dict[str, Any]] = None
         self.liquidity_sweep_updated_monotonic = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
@@ -479,6 +480,7 @@ def refresh_live_liquidity_sweeps(
         dashboard_payload["message"] = "After-hours / limited liquidity sweep reads"
     with STATE.lock:
         STATE.liquidity_sweep_live = dashboard_payload
+        STATE.liquidity_sweep_engine_live = payload
         STATE.liquidity_sweep_updated_monotonic = current_monotonic
     return dashboard_payload
 
@@ -1329,6 +1331,7 @@ def build_symbol_rows(
                     "option_tradability_score": options_score_for_row(snap, fast_move, day_move),
                     "option_tradable": snap.best_call.is_tradable() or snap.best_put.is_tradable(),
                 },
+                liquidity_sweep_context=STATE.liquidity_sweep_engine_live if snap.symbol == "AAPL" else None,
             )
         flags: List[str] = []
         if snap.latest_news:
@@ -1666,6 +1669,7 @@ def clear_dashboard_data() -> Dict[str, Any]:
         STATE.market_structure_engine_live = None
         STATE.market_structure_updated_monotonic = 0.0
         STATE.liquidity_sweep_live = None
+        STATE.liquidity_sweep_engine_live = None
         STATE.liquidity_sweep_updated_monotonic = 0.0
 
     csv_path = Path(config["outputs"]["csv_log"])

@@ -327,6 +327,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "strategy_engine": {
         "enabled": True,
         "enable_liquidity_sweep": True,
+        "liquidity_sweep_strategy_legacy_fallback": True,
         "enable_vwap_reclaim": True,
         "enable_opening_range": True,
         "enable_volume_quality": True,
@@ -838,6 +839,9 @@ class Alert:
     downgraded_by_liquidity_sweep: bool = False
     liquidity_sweep_downgrade_reason: Optional[str] = None
     liquidity_sweep_context: Optional[str] = None
+    liquidity_sweep_source: Optional[str] = None
+    liquidity_sweep_status: Optional[str] = None
+    liquidity_sweep_can_approve_trades: bool = False
     sweep_trap_bias: Optional[str] = None
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
@@ -4274,6 +4278,7 @@ class EliteScanner:
         self.decision_history: List[Dict[str, Any]] = []
         self.last_chop_warning_at: Optional[datetime] = None
         self.last_missed_entry_alerts: Dict[str, datetime] = {}
+        self.latest_liquidity_sweep_context: Dict[str, Dict[str, Any]] = {}
 
     def latest_market_structure(self) -> Dict[str, Any]:
         path = LOG_DIR / "market_structure.jsonl"
@@ -4481,7 +4486,7 @@ class EliteScanner:
     def process_liquidity_sweep_telegram(self, snap: SymbolSnapshot) -> bool:
         settings = self.config.get("liquidity_sweep_engine", {})
         notifications = self.config.get("notifications", {})
-        if not settings.get("enabled", True) or not settings.get("telegram_enabled", True):
+        if not settings.get("enabled", True):
             return False
         try:
             from tools.preview_liquidity_sweeps import build_liquidity_sweep_preview
@@ -4492,10 +4497,15 @@ class EliteScanner:
                 daily_bars=snap.daily_bars,
                 config=self.config,
             )
+            if not hasattr(self, "latest_liquidity_sweep_context"):
+                self.latest_liquidity_sweep_context = {}
+            self.latest_liquidity_sweep_context[snap.symbol] = payload
             if not settings.get("telegram_include_structure", True):
                 payload.pop("market_structure_summary", None)
         except Exception as exc:
             logger.warning("Liquidity sweep Telegram evaluation failed safely: %s", redact_notification_error(exc))
+            return False
+        if not settings.get("telegram_enabled", True):
             return False
 
         eligible, reason, alert_type = sweep_telegram_eligibility(payload, self.config)
@@ -6151,6 +6161,7 @@ class EliteScanner:
                 "option_tradability_score": alert.option_tradability_score,
                 "option_tradable": alert.option_tradable,
             },
+            liquidity_sweep_context=getattr(self, "latest_liquidity_sweep_context", {}).get(snap.symbol),
         )
         alert.primary_setup = summary.get("primary_setup")
         alert.secondary_setups = list(summary.get("secondary_setups") or [])
@@ -6229,6 +6240,9 @@ class EliteScanner:
         alert.strategy_warnings = list(summary.get("warnings") or [])
         alert.strategy_levels = dict(summary.get("levels") or {})
         alert.strategy_results = list(summary.get("strategy_results") or [])
+        alert.liquidity_sweep_source = summary.get("liquidity_sweep_source")
+        alert.liquidity_sweep_status = summary.get("liquidity_sweep_status")
+        alert.liquidity_sweep_can_approve_trades = False
         structure = snap.multi_timeframe_context or {}
         alert.trend_1m = structure.get("trend_1m")
         alert.trend_5m = structure.get("trend_5m")
@@ -7181,6 +7195,7 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     bool_map = {
         "ENABLE_STRATEGY_ENGINE": "enabled",
         "ENABLE_LIQUIDITY_SWEEP": "enable_liquidity_sweep",
+        "LIQUIDITY_SWEEP_STRATEGY_LEGACY_FALLBACK": "liquidity_sweep_strategy_legacy_fallback",
         "ENABLE_VWAP_RECLAIM": "enable_vwap_reclaim",
         "ENABLE_OPENING_RANGE": "enable_opening_range",
         "ENABLE_VOLUME_QUALITY": "enable_volume_quality",

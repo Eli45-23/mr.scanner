@@ -108,6 +108,7 @@
   "strategy_engine": {
     "enabled": true,
     "enable_liquidity_sweep": true,
+    "liquidity_sweep_strategy_legacy_fallback": true,
     "enable_vwap_reclaim": true,
     "enable_opening_range": true,
     "enable_volume_quality": true,

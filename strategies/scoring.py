@@ -80,6 +80,7 @@ def evaluate_strategy_suite(
     option_context: Optional[Dict[str, Any]] = None,
     phase1_summary: Optional[Dict[str, Any]] = None,
     phase2_summary: Optional[Dict[str, Any]] = None,
+    liquidity_sweep_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ctx = StrategyContext(
         symbol=symbol,
@@ -89,11 +90,12 @@ def evaluate_strategy_suite(
         levels=levels,
         relative_volume=relative_volume,
         market_alignment=market_alignment,
+        liquidity_sweep_context=liquidity_sweep_context,
     )
     cfg = config.get("strategy_engine", {})
     results = [breakout.evaluate(ctx)]
     if cfg.get("enable_liquidity_sweep", True):
-        results.append(liquidity_sweep.evaluate(ctx))
+        results.append(liquidity_sweep.evaluate(ctx, liquidity_sweep_context=liquidity_sweep_context))
     if cfg.get("enable_vwap_reclaim", True):
         results.append(vwap_reclaim.evaluate(ctx))
     if cfg.get("enable_opening_range", True):
@@ -456,6 +458,8 @@ def evaluate_strategy_suite(
         scenario_summary,
         market_alignment=market_alignment,
     )
+    liquidity_result = next((item for item in result_dicts if item.get("strategy") == "liquidity_sweep"), {})
+    liquidity_levels = liquidity_result.get("levels") or {}
     return {
         "symbol": symbol,
         "primary_setup": primary.get("label") if primary else None,
@@ -545,4 +549,7 @@ def evaluate_strategy_suite(
         "warnings": prioritized_warnings[:8],
         "levels": combined_levels,
         "strategy_results": result_dicts,
+        "liquidity_sweep_source": liquidity_levels.get("liquidity_sweep_source", "none"),
+        "liquidity_sweep_status": liquidity_levels.get("sweep_status"),
+        "liquidity_sweep_can_approve_trades": False,
     }

@@ -22,6 +22,9 @@ from scanner.liquidity_sweep_telegram import (
 )
 from tools import preview_liquidity_sweeps
 from tools import export_review_package
+from strategies.base import StrategyContext
+from strategies.liquidity_sweep import evaluate as evaluate_sweep_strategy
+from strategies.scoring import evaluate_strategy_suite
 
 
 START = datetime(2026, 6, 10, 14, 0, tzinfo=timezone.utc)
@@ -119,6 +122,128 @@ class LiquiditySweepEngineTests(unittest.TestCase):
         result = evaluate_liquidity_sweeps("AAPL", [], market_structure=structure())
         self.assertEqual(result["sweep_status"], "NO_ACTIVE_SWEEP")
         self.assertFalse(result["can_approve_trades"])
+
+
+class LiquiditySweepStrategyAdapterTests(unittest.TestCase):
+    def context(self, engine_context: dict | None, *, legacy_fallback: bool = True) -> StrategyContext:
+        bar = scanner.Bar(t=START, o=100.0, h=101.0, l=99.0, c=100.5, v=1000)
+        config = scanner.load_config(None)
+        config["strategy_engine"]["liquidity_sweep_strategy_legacy_fallback"] = legacy_fallback
+        return StrategyContext(
+            symbol="AAPL",
+            bars=[bar] * 6,
+            latest=bar,
+            config=config,
+            levels={},
+            relative_volume=1.0,
+            market_alignment="ALIGNED",
+            liquidity_sweep_context=engine_context,
+        )
+
+    def payload(self, status: str, direction: str = "BELOW_LEVEL", bias: str = "BULLISH", score: int = 82) -> dict:
+        return {
+            "sweep_status": status,
+            "sweep_direction": direction,
+            "trap_bias": bias,
+            "score": score,
+            "confidence": "HIGH",
+            "level_source": "5m_demand" if direction == "BELOW_LEVEL" else "5m_supply",
+            "sweep_level": 100.0,
+            "sweep_zone_low": 100.0,
+            "sweep_zone_high": 100.2,
+            "reason": "Price swept the engine level and closed back through it.",
+            "meaning": "Trapped participants may be present.",
+            "context_only": True,
+            "can_approve_trades": False,
+        }
+
+    def test_confirmed_downside_engine_sweep_adapts_to_bullish_reclaim(self) -> None:
+        result = evaluate_sweep_strategy(self.context(self.payload("SWEEP_CONFIRMED")))
+        self.assertTrue(result.active)
+        self.assertEqual(result.label, "Bullish Liquidity Sweep Reclaim")
+        self.assertEqual(result.direction, "bullish")
+        self.assertLessEqual(result.score, 75)
+        self.assertEqual(result.levels["source_of_truth"], "scanner_liquidity_sweep_engine")
+        self.assertFalse(result.levels["can_approve_trades"])
+
+    def test_confirmed_upside_engine_sweep_adapts_to_bearish_rejection(self) -> None:
+        result = evaluate_sweep_strategy(
+            self.context(self.payload("SWEEP_CONFIRMED", direction="ABOVE_LEVEL", bias="BEARISH"))
+        )
+        self.assertTrue(result.active)
+        self.assertEqual(result.label, "Bearish Liquidity Sweep Rejection")
+        self.assertEqual(result.direction, "bearish")
+
+    def test_watch_and_forming_are_not_active_or_trade_ready(self) -> None:
+        watch = evaluate_sweep_strategy(self.context(self.payload("SWEEP_WATCH", score=90)))
+        forming = evaluate_sweep_strategy(self.context(self.payload("SWEEP_FORMING", score=90)))
+        self.assertFalse(watch.active)
+        self.assertLessEqual(watch.score, 45)
+        self.assertFalse(forming.active)
+        self.assertLessEqual(forming.score, 55)
+        self.assertIn("candle has not closed", " ".join(forming.warnings).lower())
+
+    def test_failed_held_does_not_label_trap(self) -> None:
+        result = evaluate_sweep_strategy(self.context(self.payload("SWEEP_FAILED_HELD", score=90)))
+        self.assertFalse(result.active)
+        self.assertEqual(result.direction, "neutral")
+        self.assertIn("Break Held", result.label)
+        self.assertLessEqual(result.score, 35)
+
+    def test_engine_context_prevents_legacy_conflicting_opinion(self) -> None:
+        result = evaluate_sweep_strategy(self.context(self.payload("NO_ACTIVE_SWEEP")))
+        self.assertFalse(result.active)
+        self.assertEqual(result.label, "No Liquidity Sweep")
+        self.assertEqual(result.levels["liquidity_sweep_source"], "engine")
+
+    def test_legacy_fallback_can_be_disabled(self) -> None:
+        result = evaluate_sweep_strategy(self.context(None, legacy_fallback=False))
+        self.assertFalse(result.active)
+        self.assertEqual(result.levels["liquidity_sweep_source"], "none")
+
+    def test_strategy_suite_accepts_engine_context_and_reports_source(self) -> None:
+        bars = [
+            scanner.Bar(t=START + timedelta(minutes=index), o=100.0, h=100.8, l=99.8, c=100.2, v=1000)
+            for index in range(20)
+        ]
+        summary = evaluate_strategy_suite(
+            "AAPL",
+            bars,
+            bars[-1],
+            scanner.load_config(None),
+            {},
+            1.0,
+            "ALIGNED",
+            liquidity_sweep_context=self.payload("SWEEP_CONFIRMED"),
+        )
+        sweep = next(item for item in summary["strategy_results"] if item["strategy"] == "liquidity_sweep")
+        self.assertEqual(summary["liquidity_sweep_source"], "engine")
+        self.assertFalse(summary["liquidity_sweep_can_approve_trades"])
+        self.assertEqual(sweep["levels"]["source_of_truth"], "scanner_liquidity_sweep_engine")
+
+    def test_scanner_passes_cached_engine_result_into_strategy_suite(self) -> None:
+        instance = object.__new__(scanner.EliteScanner)
+        instance.config = scanner.load_config(None)
+        engine_payload = self.payload("SWEEP_CONFIRMED")
+        instance.latest_liquidity_sweep_context = {"AAPL": engine_payload}
+        bar = scanner.Bar(t=START, o=100.0, h=101.0, l=99.0, c=100.5, v=1000)
+        snap = scanner.SymbolSnapshot(symbol="AAPL", latest_bar=bar, recent_bars=[bar])
+        alert = scanner.Alert(symbol="AAPL", timestamp=START, category="WATCH", price=100.5, direction="BULLISH")
+        with (
+            patch.object(instance, "market_alignment_for", return_value="ALIGNED"),
+            patch.object(instance, "strategy_levels_for_snapshot", return_value={}),
+            patch.object(instance, "apply_mixed_signal_and_news_context"),
+            patch.object(instance, "apply_aapl_bearish_continuation_label"),
+            patch.object(scanner, "evaluate_strategy_suite", return_value={
+                "liquidity_sweep_source": "engine",
+                "liquidity_sweep_status": "SWEEP_CONFIRMED",
+                "strategy_results": [],
+            }) as suite,
+        ):
+            result = instance.attach_strategy_context(alert, snap, {})
+        self.assertIs(suite.call_args.kwargs["liquidity_sweep_context"], engine_payload)
+        self.assertEqual(result.liquidity_sweep_source, "engine")
+        self.assertFalse(result.liquidity_sweep_can_approve_trades)
 
 
 class LiquiditySweepPreviewTests(unittest.TestCase):
@@ -265,6 +390,7 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
             patch.object(scanner, "append_sweep_telegram_log") as log,
         ):
             self.assertTrue(instance.process_liquidity_sweep_telegram(snap))
+        self.assertEqual(instance.latest_liquidity_sweep_context["AAPL"]["sweep_status"], "SWEEP_CONFIRMED")
         self.assertEqual(send.call_args.kwargs["alert_type"], "LIQUIDITY_SWEEP_CONFIRMED")
         self.assertEqual(send.call_args.kwargs["alert_source"], "LIQUIDITY_SWEEP_ENGINE")
         self.assertFalse(send.call_args.kwargs["sms_sent"])
@@ -281,6 +407,7 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
                 "direction": "BULLISH",
                 "downgraded_by_liquidity_sweep": True,
                 "liquidity_sweep_downgrade_reason": "Bullish chase is risky near supply.",
+                "liquidity_sweep_source": "engine",
             }],
             scenario_window=[],
             heads_up_window=[],
@@ -302,6 +429,8 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
         self.assertIn("Sweep confirmed records: 1", summary)
         self.assertIn("Alerts downgraded by liquidity sweep: 1", summary)
         self.assertIn("Chop records strengthened by sweep risk: 1", summary)
+        self.assertIn("Engine-based strategy sweep records: 1", summary)
+        self.assertIn("Legacy fallback strategy sweep records: 0", summary)
 
 
 if __name__ == "__main__":
