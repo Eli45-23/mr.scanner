@@ -1737,7 +1737,19 @@ def load_alerts(limit: int = 100) -> List[Dict[str, Any]]:
 
 def load_alert_brain(path: Optional[Path] = None) -> Dict[str, Any]:
     records = _read_jsonl_records(path or ALERT_ORCHESTRATOR_LOG_PATH)
-    return records[-1] if records else {}
+    brain = dict(records[-1]) if records else {}
+    if path is None:
+        latest_alerts = load_alerts(limit=1)
+        if latest_alerts:
+            alert = latest_alerts[0]
+            brain.update({
+                "alert_priority_tier": alert.get("alert_priority_tier"),
+                "alert_priority_reason": alert.get("alert_priority_reason"),
+                "alert_priority_score": alert.get("alert_priority_score"),
+                "warning_filter_suppressed": alert.get("warning_filter_suppressed"),
+                "warning_suppression_reason": alert.get("warning_suppression_reason"),
+            })
+    return brain
 
 
 def load_symbol_rows() -> List[Dict[str, Any]]:
@@ -3087,7 +3099,10 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="label">Watch-only</span><strong>${(alert.orchestrator_watch_only ?? alert.watch_only) ? 'Yes' : 'No'}</strong></div>
           <div><span class="label">Trade-ready</span><strong>${(alert.orchestrator_trade_ready ?? alert.trade_ready) ? 'Yes' : 'No'}</strong></div>
           <div><span class="label">Primary Engine</span><strong>${esc(alert.orchestrator_primary_engine || alert.primary_engine || 'dashboard_context')}</strong></div>
+          <div><span class="label">Alert Priority</span><strong>${esc(alert.alert_priority_tier || 'Not classified yet')}</strong></div>
         </div>
+        <div class="copy-block"><strong>Priority Reason:</strong> ${esc(alert.alert_priority_reason || 'Waiting for priority classification')}</div>
+        <div class="copy-block"><strong>Warning Delivery:</strong> ${alert.warning_filter_suppressed ? `Dashboard only — ${esc(alert.warning_suppression_reason || 'warning filtered')}` : 'No standalone warning suppression'}</div>
         <div class="copy-block"><strong>Decision Reason:</strong> ${esc(alert.orchestrator_decision_reason || alert.decision_reason || 'Context only')}</div>
         <div class="copy-block"><strong>Supporting Engines:</strong> ${list(alert.orchestrator_supporting_engines || alert.supporting_engines)}</div>
         <div class="copy-block"><strong>Blocking / Risk Engines:</strong> ${list(alert.orchestrator_blocking_engines || alert.blocking_engines)}</div>
@@ -3709,6 +3724,9 @@ def run_tests() -> int:
                 "Main Alert Brain",
                 "renderAlertDecisionBrain",
                 "Final Event Type",
+                "Alert Priority",
+                "Priority Reason",
+                "Warning Delivery",
                 "Supporting Engines",
                 "Blocking / Risk Engines",
                 "What To Wait For",

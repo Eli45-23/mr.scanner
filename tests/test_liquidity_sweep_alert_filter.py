@@ -45,27 +45,38 @@ class LiquiditySweepAlertFilterTests(unittest.TestCase):
         payload.update(overrides)
         return payload
 
-    def test_watch_and_failed_held_are_dashboard_only(self) -> None:
-        for status in ("SWEEP_WATCH", "SWEEP_FAILED_HELD"):
+    def test_non_confirmed_statuses_are_dashboard_only(self) -> None:
+        for status in ("SWEEP_WATCH", "SWEEP_FORMING", "SWEEP_FAILED_HELD", "NO_ACTIVE_SWEEP"):
             payload = self.payload(status)
             classification = classify_sweep_output(payload)
-            allowed, _, metadata = should_send_liquidity_sweep_telegram(payload, [], {}, self.config())
-            self.assertTrue(classification["sweep_map_only"])
+            allowed, reason, metadata = should_send_liquidity_sweep_telegram(payload, [], {}, self.config())
             self.assertFalse(allowed)
-            self.assertTrue(metadata["map_only"])
+            self.assertEqual(reason, "dashboard_only_status")
+            self.assertEqual(metadata["suppression_type"], "dashboard_only_status")
+            self.assertEqual(metadata["dashboard_only_reason"], "dashboard_only_status")
             self.assertTrue(payload["dashboard_eligible"])
+            if status != "SWEEP_FORMING":
+                self.assertTrue(classification["sweep_map_only"])
 
-    def test_forming_and_confirmed_meaningful_events_can_alert(self) -> None:
+    def test_only_confirmed_meaningful_event_can_alert(self) -> None:
         forming = self.payload("SWEEP_FORMING", score=75, confidence="MEDIUM")
         confirmed = self.payload("SWEEP_CONFIRMED", score=85, confidence="HIGH")
-        self.assertTrue(should_send_liquidity_sweep_telegram(forming, [], {}, self.config())[0])
+        self.assertFalse(should_send_liquidity_sweep_telegram(forming, [], {}, self.config())[0])
         self.assertTrue(should_send_liquidity_sweep_telegram(confirmed, [], {}, self.config())[0])
 
-    def test_low_confidence_and_one_minute_only_are_suppressed(self) -> None:
-        low = self.payload(confidence="LOW")
+    def test_low_confidence_and_non_major_level_have_exact_suppression_reasons(self) -> None:
+        low = self.payload(score=69)
         one_minute = self.payload(level_source="resistance", timeframe="1m")
-        self.assertFalse(should_send_liquidity_sweep_telegram(low, [], {}, self.config())[0])
-        self.assertFalse(should_send_liquidity_sweep_telegram(one_minute, [], {}, self.config())[0])
+        low_allowed, low_reason, low_metadata = should_send_liquidity_sweep_telegram(low, [], {}, self.config())
+        minor_allowed, minor_reason, minor_metadata = should_send_liquidity_sweep_telegram(
+            one_minute, [], {}, self.config()
+        )
+        self.assertFalse(low_allowed)
+        self.assertEqual(low_reason, "below_confidence")
+        self.assertEqual(low_metadata["suppression_type"], "below_confidence")
+        self.assertFalse(minor_allowed)
+        self.assertEqual(minor_reason, "not_major_level")
+        self.assertEqual(minor_metadata["suppression_type"], "not_major_level")
 
     def test_nearby_levels_share_zone_bucket_and_state_suppresses_second(self) -> None:
         first = self.payload(sweep_level=291.67)
@@ -75,8 +86,8 @@ class LiquiditySweepAlertFilterTests(unittest.TestCase):
         state = {f"{bucket}|CONFIRMED": {"sent_at": NOW.isoformat()}}
         allowed, reason, metadata = should_send_liquidity_sweep_telegram(second, [], state, self.config())
         self.assertFalse(allowed)
-        self.assertIn("same zone bucket", reason)
-        self.assertEqual(metadata["suppression_type"], "same_zone_cooldown")
+        self.assertEqual(reason, "duplicate_cooldown")
+        self.assertEqual(metadata["suppression_type"], "duplicate_cooldown")
 
     def test_repeated_alternating_tight_range_sweeps_are_suppressed(self) -> None:
         recent = [
@@ -91,11 +102,22 @@ class LiquiditySweepAlertFilterTests(unittest.TestCase):
         self.assertIn("alternating sweeps", reason)
         self.assertTrue(metadata["repeated_range_sweeps"])
 
-    def test_chop_requires_high_confidence_confirmed_event(self) -> None:
+    def test_chop_suppresses_confirmed_sweep_unless_clean_reversal(self) -> None:
         forming = self.payload("SWEEP_FORMING", score=90, confidence="HIGH", inside_chop_range=True)
-        confirmed = self.payload("SWEEP_CONFIRMED", score=90, confidence="HIGH", inside_chop_range=True)
+        confirmed = self.payload("SWEEP_CONFIRMED", score=80, confidence="HIGH", inside_chop_range=True)
+        clean_reversal = self.payload(
+            "SWEEP_CONFIRMED",
+            score=80,
+            confidence="HIGH",
+            inside_chop_range=True,
+            clean_trap_reversal=True,
+        )
         self.assertFalse(should_send_liquidity_sweep_telegram(forming, [], {}, self.config())[0])
-        self.assertTrue(should_send_liquidity_sweep_telegram(confirmed, [], {}, self.config())[0])
+        allowed, reason, metadata = should_send_liquidity_sweep_telegram(confirmed, [], {}, self.config())
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "chop_suppressed")
+        self.assertEqual(metadata["suppression_type"], "chop_suppressed")
+        self.assertTrue(should_send_liquidity_sweep_telegram(clean_reversal, [], {}, self.config())[0])
 
     def test_state_file_is_read_safely_and_context_cannot_approve(self) -> None:
         payload = self.payload()

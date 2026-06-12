@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-ALERT_FILTER_VERSION = "liquidity-sweep-alert-filter-1.0"
+ALERT_FILTER_VERSION = "liquidity-sweep-alert-filter-2.0"
 MEANINGFUL_SOURCES = {
     "hod", "lod", "pmh", "pml", "pdh", "pdl",
     "opening_range_high", "opening_range_low",
@@ -16,6 +16,10 @@ MEANINGFUL_SOURCES = {
 
 def _settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return (config or {}).get("liquidity_sweep_engine", {})
+
+
+def _filter_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return (config or {}).get("liquidity_sweep_telegram_filter", {})
 
 
 def _level(payload: Dict[str, Any]) -> Optional[float]:
@@ -124,25 +128,44 @@ def is_meaningful_sweep_event(
     config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     settings = _settings(config)
+    filters = _filter_settings(config)
     status = str(payload.get("sweep_status") or "NO_ACTIVE_SWEEP").upper()
-    if status == "SWEEP_WATCH":
-        return False, "SWEEP_WATCH is dashboard-only by default"
-    if status == "NO_ACTIVE_SWEEP":
-        return False, "No active sweep event"
+    filter_enabled = bool(filters.get("enabled", True))
+    if filter_enabled:
+        if filters.get("confirmed_only", True) and status != "SWEEP_CONFIRMED":
+            return False, "dashboard_only_status"
+        if status == "SWEEP_WATCH" and filters.get("watch_dashboard_only", True):
+            return False, "dashboard_only_status"
+        if status == "SWEEP_FORMING" and filters.get("forming_dashboard_only", True):
+            return False, "dashboard_only_status"
+        if status == "SWEEP_FAILED_HELD" and filters.get("failed_held_dashboard_only", True):
+            return False, "dashboard_only_status"
+    if status in {"SWEEP_WATCH", "NO_ACTIVE_SWEEP"}:
+        return False, "dashboard_only_status"
     if status == "SWEEP_FAILED_HELD" and not settings.get("telegram_failed_held_enabled", False):
-        return False, "SWEEP_FAILED_HELD is dashboard-only"
+        return False, "dashboard_only_status"
     if status not in {"SWEEP_FORMING", "SWEEP_CONFIRMED", "SWEEP_FAILED_HELD"}:
         return False, "Sweep status is not an event alert"
     score = int(payload.get("score") or 0)
-    threshold = int(settings.get("telegram_confirmed_min_score", 80) if status == "SWEEP_CONFIRMED" else settings.get("telegram_forming_min_score", 70))
+    if status == "SWEEP_CONFIRMED" and score < int(filters.get("confirmed_min_confidence", 70)):
+        return False, "below_confidence"
+    threshold = int(
+        filters.get("confirmed_min_confidence", 70)
+        if status == "SWEEP_CONFIRMED" and filters.get("enabled", True)
+        else settings.get("telegram_confirmed_min_score", 80)
+        if status == "SWEEP_CONFIRMED"
+        else settings.get("telegram_forming_min_score", 70)
+    )
     if score < threshold:
-        return False, f"sweep score {score} below {threshold}"
+        return False, "below_confidence" if status == "SWEEP_CONFIRMED" else f"sweep score {score} below {threshold}"
     confidence = str(payload.get("confidence") or "LOW").upper()
     required = str(settings.get("telegram_confirmed_min_confidence", "HIGH") if status == "SWEEP_CONFIRMED" else settings.get("telegram_min_confidence", "MEDIUM")).upper()
     ranks = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
     if ranks.get(confidence, 0) < ranks.get(required, 1):
-        return False, f"sweep confidence {confidence} below {required}"
+        return False, "below_confidence" if status == "SWEEP_CONFIRMED" else f"sweep confidence {confidence} below {required}"
     importance = _source_importance(payload)
+    if status == "SWEEP_CONFIRMED" and filters.get("require_major_level", True) and importance != "HIGH":
+        return False, "not_major_level"
     if settings.get("telegram_require_meaningful_source", True) and importance == "LOW":
         return False, "sweep source lacks meaningful 5m/15m or major-level importance"
     if settings.get("telegram_suppress_1m_only", True) and str(payload.get("timeframe") or "").lower() == "1m" and importance == "LOW":
@@ -159,8 +182,19 @@ def is_meaningful_sweep_event(
     summary = (market_structure or {}).get("summary") if isinstance((market_structure or {}).get("summary"), dict) else market_structure or {}
     inside_chop = inside_chop or bool(summary.get("chop_range_detected"))
     if inside_chop and settings.get("telegram_chop_requires_high_confidence", True):
-        if status != "SWEEP_CONFIRMED" or confidence != "HIGH" or score < int(settings.get("telegram_chop_min_score", 85)):
-            return False, "chop range requires a high-confidence confirmed sweep"
+        clean_reversal = bool(payload.get("clean_trap_reversal")) or (
+            status == "SWEEP_CONFIRMED"
+            and confidence == "HIGH"
+            and score >= int(settings.get("telegram_chop_min_score", 85))
+            and str(payload.get("trap_bias") or "NEUTRAL").upper() in {"BULLISH", "BEARISH"}
+            and bool(payload.get("current_candle_closed", True))
+        )
+        if filters.get("suppress_inside_chop_unless_reversal", True) and not clean_reversal:
+            return False, "chop_suppressed"
+        if not filters.get("suppress_inside_chop_unless_reversal", True) and (
+            status != "SWEEP_CONFIRMED" or confidence != "HIGH" or score < int(settings.get("telegram_chop_min_score", 85))
+        ):
+            return False, "chop_suppressed"
     return True, "meaningful new liquidity sweep event"
 
 
@@ -195,6 +229,7 @@ def should_send_liquidity_sweep_telegram(
     market_structure: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     settings = _settings(config)
+    filters = _filter_settings(config)
     classification = classify_sweep_output(payload)
     bucket = sweep_zone_bucket(payload, float(settings.get("telegram_zone_bucket_bps", 12)))
     repeated = detect_repeated_range_sweeps(
@@ -205,10 +240,11 @@ def should_send_liquidity_sweep_telegram(
     )
     allowed, reason = is_meaningful_sweep_event(payload, market_structure, recent_sweeps, config)
     suppression = ""
-    if allowed and _state_has_recent_bucket(state, bucket, int(settings.get("telegram_same_bucket_cooldown_minutes", 30))):
-        allowed, reason, suppression = False, "same zone bucket already alerted within cooldown", "same_zone_cooldown"
+    cooldown = int(filters.get("cooldown_minutes", 10))
+    if allowed and _state_has_recent_bucket(state, bucket, cooldown):
+        allowed, reason, suppression = False, "duplicate_cooldown", "duplicate_cooldown"
     elif not allowed:
-        suppression = "repeated_range_sweeps" if repeated["repeated_range_sweeps"] else "dashboard_only"
+        suppression = "repeated_range_sweeps" if repeated["repeated_range_sweeps"] else reason
     metadata = {
         "alert_filter_version": ALERT_FILTER_VERSION,
         "zone_bucket": bucket,

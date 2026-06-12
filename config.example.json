@@ -84,6 +84,28 @@
     "do_not_chase_context_enabled": true,
     "dashboard_context_always": true
   },
+  "alert_priority": {
+    "enabled": true,
+    "telegram_only_tier_1": true,
+    "dashboard_only_context": true,
+    "log_tier_3": true,
+    "min_priority_score_for_telegram": 80,
+    "allow_chop_activation_text_once": true,
+    "allow_confirmed_sweep_text": true,
+    "confirmed_sweep_min_confidence": 70,
+    "major_structure_shift_text": true,
+    "dedupe_minutes": 10
+  },
+  "warning_alert_filter": {
+    "enabled": true,
+    "chop_activation_text_once": true,
+    "chop_repeated_dashboard_only": true,
+    "mixed_dashboard_only": true,
+    "do_not_chase_dashboard_only": true,
+    "late_move_dashboard_only": true,
+    "allow_chop_exit_text": true,
+    "cooldown_minutes": 15
+  },
   "liquidity_sweep_engine": {
     "enabled": true,
     "timeframes": ["1m", "5m", "15m"],
@@ -122,6 +144,17 @@
     "telegram_cooldown_minutes": 10,
     "telegram_max_chars": 900,
     "telegram_include_structure": true
+  },
+  "liquidity_sweep_telegram_filter": {
+    "enabled": true,
+    "watch_dashboard_only": true,
+    "forming_dashboard_only": true,
+    "failed_held_dashboard_only": true,
+    "confirmed_only": true,
+    "confirmed_min_confidence": 70,
+    "require_major_level": true,
+    "suppress_inside_chop_unless_reversal": true,
+    "cooldown_minutes": 10
   },
   "morning_playbook": {
     "enabled": true,

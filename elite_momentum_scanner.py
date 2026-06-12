@@ -69,6 +69,7 @@ import requests
 from post_alert_performance import PostAlertPerformanceTracker, update_performance_record
 from scanner.chop_mode_engine import clean_breakout_exits_chop, evaluate_chop_mode
 from scanner.alert_decision_orchestrator import orchestrate_alert_decision
+from scanner.alert_priority import classify_alert_priority, validate_priority_decision
 from scanner.liquidity_sweep_alert_filter import should_send_liquidity_sweep_telegram
 from scanner.liquidity_sweep_telegram import (
     append_sweep_telegram_log,
@@ -253,6 +254,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "do_not_chase_context_enabled": True,
         "dashboard_context_always": True,
     },
+    "alert_priority": {
+        "enabled": True,
+        "telegram_only_tier_1": True,
+        "dashboard_only_context": True,
+        "log_tier_3": True,
+        "min_priority_score_for_telegram": 80,
+        "allow_chop_activation_text_once": True,
+        "allow_confirmed_sweep_text": True,
+        "confirmed_sweep_min_confidence": 70,
+        "major_structure_shift_text": True,
+        "dedupe_minutes": 10,
+    },
+    "warning_alert_filter": {
+        "enabled": True,
+        "chop_activation_text_once": True,
+        "chop_repeated_dashboard_only": True,
+        "mixed_dashboard_only": True,
+        "do_not_chase_dashboard_only": True,
+        "late_move_dashboard_only": True,
+        "allow_chop_exit_text": True,
+        "cooldown_minutes": 15,
+    },
     "liquidity_sweep_engine": {
         "enabled": True,
         "timeframes": ["1m", "5m", "15m"],
@@ -291,6 +314,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "telegram_cooldown_minutes": 10,
         "telegram_max_chars": 900,
         "telegram_include_structure": True,
+    },
+    "liquidity_sweep_telegram_filter": {
+        "enabled": True,
+        "watch_dashboard_only": True,
+        "forming_dashboard_only": True,
+        "failed_held_dashboard_only": True,
+        "confirmed_only": True,
+        "confirmed_min_confidence": 70,
+        "require_major_level": True,
+        "suppress_inside_chop_unless_reversal": True,
+        "cooldown_minutes": 10,
     },
     "morning_playbook": {
         "enabled": True,
@@ -920,6 +954,17 @@ class Alert:
     orchestrator_wait_for: List[str] = field(default_factory=list)
     orchestrator_what_to_wait_for: List[str] = field(default_factory=list)
     orchestrator_invalidation_notes: List[str] = field(default_factory=list)
+    alert_priority_tier: Optional[str] = None
+    alert_priority_reason: Optional[str] = None
+    alert_priority_score: Optional[int] = None
+    alert_priority_telegram_allowed: bool = False
+    alert_priority_dashboard_only: bool = True
+    alert_priority_context_only: bool = True
+    alert_priority_can_approve_trades: bool = False
+    warning_filter_suppressed: bool = False
+    warning_suppression_reason: Optional[str] = None
+    warning_filter_type: Optional[str] = None
+    chop_exit_clean_confirmation: bool = False
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
     strategy_levels: Dict[str, float] = field(default_factory=dict)
@@ -4535,8 +4580,14 @@ class EliteScanner:
             mixed_signal=bool(alert.mixed_signal_detected or alert.scenario_conflict),
             structure_warning=str(alert.market_structure_warning or ""),
         )
+        alert.chop_exit_clean_confirmation = bool(clean_exit and chop.get("chop_mode_active"))
         if alert.chop_mode_active and not clean_exit and decision_config.get("chop_mode_suppress_repeated_alerts", True):
-            cooldown = int(decision_config.get("chop_mode_cooldown_minutes", 15))
+            cooldown = int(
+                self.config.get("warning_alert_filter", {}).get(
+                    "cooldown_minutes",
+                    decision_config.get("chop_mode_cooldown_minutes", 15),
+                )
+            )
             warning_due = not self.last_chop_warning_at or (
                 alert.timestamp - self.last_chop_warning_at
             ).total_seconds() >= cooldown * 60
@@ -4611,6 +4662,39 @@ class EliteScanner:
         }
         eligible = bool(eligible and filter_allowed)
         reason = reason if eligible else filter_reason
+        priority_result = {
+            "tier": "TIER_1_TEXT_ALERT",
+            "should_send_telegram": True,
+            "reason": "Alert priority ladder disabled; existing sweep delivery behavior preserved",
+            "priority_score": int(payload.get("score") or 0),
+        }
+        if self.config.get("alert_priority", {}).get("enabled", True):
+            priority_payload = {
+                **payload,
+                "existing_user_facing_approved": eligible,
+                "telegram_filter_allowed": filter_allowed,
+                "context_only": True,
+            }
+            try:
+                priority_result = classify_alert_priority(priority_payload, self.config)
+                priority_valid, priority_reason = validate_priority_decision(priority_result)
+                if not priority_valid:
+                    raise ValueError(priority_reason)
+            except Exception as exc:
+                priority_result = {
+                    "tier": "TIER_2_DASHBOARD_ONLY",
+                    "should_send_telegram": False,
+                    "dashboard_only": True,
+                    "reason": f"Alert priority failed safely: {redact_notification_error(exc)}",
+                    "priority_score": 0,
+                    "can_approve_trades": False,
+                    "context_only": True,
+                }
+            if not priority_result["should_send_telegram"]:
+                eligible = False
+                reason = "priority_not_tier_1"
+                filter_metadata["suppression_type"] = "priority_not_tier_1"
+                filter_metadata["dashboard_only_reason"] = priority_result["reason"]
         log_fields: Dict[str, Any] = {
             "telegram_eligible": bool(eligible),
             "telegram_sent": False,
@@ -4619,6 +4703,9 @@ class EliteScanner:
             "openai_formatter_used": False,
             "openai_validation_passed": False,
             "fallback_used": False,
+            "alert_priority_tier": priority_result["tier"],
+            "alert_priority_reason": priority_result["reason"],
+            "alert_priority_score": priority_result["priority_score"],
             **filter_metadata,
         }
         if not eligible or not alert_type:
@@ -4646,11 +4733,13 @@ class EliteScanner:
 
         allowed, dedupe_reason, _ = claim_sweep_delivery(
             payload,
-            int(settings.get("telegram_same_bucket_cooldown_minutes", 30)),
+            int(self.config.get("liquidity_sweep_telegram_filter", {}).get("cooldown_minutes", 10)),
             LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE,
         )
         if not allowed:
-            log_fields["telegram_suppressed_reason"] = dedupe_reason
+            log_fields["telegram_suppressed_reason"] = "duplicate_cooldown"
+            log_fields["suppression_type"] = "duplicate_cooldown"
+            log_fields["dedupe_detail"] = dedupe_reason
             append_sweep_telegram_log(LOG_DIR / "liquidity_sweeps.jsonl", payload, **log_fields)
             return False
 
@@ -7160,6 +7249,49 @@ class EliteScanner:
             logger.warning("Alert orchestrator log failed safely: %s", redact_notification_error(exc))
         return decision
 
+    def apply_alert_priority(self, alert: Alert) -> Dict[str, Any]:
+        if not self.config.get("alert_priority", {}).get("enabled", True):
+            return {}
+        existing_approved = bool(alert.sms_allowed or alert.watch_allowed or alert.phase3_heads_up_sent)
+        payload = {
+            **asdict(alert),
+            "existing_user_facing_approved": existing_approved,
+            "context_only": alert.orchestrator_context_only,
+            "chop_activation_first": bool(alert.chop_warning_sent),
+        }
+        try:
+            result = classify_alert_priority(payload, self.config)
+            valid, reason = validate_priority_decision(result)
+            if not valid:
+                raise ValueError(reason)
+        except Exception as exc:
+            result = {
+                "tier": "TIER_2_DASHBOARD_ONLY",
+                "should_send_telegram": False,
+                "dashboard_only": True,
+                "reason": f"Alert priority failed safely: {redact_notification_error(exc)}",
+                "priority_score": 0,
+                "can_approve_trades": False,
+                "context_only": True,
+            }
+        alert.alert_priority_tier = result["tier"]
+        alert.alert_priority_reason = result["reason"]
+        alert.alert_priority_score = result["priority_score"]
+        alert.alert_priority_telegram_allowed = bool(result["should_send_telegram"])
+        alert.alert_priority_dashboard_only = bool(result["dashboard_only"])
+        alert.alert_priority_context_only = bool(result["context_only"])
+        alert.alert_priority_can_approve_trades = False
+        alert.warning_filter_suppressed = bool(result.get("warning_filter_suppressed"))
+        alert.warning_suppression_reason = result.get("warning_suppression_reason") or None
+        alert.warning_filter_type = result.get("warning_filter_type") or None
+        if self.config.get("alert_priority", {}).get("telegram_only_tier_1", True) and result["tier"] != "TIER_1_TEXT_ALERT":
+            alert.sms_allowed = False
+            alert.watch_allowed = False
+            alert.phase3_heads_up_sent = False
+            alert.text_alert_reason = result["reason"]
+            alert.notes.append(f"alert priority: {result['tier']} - {result['reason']}")
+        return result
+
     def process_alert(self, alert: Alert) -> bool:
         quality_config = self.config.get("alert_quality", {})
         text_key: Optional[str] = None
@@ -7193,6 +7325,7 @@ class EliteScanner:
             return False
         apply_risk_invalidation(alert)
         assign_professional_alert_tier(alert)
+        self.apply_alert_priority(alert)
         logger.info(alert.short_summary())
         self.writer.write(alert)
         if self.post_alert_performance_enabled:
@@ -7477,6 +7610,33 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     orchestrator["trend_context_cooldown_minutes"] = env_int(
         "TREND_CONTEXT_COOLDOWN_MINUTES", int(orchestrator.get("trend_context_cooldown_minutes", 15))
     )
+    priority = config.setdefault("alert_priority", {})
+    priority["enabled"] = env_bool("ENABLE_ALERT_PRIORITY", bool(priority.get("enabled", True)))
+    priority["telegram_only_tier_1"] = env_bool(
+        "TELEGRAM_ONLY_TIER_1", bool(priority.get("telegram_only_tier_1", True))
+    )
+    priority["min_priority_score_for_telegram"] = env_int(
+        "ALERT_PRIORITY_MIN_SCORE", int(priority.get("min_priority_score_for_telegram", 80))
+    )
+    priority["dedupe_minutes"] = env_int(
+        "ALERT_PRIORITY_DEDUPE_MINUTES", int(priority.get("dedupe_minutes", 10))
+    )
+    warning_filter = config.setdefault("warning_alert_filter", {})
+    warning_filter["enabled"] = env_bool(
+        "WARNING_ALERT_FILTER_ENABLED", bool(warning_filter.get("enabled", True))
+    )
+    warning_filter["chop_activation_text_once"] = env_bool(
+        "CHOP_ACTIVATION_TEXT_ONCE", bool(warning_filter.get("chop_activation_text_once", True))
+    )
+    warning_filter["mixed_dashboard_only"] = env_bool(
+        "MIXED_DASHBOARD_ONLY", bool(warning_filter.get("mixed_dashboard_only", True))
+    )
+    warning_filter["do_not_chase_dashboard_only"] = env_bool(
+        "DO_NOT_CHASE_DASHBOARD_ONLY", bool(warning_filter.get("do_not_chase_dashboard_only", True))
+    )
+    warning_filter["late_move_dashboard_only"] = env_bool(
+        "LATE_MOVE_DASHBOARD_ONLY", bool(warning_filter.get("late_move_dashboard_only", True))
+    )
     sweep = config.setdefault("liquidity_sweep_engine", {})
     sweep["enabled"] = env_bool("ENABLE_LIQUIDITY_SWEEP_ENGINE", bool(sweep.get("enabled", True)))
     raw_sweep_timeframes = os.getenv("LIQUIDITY_SWEEP_TIMEFRAMES")
@@ -7552,6 +7712,16 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     )
     sweep["telegram_include_structure"] = env_bool(
         "LIQUIDITY_SWEEP_TELEGRAM_INCLUDE_STRUCTURE", bool(sweep.get("telegram_include_structure", True))
+    )
+    sweep_filter = config.setdefault("liquidity_sweep_telegram_filter", {})
+    sweep_filter["confirmed_only"] = env_bool(
+        "LIQUIDITY_SWEEP_CONFIRMED_ONLY_TELEGRAM", bool(sweep_filter.get("confirmed_only", True))
+    )
+    sweep_filter["confirmed_min_confidence"] = env_int(
+        "LIQUIDITY_SWEEP_CONFIRMED_MIN_CONFIDENCE", int(sweep_filter.get("confirmed_min_confidence", 70))
+    )
+    sweep_filter["require_major_level"] = env_bool(
+        "LIQUIDITY_SWEEP_REQUIRE_MAJOR_LEVEL", bool(sweep_filter.get("require_major_level", True))
     )
     playbook = config.setdefault("morning_playbook", {})
     playbook["enabled"] = env_bool("ENABLE_MORNING_PLAYBOOK", bool(playbook.get("enabled", True)))

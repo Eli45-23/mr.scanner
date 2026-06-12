@@ -396,6 +396,33 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
         self.assertFalse(send.call_args.kwargs["sms_sent"])
         self.assertTrue(log.call_args.kwargs["telegram_sent"])
 
+    def test_scanner_logs_priority_not_tier_one_suppression(self) -> None:
+        config = scanner.load_config(None)
+        config["notifications"]["telegram_enabled"] = True
+        instance = object.__new__(scanner.EliteScanner)
+        instance.config = config
+        bar = scanner.Bar(t=START, o=100.0, h=101.1, l=99.9, c=100.7, v=1600)
+        snap = scanner.SymbolSnapshot(symbol="AAPL", latest_bar=bar, recent_bars=[bar])
+        priority_result = {
+            "tier": "TIER_2_DASHBOARD_ONLY",
+            "should_send_telegram": False,
+            "dashboard_only": True,
+            "reason": "Priority ladder retained sweep on dashboard",
+            "priority_score": 90,
+            "can_approve_trades": False,
+            "context_only": True,
+        }
+        with (
+            patch("tools.preview_liquidity_sweeps.build_liquidity_sweep_preview", return_value=self.payload("SWEEP_CONFIRMED")),
+            patch.object(scanner, "classify_alert_priority", return_value=priority_result),
+            patch.object(scanner, "send_telegram_message") as send,
+            patch.object(scanner, "append_sweep_telegram_log") as log,
+        ):
+            self.assertFalse(instance.process_liquidity_sweep_telegram(snap))
+        send.assert_not_called()
+        self.assertEqual(log.call_args.kwargs["telegram_suppressed_reason"], "priority_not_tier_1")
+        self.assertEqual(log.call_args.kwargs["suppression_type"], "priority_not_tier_1")
+
     def test_review_summary_includes_liquidity_sweep_counts(self) -> None:
         summary = export_review_package.build_review_summary(
             day_text="2026-06-10",
