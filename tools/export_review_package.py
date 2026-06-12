@@ -13,8 +13,10 @@ from zoneinfo import ZoneInfo
 
 try:
     from tools.review_alert_performance import build_report as build_performance_report
+    from tools.review_alert_quality import write_alert_quality_review
 except ModuleNotFoundError:
     from review_alert_performance import build_report as build_performance_report
+    from review_alert_quality import write_alert_quality_review
 
 APP_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_DIR = APP_DIR / "logs"
@@ -539,6 +541,8 @@ def build_review_summary(
 - `logs/chop_mode.jsonl` if available
 - `logs/missed_clean_entry.jsonl` if available
 - `logs/alert_orchestrator.jsonl` if available
+- `logs/market_map_updates.jsonl` if available
+- `logs/morning_playbook.jsonl` if available
 - `logs/openai_alert_formatter.jsonl` if available
 - `logs/premarket_discipline_message.jsonl` if available
 - latest scanner log if available
@@ -557,6 +561,8 @@ def build_review_summary(
 - `window/market_structure_window.jsonl`
 - `window/liquidity_sweeps_window.jsonl`
 - `alert_performance_{day_text}.md` if generated
+- `alert_quality_review_{day_text}.md`
+- `alert_quality_review_{day_text}.json`
 
 ## Export Notes
 {notes_text}
@@ -613,6 +619,8 @@ def export_review_package(
     chop_mode = records_for_day(read_jsonl(log_dir / "chop_mode.jsonl"), day_text)
     missed_clean_entry = records_for_day(read_jsonl(log_dir / "missed_clean_entry.jsonl"), day_text)
     alert_orchestrator = records_for_day(read_jsonl(log_dir / "alert_orchestrator.jsonl"), day_text)
+    market_map_updates = records_for_day(read_jsonl(log_dir / "market_map_updates.jsonl"), day_text)
+    morning_playbook = records_for_day(read_jsonl(log_dir / "morning_playbook.jsonl"), day_text)
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -640,6 +648,10 @@ def export_review_package(
         write_jsonl(logs_out / "missed_clean_entry.jsonl", missed_clean_entry)
     if (log_dir / "alert_orchestrator.jsonl").exists():
         write_jsonl(logs_out / "alert_orchestrator.jsonl", alert_orchestrator)
+    if (log_dir / "market_map_updates.jsonl").exists():
+        write_jsonl(logs_out / "market_map_updates.jsonl", market_map_updates)
+    if (log_dir / "morning_playbook.jsonl").exists():
+        write_jsonl(logs_out / "morning_playbook.jsonl", morning_playbook)
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
@@ -707,6 +719,7 @@ def export_review_package(
         build_performance_report(day_text, list(latest_performance.values())),
         encoding="utf-8",
     )
+    quality_paths = write_alert_quality_review(day_text, log_dir, package_dir)
 
     summary = build_review_summary(
         day_text=day_text,
@@ -731,6 +744,8 @@ def export_review_package(
         "package_dir": package_dir,
         "summary": summary_path,
         "zip": zip_path,
+        "alert_quality_markdown": quality_paths["markdown"],
+        "alert_quality_json": quality_paths["json"],
     }
 
 

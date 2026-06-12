@@ -206,8 +206,17 @@
     "send_once_per_day": true,
     "include_market_structure": true,
     "include_liquidity_sweeps": true,
+    "include_supply_demand": true,
+    "include_support_resistance": true,
     "include_discipline_rules": true,
     "max_chars": 1200
+  },
+  "alert_quality_review": {
+    "enabled": true,
+    "target_max_telegram_alerts_per_day": 25,
+    "warn_if_risk_warning_ratio_above": 0.5,
+    "warn_if_chop_alert_ratio_above": 0.4,
+    "include_recommendations": true
   },
   "market_map_update": {
     "enabled": true,

@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 DISCLAIMER = "Not a buy/sell signal."
 CONFIRMATION = "Confirm manually."
+WATCH_ONLY = "Watch only."
+MORNING_MAP = "Use this as a morning map, not a trade alert."
 FORBIDDEN_ACTION_PATTERNS = (
     r"\bbuy\b",
     r"\bsell\b",
@@ -94,6 +96,29 @@ def _zone_value(value: Any) -> Any:
     return _pick(value, "price", "level", "midpoint", "sweep_level")
 
 
+def _zone_detail(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"area": _zone_value(value)}
+    return {
+        "area": _zone_value(value),
+        "precision": _zone_value(
+            {
+                "zone_low": _pick(value, "precision_zone_low"),
+                "zone_high": _pick(value, "precision_zone_high"),
+            }
+        ),
+        "major": _zone_value(
+            {
+                "zone_low": _pick(value, "major_zone_low", "zone_low"),
+                "zone_high": _pick(value, "major_zone_high", "zone_high"),
+            }
+        ),
+        "quality": _pick(value, "quality_label", "label", "strength"),
+        "trigger": _pick(value, "trigger_level", "best_reaction_level"),
+        "invalidation": _pick(value, "invalidation_level"),
+    }
+
+
 def build_morning_playbook_payload(
     symbol: str,
     current_price: Optional[float],
@@ -102,6 +127,8 @@ def build_morning_playbook_payload(
     liquidity_sweep: Optional[Dict[str, Any]] = None,
     market_context: Optional[Dict[str, Any]] = None,
     option_context: Optional[Dict[str, Any]] = None,
+    include_support_resistance: bool = True,
+    include_supply_demand: bool = True,
 ) -> Dict[str, Any]:
     structure = market_structure or {}
     if isinstance(structure.get("summary"), dict):
@@ -125,6 +152,13 @@ def build_morning_playbook_payload(
         avoid.insert(0, "Current SPY/QQQ context is mixed.")
     if option_context.get("spread_warning"):
         avoid.insert(0, str(option_context["spread_warning"]))
+    demand_detail = _zone_detail(structure.get("major_demand_area")) if include_supply_demand else {}
+    supply_detail = _zone_detail(structure.get("major_supply_area")) if include_supply_demand else {}
+    chop_warning = (
+        "Chop risk active: price is trapped between demand and supply."
+        if structure.get("chop_range_detected") or "chop" in str(_pick(structure, "structure_warning", "warning") or "").lower()
+        else None
+    )
     return {
         "symbol": str(symbol or "AAPL").upper(),
         "date": datetime.now(ET).date().isoformat(),
@@ -138,10 +172,17 @@ def build_morning_playbook_payload(
         "structure_quality": _pick(structure, "structure_quality", "quality"),
         "structure_warning": _pick(structure, "structure_warning", "warning"),
         "current_price_location_summary": structure.get("current_price_location_summary"),
-        "major_support_area": _zone_value(structure.get("major_support_area")),
-        "major_resistance_area": _zone_value(structure.get("major_resistance_area")),
-        "major_demand_area": _zone_value(structure.get("major_demand_area")),
-        "major_supply_area": _zone_value(structure.get("major_supply_area")),
+        "major_support_area": _zone_value(structure.get("major_support_area")) if include_support_resistance else None,
+        "major_resistance_area": _zone_value(structure.get("major_resistance_area")) if include_support_resistance else None,
+        "major_demand_area": demand_detail.get("major"),
+        "major_supply_area": supply_detail.get("major"),
+        "precision_demand_area": demand_detail.get("precision"),
+        "precision_supply_area": supply_detail.get("precision"),
+        "demand_quality": demand_detail.get("quality"),
+        "supply_quality": supply_detail.get("quality"),
+        "demand_trigger": demand_detail.get("trigger"),
+        "supply_trigger": supply_detail.get("trigger"),
+        "chop_warning": chop_warning,
         "nearest_upside_sweep_zone": _zone_value(sweep.get("nearest_upside_sweep_zone")),
         "nearest_downside_sweep_zone": _zone_value(sweep.get("nearest_downside_sweep_zone")),
         "sweep_status": sweep.get("sweep_status"),
@@ -150,6 +191,7 @@ def build_morning_playbook_payload(
         "wait_for": wait_for,
         "avoid": avoid,
         "disclaimer": DISCLAIMER,
+        "morning_map_language": MORNING_MAP,
         "can_approve_trades": False,
         "context_only": True,
     }
@@ -179,11 +221,14 @@ def format_morning_playbook_message(payload: Dict[str, Any], max_chars: int = 12
             "Structure:\n"
             f"Bias: {_display(payload.get('market_structure_bias'))} | Quality: {_display(payload.get('structure_quality'))}\n"
             f"Warning: {_display(payload.get('structure_warning'))}\n"
+            f"Chop: {_display(payload.get('chop_warning'))}\n"
             f"Location: {_display(payload.get('current_price_location_summary'))}"
         ),
         (
             "Key Areas:\n"
-            f"Demand: {_display(payload.get('major_demand_area'))} | Supply: {_display(payload.get('major_supply_area'))}\n"
+            f"Demand: {_display(payload.get('major_demand_area'))} | Precision: {_display(payload.get('precision_demand_area'))}\n"
+            f"Supply: {_display(payload.get('major_supply_area'))} | Precision: {_display(payload.get('precision_supply_area'))}\n"
+            f"Triggers: demand {_display(payload.get('demand_trigger'))} | supply {_display(payload.get('supply_trigger'))}\n"
             f"Support: {_display(payload.get('major_support_area'))} | Resistance: {_display(payload.get('major_resistance_area'))}"
         ),
         (
@@ -195,12 +240,12 @@ def format_morning_playbook_message(payload: Dict[str, Any], max_chars: int = 12
         ),
         (
             "Plan:\n"
-            "Watch only. Confirm manually.\n"
+            f"{WATCH_ONLY} {CONFIRMATION}\n"
             "Wait for a clean PMH/PDH or PML/PDL hold with SPY/QQQ confirmation, or a clean VWAP/EMA9 hold/rejection.\n"
             "Avoid chasing the first candle. Respect Chop Mode.\n"
             "No clean edge if price stays trapped between demand and supply."
         ),
-        f"{DISCLAIMER}\nUse this as a morning map, not a trade alert.",
+        f"{DISCLAIMER}\n{MORNING_MAP}",
     ]
     message = "\n\n".join(sections)
     limit = max(300, int(max_chars))
@@ -221,6 +266,8 @@ def _protected_numeric_text(payload: Dict[str, Any]) -> set[str]:
         "major_resistance_area",
         "major_demand_area",
         "major_supply_area",
+        "precision_demand_area",
+        "precision_supply_area",
         "nearest_upside_sweep_zone",
         "nearest_downside_sweep_zone",
     ):
@@ -244,6 +291,10 @@ def validate_morning_playbook_message(
         failures.append("missing Not a buy/sell signal disclaimer")
     if CONFIRMATION not in message:
         failures.append("missing Confirm manually language")
+    if WATCH_ONLY not in message:
+        failures.append("missing Watch only language")
+    if MORNING_MAP not in message:
+        failures.append("missing morning map language")
     actionable = message.replace(DISCLAIMER, "")
     for pattern in FORBIDDEN_ACTION_PATTERNS:
         if re.search(pattern, actionable, flags=re.IGNORECASE):

@@ -387,8 +387,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "send_once_per_day": True,
         "include_market_structure": True,
         "include_liquidity_sweeps": True,
+        "include_supply_demand": True,
+        "include_support_resistance": True,
         "include_discipline_rules": True,
         "max_chars": 1200,
+    },
+    "alert_quality_review": {
+        "enabled": True,
+        "target_max_telegram_alerts_per_day": 25,
+        "warn_if_risk_warning_ratio_above": 0.5,
+        "warn_if_chop_alert_ratio_above": 0.4,
+        "include_recommendations": True,
     },
     "market_map_update": {
         "enabled": True,
@@ -4898,6 +4907,8 @@ class EliteScanner:
                 liquidity_sweep=sweep,
                 market_context=market_context,
                 option_context=option_context,
+                include_support_resistance=bool(settings.get("include_support_resistance", True)),
+                include_supply_demand=bool(settings.get("include_supply_demand", True)),
             )
             max_chars = int(settings.get("max_chars", 1200))
             message = format_morning_playbook_message(payload, max_chars=max_chars)

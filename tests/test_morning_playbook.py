@@ -37,11 +37,24 @@ def sample_payload():
             "market_structure_bias": "MIXED",
             "structure_quality": "HIGH",
             "structure_warning": "inside chop range",
+            "chop_range_detected": True,
             "current_price_location_summary": "AAPL is between demand and supply",
             "major_support_area": {"price": 290.1},
             "major_resistance_area": {"price": 292.4},
-            "major_demand_area": {"zone_low": 290.05, "zone_high": 290.26},
-            "major_supply_area": {"zone_low": 292.2, "zone_high": 292.45},
+            "major_demand_area": {
+                "zone_low": 290.05,
+                "zone_high": 290.26,
+                "precision_zone_low": 290.12,
+                "precision_zone_high": 290.2,
+                "trigger_level": 290.16,
+            },
+            "major_supply_area": {
+                "zone_low": 292.2,
+                "zone_high": 292.45,
+                "precision_zone_low": 292.3,
+                "precision_zone_high": 292.38,
+                "trigger_level": 292.34,
+            },
         },
         liquidity_sweep={
             "nearest_upside_sweep_zone": {"level": 292.4},
@@ -86,7 +99,9 @@ def test_payload_is_context_only_and_cannot_approve():
 
 def test_format_includes_levels_structure_and_sweeps():
     message = format_morning_playbook_message(sample_payload())
-    for text in ("PMH", "PML", "PDH", "PDL", "PDC", "MIXED", "292.40", "290.05"):
+    for text in ("PMH", "PML", "PDH", "PDL", "PDC", "MIXED", "292.40", "290.05", "290.12", "292.30", "Chop"):
+        assert text in message
+    for text in ("Watch only.", "Confirm manually.", "Not a buy/sell signal.", "Use this as a morning map, not a trade alert."):
         assert text in message
 
 
@@ -180,3 +195,14 @@ def test_morning_playbook_env_overrides():
     assert config["send_time_et"] == "09:27"
     assert config["telegram_enabled"] is False
     assert config["max_chars"] == 1000
+
+
+def test_preview_tool_runs_without_market_or_telegram(capsys):
+    from tools import preview_morning_playbook
+
+    with patch("sys.argv", ["preview_morning_playbook.py"]):
+        assert preview_morning_playbook.main() == 0
+    output = capsys.readouterr().out
+    assert "AAPL Morning Playbook" in output
+    assert "Validation: PASS" in output
+    assert "token" not in output.lower()
