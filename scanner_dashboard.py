@@ -170,7 +170,8 @@ def load_market_structure_dashboard(
             if levels:
                 item = levels[0]
                 copy_lines.append(
-                    f"{timeframe} {label}: {float(item['price']):.2f} | {item.get('strength', 'Not enough clean data yet')} | "
+                    f"{timeframe} {label}: {float(item['price']):.2f} | {item.get('quality_label') or item.get('strength', 'Not enough clean data yet')} | "
+                    f"Trigger {item.get('trigger_level', 'unavailable')} | Invalidation {item.get('invalidation_level', 'unavailable')} | "
                     f"{item.get('source') or item.get('reason') or 'Not enough clean data yet'}"
                 )
         for label, key in (("Demand", "demand"), ("Supply", "supply")):
@@ -178,9 +179,17 @@ def load_market_structure_dashboard(
             if zones:
                 item = zones[0]
                 tested = "Fresh" if item.get("fresh") else f"Tested {item.get('times_tested', 0)}x"
+                precision_low = item.get("precision_zone_low", item.get("zone_low"))
+                precision_high = item.get("precision_zone_high", item.get("zone_high"))
+                major_low = item.get("major_zone_low", item.get("zone_low"))
+                major_high = item.get("major_zone_high", item.get("zone_high"))
                 copy_lines.append(
-                    f"{timeframe} {label}: {float(item['zone_low']):.2f}-{float(item['zone_high']):.2f} | "
-                    f"{item.get('strength', 'Not enough clean data yet')} | {tested} | "
+                    f"{timeframe} {label}: Precision {float(precision_low):.2f}-{float(precision_high):.2f} | "
+                    f"Major: {float(major_low):.2f}-{float(major_high):.2f} | "
+                    f"{item.get('quality_label') or item.get('label') or item.get('strength', 'Not enough clean data yet')} | {tested} | "
+                    f"Trigger {item.get('trigger_level', 'unavailable')} | "
+                    f"{'Reclaim' if key == 'demand' else 'Rejection'} {item.get('reclaim_line') or item.get('rejection_line') or 'unavailable'} | "
+                    f"Invalidation {item.get('invalidation_level', 'unavailable')} | "
                     f"{item.get('last_reaction') or item.get('reason') or 'Not enough clean data yet'}"
                 )
     session_label = _market_session_label(now)
@@ -2710,9 +2719,9 @@ INDEX_HTML = r"""<!doctype html>
     function renderNearestLevel(label, item, zone = false) {
       if (!item || !Object.keys(item).length) return `${label}: Not enough clean data yet`;
       const price = zone
-        ? `${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)}`
+        ? `Precision ${structureMoney(item.precision_zone_low ?? item.zone_low)}-${structureMoney(item.precision_zone_high ?? item.zone_high)} | Major ${structureMoney(item.major_zone_low ?? item.zone_low)}-${structureMoney(item.major_zone_high ?? item.zone_high)}`
         : structureMoney(item.price);
-      return `${label}: ${price} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
+      return `${label}: ${price} | ${structureValue(item.timeframe)} | ${structureValue(item.quality_label || item.strength)} | Trigger ${structureValue(item.trigger_level)} | Invalidation ${structureValue(item.invalidation_level)}`;
     }
 
     function renderStructureLevelTable(timeframe, record) {
@@ -2726,11 +2735,12 @@ INDEX_HTML = r"""<!doctype html>
         return `<div class="empty">No clean ${esc(timeframe)} support or resistance detected yet</div>`;
       }
       return `<table>
-        <thead><tr><th>Type</th><th>Price</th><th>Strength</th><th>Score</th><th>Tested</th><th>Fresh</th><th>Source</th><th>Reason</th></tr></thead>
+        <thead><tr><th>Type</th><th>Price</th><th>Quality</th><th>Score</th><th>Trigger</th><th>Reclaim / Rejection</th><th>Invalidation</th><th>Source</th><th>Reason</th></tr></thead>
         <tbody>${rows.map((item) => `<tr>
-          <td>${esc(item.type)}</td><td>${structureMoney(item.price)}</td><td>${esc(structureValue(item.strength))}</td>
-          <td>${esc(structureValue(item.score))}</td><td>${esc(structureValue(item.times_tested))}</td>
-          <td>${item.fresh ? 'Fresh' : 'Tested'}</td><td>${esc(structureValue(item.source))}</td><td>${esc(structureValue(item.reason))}</td>
+          <td>${esc(item.type)}</td><td>${structureMoney(item.price)}</td><td>${esc(structureValue(item.quality_label || item.strength))}</td>
+          <td>${esc(structureValue(item.quality_score ?? item.score))}</td><td>${structureMoney(item.trigger_level)}</td>
+          <td>${structureMoney(item.reclaim_line ?? item.rejection_line)}</td><td>${structureMoney(item.invalidation_level)}</td>
+          <td>${esc(structureValue(item.source))}</td><td>${esc(structureValue(item.reason))}</td>
         </tr>`).join('')}</tbody>
       </table>`;
     }
@@ -2744,12 +2754,14 @@ INDEX_HTML = r"""<!doctype html>
       ];
       if (!rows.length) return `<div class="empty">No clean ${esc(timeframe)} zones detected yet</div>`;
       return `<table>
-        <thead><tr><th>Type</th><th>Zone</th><th>Strength</th><th>Score</th><th>Tested</th><th>Fresh</th><th>Reaction</th><th>Invalidation</th><th>Reason</th></tr></thead>
+        <thead><tr><th>Type</th><th>Precision Area</th><th>Major Area</th><th>Label</th><th>Quality</th><th>Trigger</th><th>Reclaim / Rejection</th><th>Invalidation</th><th>Confidence</th><th>Reason</th></tr></thead>
         <tbody>${rows.map((item) => `<tr>
-          <td>${esc(item.type)}</td><td>${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)}</td>
-          <td>${esc(structureValue(item.strength))}</td><td>${esc(structureValue(item.score))}</td>
-          <td>${esc(structureValue(item.times_tested))}</td><td>${item.fresh ? 'Fresh' : 'Tested'}</td>
-          <td>${esc(structureValue(item.last_reaction))}</td><td>${esc(structureValue(item.invalidation))}</td>
+          <td>${esc(item.type)}</td>
+          <td>${structureMoney(item.precision_zone_low ?? item.zone_low)}-${structureMoney(item.precision_zone_high ?? item.zone_high)}</td>
+          <td>${structureMoney(item.major_zone_low ?? item.zone_low)}-${structureMoney(item.major_zone_high ?? item.zone_high)}</td>
+          <td>${esc(structureValue(item.quality_label || item.label || item.strength))}</td><td>${esc(structureValue(item.quality_score ?? item.score))}</td>
+          <td>${structureMoney(item.trigger_level)}</td><td>${structureMoney(item.reclaim_line ?? item.rejection_line)}</td>
+          <td>${structureMoney(item.invalidation_level)}</td><td>${esc(structureValue(item.trigger_confidence))}</td>
           <td>${esc(structureValue(item.reason))}</td>
         </tr>`).join('')}</tbody>
       </table>`;
@@ -3308,7 +3320,7 @@ INDEX_HTML = r"""<!doctype html>
     function controlZone(item) {
       if (!item || !Object.keys(item).length) return 'Not enough clean data yet';
       if (item.zone_low !== undefined && item.zone_high !== undefined) {
-        return `${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
+        return `Precision ${structureMoney(item.precision_zone_low ?? item.zone_low)}-${structureMoney(item.precision_zone_high ?? item.zone_high)} | Major ${structureMoney(item.major_zone_low ?? item.zone_low)}-${structureMoney(item.major_zone_high ?? item.zone_high)} | ${structureValue(item.timeframe)} | ${structureValue(item.label || item.strength)}`;
       }
       return `${structureMoney(item.price)} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
     }

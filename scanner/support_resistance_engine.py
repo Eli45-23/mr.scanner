@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional
 
 from .market_structure_models import ENGINE_VERSION, clamp_score, normalize_bars, strength, timestamp_text
+from .zone_quality import rank_zones_by_quality
+from .zone_triggers import derive_triggers_for_zones
 
 
 def _average(values: Iterable[float]) -> float:
@@ -94,6 +96,8 @@ def detect_support_resistance(
     known_levels: Optional[Dict[str, Optional[float]]] = None,
     max_levels: int = 3,
     min_strength: int = 0,
+    zone_quality_config: Optional[Dict[str, Any]] = None,
+    zone_trigger_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     bars = normalize_bars(candles)
     price = float(current_price or (bars[-1]["c"] if bars else 0))
@@ -138,10 +142,18 @@ def detect_support_resistance(
         if prior["c"] > bar["l"] and later["h"] >= bar["l"] >= later["c"]:
             resistances.append(_candidate(bar["l"], "retest_old_support", index + 1, bars, "resistance"))
 
+    context = {"known_levels": known_levels or {}}
+    average_range = _average(item["h"] - item["l"] for item in bars[-20:]) or None
     support_levels = [item for item in _merge(supports, bars, price, "support") if item["score"] >= min_strength and item["price"] <= price]
     resistance_levels = [item for item in _merge(resistances, bars, price, "resistance") if item["score"] >= min_strength and item["price"] >= price]
-    support_levels = sorted(support_levels, key=lambda item: (-item["score"], abs(price - item["price"])))[:max_levels]
-    resistance_levels = sorted(resistance_levels, key=lambda item: (-item["score"], abs(price - item["price"])))[:max_levels]
+    support_levels = derive_triggers_for_zones(
+        rank_zones_by_quality(({**item, "zone_type": "support"} for item in support_levels), context, zone_quality_config),
+        current_price=price, atr=average_range, config=zone_trigger_config,
+    )[:max_levels]
+    resistance_levels = derive_triggers_for_zones(
+        rank_zones_by_quality(({**item, "zone_type": "resistance"} for item in resistance_levels), context, zone_quality_config),
+        current_price=price, atr=average_range, config=zone_trigger_config,
+    )[:max_levels]
     for item in support_levels + resistance_levels:
         item.pop("_latest_index", None)
     nearest_support = min(support_levels, key=lambda item: price - item["price"], default={})

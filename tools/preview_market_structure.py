@@ -105,6 +105,8 @@ def build_market_structure(
             known_levels=known_levels,
             max_levels=int(structure_config.get("max_levels_per_timeframe", 3)),
             min_strength=int(structure_config.get("min_level_strength", 55)),
+            zone_quality_config=config.get("zone_quality", {}),
+            zone_trigger_config=config.get("zone_triggers", {}),
         )
         supply_demand[timeframe] = detect_supply_demand(
             symbol,
@@ -115,6 +117,9 @@ def build_market_structure(
             support_resistance=support_resistance[timeframe],
             max_zones=int(structure_config.get("max_zones_per_timeframe", 3)),
             min_strength=int(structure_config.get("min_zone_strength", 55)),
+            precision_config=config.get("supply_demand_precision", {}),
+            zone_quality_config=config.get("zone_quality", {}),
+            zone_trigger_config=config.get("zone_triggers", {}),
         )
     return {
         "symbol": symbol,
@@ -211,8 +216,13 @@ def render_pretty(payload: Dict[str, Any]) -> str:
                 lines.append("No clean zones detected.")
             for index, zone in enumerate(items, 1):
                 freshness = "fresh" if zone["fresh"] else f"tested {zone['times_tested']}x"
+                precision_low = zone.get("precision_zone_low", zone["zone_low"])
+                precision_high = zone.get("precision_zone_high", zone["zone_high"])
+                major_low = zone.get("major_zone_low", zone["zone_low"])
+                major_high = zone.get("major_zone_high", zone["zone_high"])
                 lines.append(
-                    f"{index}) {zone['zone_low']:.2f}-{zone['zone_high']:.2f} | {zone['strength']} | "
+                    f"{index}) Precision {precision_low:.2f}-{precision_high:.2f} | "
+                    f"Major {major_low:.2f}-{major_high:.2f} | {zone.get('label', zone['strength'])} | "
                     f"{freshness} | {zone['last_reaction']}"
                 )
     summary = payload["summary"]
