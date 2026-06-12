@@ -40,6 +40,7 @@ MARKET_STRUCTURE_LOG_PATHS = {
 }
 LIQUIDITY_SWEEP_LOG_PATH = APP_DIR / "logs" / "liquidity_sweeps.jsonl"
 ALERT_ORCHESTRATOR_LOG_PATH = APP_DIR / "logs" / "alert_orchestrator.jsonl"
+CHOP_MODE_LOG_PATH = APP_DIR / "logs" / "chop_mode.jsonl"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -1757,6 +1758,179 @@ def load_symbol_rows() -> List[Dict[str, Any]]:
         return list(STATE.symbol_rows)
 
 
+def _blocked_alert_reason(alert: Dict[str, Any]) -> str:
+    for field in (
+        "warning_suppression_reason",
+        "alert_priority_reason",
+        "orchestrator_suppression_reason",
+        "orchestrator_block_reason",
+        "scenario_alert_block_reason",
+        "scenario_sms_block_reason",
+        "sms_block_reason",
+        "phase3_heads_up_block_reason",
+        "text_alert_reason",
+    ):
+        value = alert.get(field)
+        if value:
+            return str(value)
+    return "Did not meet Tier 1 notification requirements"
+
+
+def load_dashboard_control_center(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    alerts: Optional[List[Dict[str, Any]]] = None,
+    symbols: Optional[List[Dict[str, Any]]] = None,
+    brain: Optional[Dict[str, Any]] = None,
+    structure: Optional[Dict[str, Any]] = None,
+    sweeps: Optional[Dict[str, Any]] = None,
+    paths: Optional[Dict[str, Path]] = None,
+) -> Dict[str, Any]:
+    config = config or scanner_app.load_config(STATE.config_path)
+    settings = config.get("dashboard_control_center", {})
+    enabled = bool(settings.get("enabled", True))
+    empty = {
+        "enabled": enabled,
+        "symbol": "AAPL",
+        "updated_at": None,
+        "market_state": {},
+        "key_levels": {},
+        "supply_demand": {},
+        "liquidity_sweep_map": {},
+        "alert_priority": {},
+        "blocked_alerts": [],
+        "option_quality": {},
+        "recent_important_events": [],
+        "dashboard_only_context": [],
+        "message": "Waiting for dashboard control center data.",
+        "context_only": True,
+        "can_approve_trades": False,
+    }
+    if not enabled:
+        return {**empty, "message": "Dashboard control center is disabled."}
+
+    source_paths = paths or {}
+    alerts = alerts if alerts is not None else load_alerts(limit=max(25, int(settings.get("max_blocked_alerts", 10)) * 3))
+    symbols = symbols if symbols is not None else load_symbol_rows()
+    brain = brain if brain is not None else load_alert_brain(source_paths.get("brain"))
+    structure = structure if structure is not None else load_market_structure_dashboard(
+        config,
+        paths=source_paths.get("market_structure"),
+    )
+    sweeps = sweeps if sweeps is not None else load_liquidity_sweep_dashboard(
+        config,
+        path=source_paths.get("liquidity_sweeps"),
+    )
+    chop_records = _read_jsonl_records(source_paths.get("chop_mode", CHOP_MODE_LOG_PATH))
+    latest_chop = chop_records[-1] if chop_records else {}
+    aapl = next((row for row in symbols if str(row.get("symbol") or "").upper() == "AAPL"), {})
+    summary = structure.get("summary") or {}
+    nearest = structure.get("nearest") or {}
+
+    blocked: List[Dict[str, Any]] = []
+    dashboard_context: List[Dict[str, Any]] = []
+    important: List[Dict[str, Any]] = []
+    max_blocked = max(1, int(settings.get("max_blocked_alerts", 10)))
+    for alert in alerts:
+        tier = str(alert.get("alert_priority_tier") or "")
+        telegram_allowed = bool(alert.get("alert_priority_telegram_allowed") or alert.get("orchestrator_telegram_allowed"))
+        event = {
+            "timestamp": alert.get("timestamp"),
+            "setup": alert.get("primary_setup") or alert.get("setup_name") or alert.get("category") or "Context update",
+            "direction": alert.get("direction") or alert.get("scenario_direction") or "NEUTRAL",
+            "tier": tier or "Not classified",
+            "reason": _blocked_alert_reason(alert),
+        }
+        if tier == "TIER_1_TEXT_ALERT" or telegram_allowed:
+            important.append(event)
+        else:
+            if settings.get("show_blocked_alerts", True) and len(blocked) < max_blocked:
+                blocked.append(event)
+            if settings.get("show_context_updates", True) and len(dashboard_context) < max_blocked:
+                dashboard_context.append(event)
+
+    if latest_chop:
+        important.append({
+            "timestamp": latest_chop.get("timestamp"),
+            "setup": "Chop Mode",
+            "direction": "NEUTRAL",
+            "tier": "DASHBOARD CONTEXT",
+            "reason": latest_chop.get("chop_mode_reason") or latest_chop.get("suppression_reason") or "Chop context updated",
+        })
+    current_sweep = sweeps.get("current_event") or {}
+    if current_sweep:
+        important.append({
+            "timestamp": current_sweep.get("timestamp"),
+            "setup": sweeps.get("status_label") or "Liquidity Sweep",
+            "direction": current_sweep.get("trap_bias") or "NEUTRAL",
+            "tier": "DASHBOARD CONTEXT",
+            "reason": current_sweep.get("reason") or sweeps.get("context_summary") or "Sweep map updated",
+        })
+
+    timestamps = [
+        value for value in (
+            aapl.get("bar_time"),
+            structure.get("last_updated"),
+            sweeps.get("updated_at"),
+            brain.get("timestamp"),
+            latest_chop.get("timestamp"),
+        ) if value
+    ]
+    return {
+        **empty,
+        "updated_at": max(timestamps) if timestamps else None,
+        "market_state": {
+            "current_price": aapl.get("price", summary.get("current_price")),
+            "structure_bias": summary.get("market_structure_bias") or aapl.get("current_structure_bias") or "Not enough clean data yet",
+            "structure_quality": summary.get("structure_quality") or "Not enough clean data yet",
+            "structure_warning": summary.get("structure_warning") or aapl.get("structure_key_warning") or "No active structure warning",
+            "chop_mode_active": bool(latest_chop.get("chop_mode_active") or aapl.get("chop_mode_active")),
+            "chop_mode_reason": latest_chop.get("chop_mode_reason") or aapl.get("chop_mode_reason") or "No active Chop Mode",
+            "spy_context": aapl.get("spy_alignment") or aapl.get("market_alignment") or "Unavailable",
+            "qqq_context": aapl.get("qqq_alignment") or aapl.get("market_alignment") or "Unavailable",
+        },
+        "key_levels": {
+            "support": nearest.get("support") or {},
+            "resistance": nearest.get("resistance") or {},
+            "location": summary.get("current_price_location_summary") or "Not enough clean data yet",
+        },
+        "supply_demand": {
+            "demand": nearest.get("demand") or {},
+            "supply": nearest.get("supply") or {},
+            "warning": summary.get("structure_warning") or "No active structure warning",
+        },
+        "liquidity_sweep_map": {
+            "status": sweeps.get("status_label") or "No active sweep",
+            "bias": sweeps.get("sweep_bias_label") or "Neutral",
+            "upside_zone": sweeps.get("upside_sweep_zone"),
+            "downside_zone": sweeps.get("downside_sweep_zone"),
+            "context": sweeps.get("context_summary") or "No active sweep.",
+        },
+        "alert_priority": ({
+            "tier": brain.get("alert_priority_tier") or "Not classified yet",
+            "reason": brain.get("alert_priority_reason") or brain.get("decision_reason") or "Waiting for priority decision",
+            "telegram_allowed": bool(brain.get("orchestrator_telegram_allowed") or brain.get("telegram_allowed")),
+            "warning_suppression_reason": brain.get("warning_suppression_reason") or "",
+        } if settings.get("show_alert_priority", True) else {
+            "tier": "Hidden by dashboard config",
+            "reason": "Alert priority display is disabled",
+            "telegram_allowed": False,
+            "warning_suppression_reason": "",
+        }),
+        "blocked_alerts": blocked,
+        "option_quality": {
+            "label": aapl.get("option_quality") or "Unavailable",
+            "message": aapl.get("option_quality_message") or "No option-quality data yet",
+            "feed": aapl.get("option_feed_status") or "Unavailable",
+            "score": aapl.get("option_tradability_score"),
+            "tradable": bool(aapl.get("option_tradable")),
+        },
+        "recent_important_events": important[:10],
+        "dashboard_only_context": dashboard_context,
+        "message": "Live dashboard context" if aapl or summary or alerts else "Waiting for dashboard control center data.",
+    }
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -2340,6 +2514,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="content">
       <section>
         <div class="table-head">
+          <h2>Dashboard Control Center</h2>
+          <span class="muted" id="controlCenterUpdated">Waiting for context</span>
+        </div>
+        <div class="structure-body" id="dashboardControlCenter"></div>
+      </section>
+      <section>
+        <div class="table-head">
           <h2>Main Alert Brain</h2>
           <span class="muted" id="alertBrainUpdated">Waiting for decision</span>
         </div>
@@ -2400,6 +2581,8 @@ INDEX_HTML = r"""<!doctype html>
       notificationStatus: document.getElementById('notificationStatus'),
       notificationStatusValue: document.getElementById('notificationStatusValue'),
       notificationStatusDetails: document.getElementById('notificationStatusDetails'),
+      dashboardControlCenter: document.getElementById('dashboardControlCenter'),
+      controlCenterUpdated: document.getElementById('controlCenterUpdated'),
       clear: document.getElementById('clearBtn'),
       dot: document.getElementById('statusDot'),
       status: document.getElementById('statusText'),
@@ -3111,6 +3294,75 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
 
+    function compactEventRows(items, emptyText) {
+      if (!items || !items.length) return `<div class="muted">${esc(emptyText)}</div>`;
+      return items.map((item) => `
+        <div class="copy-block">
+          <strong>${esc(item.setup || 'Context update')}</strong>
+          <span class="muted">${esc(item.tier || '')} ${item.timestamp ? `| ${esc(fmtTime(item.timestamp))}` : ''}</span>
+          <div>${esc(item.reason || 'No reason available')}</div>
+        </div>
+      `).join('');
+    }
+
+    function controlZone(item) {
+      if (!item || !Object.keys(item).length) return 'Not enough clean data yet';
+      if (item.zone_low !== undefined && item.zone_high !== undefined) {
+        return `${structureMoney(item.zone_low)}-${structureMoney(item.zone_high)} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
+      }
+      return `${structureMoney(item.price)} | ${structureValue(item.timeframe)} | ${structureValue(item.strength)}`;
+    }
+
+    function renderDashboardControlCenter(data) {
+      if (!data || !data.enabled) {
+        els.controlCenterUpdated.textContent = 'Disabled';
+        els.dashboardControlCenter.innerHTML = '<div class="empty">Dashboard control center is disabled.</div>';
+        return;
+      }
+      const market = data.market_state || {};
+      const levels = data.key_levels || {};
+      const zones = data.supply_demand || {};
+      const sweeps = data.liquidity_sweep_map || {};
+      const priority = data.alert_priority || {};
+      const option = data.option_quality || {};
+      els.controlCenterUpdated.textContent = data.updated_at ? fmtTime(data.updated_at) : 'Waiting for context';
+      els.dashboardControlCenter.innerHTML = `
+        <h3>1. Market State</h3>
+        <div class="structure-summary">
+          <div><span class="label">AAPL Price</span><strong>${market.current_price === null || market.current_price === undefined ? 'Waiting for data' : structureMoney(market.current_price)}</strong></div>
+          <div><span class="label">Structure</span><strong>${esc(structureValue(market.structure_bias))}</strong></div>
+          <div><span class="label">Quality</span><strong>${esc(structureValue(market.structure_quality))}</strong></div>
+          <div><span class="label">Chop Mode</span><strong>${market.chop_mode_active ? 'ACTIVE' : 'Inactive'}</strong></div>
+          <div><span class="label">SPY Context</span><strong>${esc(structureValue(market.spy_context))}</strong></div>
+          <div><span class="label">QQQ Context</span><strong>${esc(structureValue(market.qqq_context))}</strong></div>
+        </div>
+        <div class="copy-block"><strong>Structure Warning:</strong> ${esc(structureValue(market.structure_warning))}</div>
+        <div class="copy-block"><strong>Chop Context:</strong> ${esc(structureValue(market.chop_mode_reason))}</div>
+
+        <h3>2. Key Levels</h3>
+        <div class="copy-block"><strong>Support:</strong> ${esc(controlZone(levels.support))}<br><strong>Resistance:</strong> ${esc(controlZone(levels.resistance))}<br><span class="muted">${esc(structureValue(levels.location))}</span></div>
+
+        <h3>3. Supply / Demand</h3>
+        <div class="copy-block"><strong>Demand:</strong> ${esc(controlZone(zones.demand))}<br><strong>Supply:</strong> ${esc(controlZone(zones.supply))}</div>
+
+        <h3>4. Liquidity Sweep Map</h3>
+        <div class="copy-block"><strong>${esc(structureValue(sweeps.status))}</strong> | ${esc(structureValue(sweeps.bias))}<br>${esc(structureValue(sweeps.context))}</div>
+
+        <h3>5. Alert Priority / Blocked Alerts</h3>
+        <div class="copy-block"><strong>${esc(structureValue(priority.tier))}</strong> — ${esc(structureValue(priority.reason))}<br><strong>Why No Text Alert?</strong> ${priority.telegram_allowed ? 'Priority alert is eligible for text delivery.' : esc(priority.warning_suppression_reason || priority.reason || 'Did not meet Tier 1 requirements.')}</div>
+        ${compactEventRows(data.blocked_alerts, 'No recently blocked alerts.')}
+
+        <h3>6. Option Quality</h3>
+        <div class="copy-block"><strong>${esc(structureValue(option.label))}</strong> | ${esc(structureValue(option.feed))} | Score ${option.score ?? 'Unavailable'}<br>${esc(structureValue(option.message))}</div>
+
+        <h3>7. Recent Important Events</h3>
+        ${compactEventRows(data.recent_important_events, 'No recent important events.')}
+
+        <h3>Dashboard Only Context</h3>
+        ${compactEventRows(data.dashboard_only_context, 'No dashboard-only context updates yet.')}
+      `;
+    }
+
     function renderAlpacaHealth(data) {
       const summary = data.summary || {};
       const warnings = data.warnings || [];
@@ -3205,11 +3457,12 @@ INDEX_HTML = r"""<!doctype html>
 
     async function refresh() {
       try {
-        const [status, alerts, symbols, brain] = await Promise.all([api('/api/status'), api('/api/alerts'), api('/api/symbols'), api('/api/alert-brain')]);
+        const [status, alerts, symbols, brain, controlCenter] = await Promise.all([api('/api/status'), api('/api/alerts'), api('/api/symbols'), api('/api/alert-brain'), api('/api/control-center')]);
         renderStatus(status);
         renderMarket(symbols.symbols || []);
         renderAlerts(alerts.alerts || []);
         renderAlertDecisionBrain(brain);
+        renderDashboardControlCenter(controlCenter);
       } catch (err) {
         els.error.style.display = 'block';
         els.error.textContent = err.message;
@@ -3303,6 +3556,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(STATE.snapshot().get("liquidity_sweeps", {}))
             elif parsed.path == "/api/alert-brain":
                 self.send_json(load_alert_brain())
+            elif parsed.path == "/api/control-center":
+                self.send_json(load_dashboard_control_center())
             elif parsed.path == "/api/alpaca-health":
                 force_refresh = parse_qs(parsed.query).get("force_refresh", ["false"])[0].lower() == "true"
                 self.send_json(alpaca_health_check(force_refresh=force_refresh))
@@ -3789,6 +4044,111 @@ def run_tests() -> int:
             self.assertEqual(payload["primary_engine"], "multi_timeframe_trend")
             self.assertTrue(payload["dashboard_allowed"])
             self.assertIn("/api/alert-brain", Path(__file__).read_text(encoding="utf-8"))
+
+        def test_dashboard_control_center_renders_and_returns_priority_context_safely(self) -> None:
+            config = scanner_app.load_config(None)
+            payload = load_dashboard_control_center(
+                config,
+                alerts=[{
+                    "timestamp": "2026-06-12T14:00:00+00:00",
+                    "symbol": "AAPL",
+                    "primary_setup": "Mixed Signal",
+                    "alert_priority_tier": "TIER_2_DASHBOARD_ONLY",
+                    "alert_priority_reason": "mixed_dashboard_only",
+                    "alert_priority_telegram_allowed": False,
+                }],
+                symbols=[{
+                    "symbol": "AAPL",
+                    "price": 201.25,
+                    "spy_alignment": "ALIGNED",
+                    "qqq_alignment": "ALIGNED",
+                    "option_quality": "WIDE_SPREAD",
+                    "option_quality_message": "Option wide spread - stock setup only",
+                    "option_feed_status": "OPRA",
+                    "option_tradability_score": 42,
+                }],
+                brain={
+                    "timestamp": "2026-06-12T14:00:00+00:00",
+                    "alert_priority_tier": "TIER_2_DASHBOARD_ONLY",
+                    "alert_priority_reason": "mixed_dashboard_only",
+                    "telegram_allowed": False,
+                },
+                structure={
+                    "last_updated": "2026-06-12T14:00:00+00:00",
+                    "summary": {
+                        "current_price": 201.25,
+                        "market_structure_bias": "MIXED",
+                        "structure_quality": "MEDIUM",
+                        "structure_warning": "inside chop range",
+                    },
+                    "nearest": {
+                        "support": {"price": 200.8, "timeframe": "5m", "strength": "HIGH"},
+                        "resistance": {"price": 201.8, "timeframe": "5m", "strength": "HIGH"},
+                        "demand": {"zone_low": 200.6, "zone_high": 200.9, "timeframe": "5m", "strength": "HIGH"},
+                        "supply": {"zone_low": 201.7, "zone_high": 202.0, "timeframe": "5m", "strength": "MEDIUM"},
+                    },
+                },
+                sweeps={
+                    "updated_at": "2026-06-12T14:00:00+00:00",
+                    "status_label": "Sweep watch",
+                    "sweep_bias_label": "Neutral",
+                    "context_summary": "Watching supply for a possible sweep.",
+                    "current_event": {},
+                },
+                paths={"chop_mode": Path("/missing/chop-mode.jsonl")},
+            )
+            self.assertTrue(payload["enabled"])
+            self.assertEqual(payload["market_state"]["current_price"], 201.25)
+            self.assertEqual(payload["market_state"]["spy_context"], "ALIGNED")
+            self.assertEqual(payload["option_quality"]["label"], "WIDE_SPREAD")
+            self.assertEqual(payload["blocked_alerts"][0]["reason"], "mixed_dashboard_only")
+            self.assertEqual(payload["alert_priority"]["tier"], "TIER_2_DASHBOARD_ONLY")
+            serialized = json.dumps(payload)
+            self.assertNotIn("ALPACA_API_KEY", serialized)
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", serialized)
+            for text in (
+                "Dashboard Control Center",
+                "1. Market State",
+                "2. Key Levels",
+                "3. Supply / Demand",
+                "4. Liquidity Sweep Map",
+                "5. Alert Priority / Blocked Alerts",
+                "6. Option Quality",
+                "7. Recent Important Events",
+                "Dashboard Only Context",
+                "Why No Text Alert?",
+                "renderDashboardControlCenter",
+                "/api/control-center",
+            ):
+                self.assertIn(text, INDEX_HTML if text != "/api/control-center" else Path(__file__).read_text(encoding="utf-8"))
+
+        def test_dashboard_control_center_missing_logs_and_context_do_not_crash(self) -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                payload = load_dashboard_control_center(
+                    scanner_app.load_config(None),
+                    alerts=[],
+                    symbols=[],
+                    brain={},
+                    structure=load_market_structure_dashboard(
+                        scanner_app.load_config(None),
+                        paths={
+                            "support_resistance": root / "missing-support.jsonl",
+                            "supply_demand": root / "missing-zones.jsonl",
+                            "summary": root / "missing-structure.jsonl",
+                        },
+                    ),
+                    sweeps=load_liquidity_sweep_dashboard(
+                        scanner_app.load_config(None),
+                        path=root / "missing-sweeps.jsonl",
+                    ),
+                    paths={"chop_mode": root / "missing-chop.jsonl"},
+                )
+            self.assertEqual(payload["message"], "Waiting for dashboard control center data.")
+            self.assertEqual(payload["market_state"]["structure_bias"], "Not enough clean data yet")
+            self.assertEqual(payload["liquidity_sweep_map"]["status"], "No active sweep")
+            self.assertEqual(payload["blocked_alerts"], [])
+            self.assertFalse(payload["can_approve_trades"])
 
         def test_live_market_structure_refresh_reuses_aapl_snapshot_without_alert_changes(self) -> None:
             config = scanner_app.load_config(None)

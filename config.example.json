@@ -106,6 +106,13 @@
     "allow_chop_exit_text": true,
     "cooldown_minutes": 15
   },
+  "dashboard_control_center": {
+    "enabled": true,
+    "show_blocked_alerts": true,
+    "show_alert_priority": true,
+    "show_context_updates": true,
+    "max_blocked_alerts": 10
+  },
   "liquidity_sweep_engine": {
     "enabled": true,
     "timeframes": ["1m", "5m", "15m"],
@@ -166,6 +173,20 @@
     "include_liquidity_sweeps": true,
     "include_discipline_rules": true,
     "max_chars": 1200
+  },
+  "market_map_update": {
+    "enabled": true,
+    "telegram_enabled": true,
+    "symbol": "AAPL",
+    "interval_minutes": 10,
+    "send_during_regular_hours_only": true,
+    "send_once_per_interval": true,
+    "max_chars": 1200,
+    "include_support_resistance": true,
+    "include_supply_demand": true,
+    "include_liquidity_sweeps": true,
+    "include_market_structure": true,
+    "include_option_quality": true
   },
   "alert_quality": {
     "sms_symbol_cooldown_seconds": 1200,

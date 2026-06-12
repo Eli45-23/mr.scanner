@@ -87,6 +87,15 @@ from scanner.morning_playbook import (
     should_send_morning_playbook,
     validate_morning_playbook_message,
 )
+from scanner.market_map_update import (
+    append_market_map_log,
+    build_market_map_payload,
+    format_market_map_message,
+    mark_market_map_update_sent,
+    market_map_interval_key,
+    should_send_market_map_update,
+    validate_market_map_message,
+)
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
 from strategies.context import evaluate_multi_timeframe_context
@@ -114,6 +123,8 @@ TELEGRAM_DELIVERY_DEDUPE_STATE = STATE_DIR / "telegram_delivery_dedupe.json"
 LIQUIDITY_SWEEP_TELEGRAM_DEDUPE_STATE = STATE_DIR / "liquidity_sweep_telegram_dedupe.json"
 MORNING_PLAYBOOK_STATE = STATE_DIR / "morning_playbook_state.json"
 MORNING_PLAYBOOK_LOG = LOG_DIR / "morning_playbook.jsonl"
+MARKET_MAP_UPDATE_STATE = STATE_DIR / "market_map_update_state.json"
+MARKET_MAP_UPDATE_LOG = LOG_DIR / "market_map_updates.jsonl"
 
 logger = logging.getLogger("elite_scanner")
 logging.basicConfig(
@@ -276,6 +287,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "allow_chop_exit_text": True,
         "cooldown_minutes": 15,
     },
+    "dashboard_control_center": {
+        "enabled": True,
+        "show_blocked_alerts": True,
+        "show_alert_priority": True,
+        "show_context_updates": True,
+        "max_blocked_alerts": 10,
+    },
     "liquidity_sweep_engine": {
         "enabled": True,
         "timeframes": ["1m", "5m", "15m"],
@@ -336,6 +354,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "include_liquidity_sweeps": True,
         "include_discipline_rules": True,
         "max_chars": 1200,
+    },
+    "market_map_update": {
+        "enabled": True,
+        "telegram_enabled": True,
+        "symbol": "AAPL",
+        "interval_minutes": 10,
+        "send_during_regular_hours_only": True,
+        "send_once_per_interval": True,
+        "max_chars": 1200,
+        "include_support_resistance": True,
+        "include_supply_demand": True,
+        "include_liquidity_sweeps": True,
+        "include_market_structure": True,
+        "include_option_quality": True,
     },
     "market_data": {
         "stock_feed": "sip",
@@ -4879,6 +4911,124 @@ class EliteScanner:
             logger.warning("Morning playbook failed safely: %s", error)
             return False
 
+    def process_market_map_update(
+        self,
+        snap: Optional[SymbolSnapshot],
+        market_context: Optional[Dict[str, Any]] = None,
+        *,
+        now: Optional[datetime] = None,
+        state_path: Path = MARKET_MAP_UPDATE_STATE,
+        log_path: Path = MARKET_MAP_UPDATE_LOG,
+    ) -> bool:
+        settings = dict(self.config.get("market_map_update", {}))
+        notifications = self.config.get("notifications", {})
+        settings["telegram_enabled"] = bool(
+            settings.get("telegram_enabled", True)
+            and notifications.get("telegram_enabled", False)
+        )
+        settings["market_open"] = self.config.get("market_open", "09:30")
+        settings["market_close"] = self.config.get("market_close", "16:00")
+        now = (now or now_et()).astimezone(ET)
+        eligible, _ = should_send_market_map_update(now, settings, state_path)
+        if not eligible:
+            return False
+
+        interval_key = market_map_interval_key(now, int(settings.get("interval_minutes", 10)))
+        payload: Dict[str, Any] = build_market_map_payload("AAPL", None)
+        try:
+            levels = self.strategy_levels_for_snapshot(snap) if snap else {}
+            structure: Dict[str, Any] = {}
+            if snap and settings.get("include_market_structure", True):
+                from tools.preview_market_structure import build_market_structure
+
+                structure = build_market_structure(
+                    "AAPL",
+                    snap.recent_bars,
+                    daily_bars=snap.daily_bars,
+                    config=self.config,
+                )
+            elif settings.get("include_market_structure", True):
+                structure = self.latest_market_structure()
+
+            sweep = (
+                self.latest_liquidity_sweep_context.get("AAPL", {})
+                if settings.get("include_liquidity_sweeps", True)
+                else {}
+            )
+            option_context: Dict[str, Any] = {}
+            if snap and settings.get("include_option_quality", True):
+                selections = [snap.best_call, snap.best_put]
+                best = max(selections, key=lambda selection: selection.score, default=None)
+                if best:
+                    option_context = {
+                        "quality": best.quality,
+                        "message": best.details.get("message") or option_quality_message(best.quality),
+                        "score": best.score,
+                    }
+            payload = build_market_map_payload(
+                "AAPL",
+                snap.latest_bar.c if snap and snap.latest_bar else None,
+                levels,
+                market_structure=structure,
+                liquidity_sweep=sweep,
+                market_context=market_context,
+                option_context=option_context,
+            )
+            max_chars = int(settings.get("max_chars", 1200))
+            message = format_market_map_message(payload, max_chars=max_chars)
+            valid, validation_reason = validate_market_map_message(payload, message, max_chars=max_chars)
+            if not valid:
+                append_market_map_log(
+                    log_path,
+                    payload,
+                    False,
+                    f"message validation failed: {validation_reason}",
+                    validation_passed=False,
+                    interval_key=interval_key,
+                )
+                mark_market_map_update_sent(state_path, interval_key)
+                return False
+            sent, error = send_telegram_message(
+                token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+                chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+                message=message,
+                timeout_seconds=int(notifications.get("telegram_timeout_seconds", 8)),
+                alert_type="MARKET_MAP_UPDATE",
+                alert_source="MARKET_MAP_UPDATE",
+                symbol="AAPL",
+                sms_sent=False,
+                alert_tier="CONTEXT",
+                alert_tier_reason="Scheduled market map is context-only and cannot approve trades",
+                message_source_path="scanner.market_map_update",
+                phone_conclusion="WATCH ONLY",
+                phone_conclusion_reason="Scheduled context map; confirm manually",
+            )
+            append_market_map_log(
+                log_path,
+                payload,
+                bool(sent),
+                "sent" if sent else error,
+                validation_passed=True,
+                message_length=len(message),
+                interval_key=interval_key,
+            )
+            mark_market_map_update_sent(state_path, interval_key)
+            if not sent:
+                logger.warning("Market map Telegram send failed safely: %s", error)
+            return bool(sent)
+        except Exception as exc:
+            error = redact_notification_error(exc)
+            append_market_map_log(
+                log_path,
+                payload,
+                False,
+                f"market map update failed safely: {error}",
+                interval_key=interval_key,
+            )
+            mark_market_map_update_sent(state_path, interval_key)
+            logger.warning("Market map update failed safely: %s", error)
+            return False
+
     def build_snapshots(self) -> Dict[str, SymbolSnapshot]:
         end = now_utc()
         start = session_history_start(self.config)
@@ -7369,6 +7519,7 @@ class EliteScanner:
             if symbol == "AAPL":
                 self.process_liquidity_sweep_telegram(snap)
                 self.process_morning_playbook(snap, market_context)
+                self.process_market_map_update(snap, market_context)
             for alert in self.evaluate_symbol(snap, market_context, market_bars):
                 if self.process_alert(alert):
                     count += 1
@@ -7733,6 +7884,19 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     )
     playbook["max_chars"] = env_int(
         "MORNING_PLAYBOOK_MAX_CHARS", int(playbook.get("max_chars", 1200))
+    )
+    market_map = config.setdefault("market_map_update", {})
+    market_map["enabled"] = env_bool(
+        "ENABLE_MARKET_MAP_UPDATE", bool(market_map.get("enabled", True))
+    )
+    market_map["telegram_enabled"] = env_bool(
+        "MARKET_MAP_TELEGRAM_ENABLED", bool(market_map.get("telegram_enabled", True))
+    )
+    market_map["interval_minutes"] = env_int(
+        "MARKET_MAP_UPDATE_INTERVAL_MINUTES", int(market_map.get("interval_minutes", 10))
+    )
+    market_map["max_chars"] = env_int(
+        "MARKET_MAP_MAX_CHARS", int(market_map.get("max_chars", 1200))
     )
 
     quality = config.setdefault("alert_quality", {})
