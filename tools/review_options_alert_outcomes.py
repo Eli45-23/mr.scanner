@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -149,13 +150,45 @@ def review_alerts(limit: int = 25, *, include_near_misses: bool = False, dry_run
     }
 
 
+def print_review_result(result: Dict[str, Any], *, compact: bool = False) -> None:
+    if compact:
+        summary = result.get("summary") or {}
+        print(
+            f"{datetime.now().astimezone().isoformat(timespec='seconds')} | "
+            f"reviewed={result.get('reviewed_count')} skipped={result.get('skipped_count')} "
+            f"completed={summary.get('completed')} pending={summary.get('pending')} "
+            f"favorable_rate={summary.get('favorable_rate')}"
+        )
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+
+
+def run_loop(limit: int, *, include_near_misses: bool, dry_run: bool, interval_seconds: int, once: bool = False) -> int:
+    interval = max(60, int(interval_seconds))
+    while True:
+        result = review_alerts(limit, include_near_misses=include_near_misses, dry_run=dry_run)
+        print_review_result(result, compact=True)
+        if once:
+            return 0
+        time.sleep(interval)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Review latest options whale alert outcomes using underlying stock bars.")
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--include-near-misses", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--loop", action="store_true", help="Keep reviewing pending outcomes on a timer.")
+    parser.add_argument("--interval-seconds", type=int, default=300, help="Loop interval. Minimum is 60 seconds.")
     args = parser.parse_args()
-    print(json.dumps(review_alerts(args.limit, include_near_misses=args.include_near_misses, dry_run=args.dry_run), indent=2, sort_keys=True, default=str))
+    if args.loop:
+        return run_loop(
+            args.limit,
+            include_near_misses=args.include_near_misses,
+            dry_run=args.dry_run,
+            interval_seconds=args.interval_seconds,
+        )
+    print_review_result(review_alerts(args.limit, include_near_misses=args.include_near_misses, dry_run=args.dry_run))
     return 0
 
 
