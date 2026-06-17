@@ -39,19 +39,23 @@ HTML_TEMPLATE = """
     <section class="card">
       <h2>Main Scanner Dashboard</h2>
       <p>Live options whale scanner, flow rows, score components, market context, and scan controls.</p>
-      <p><code>{main_url}</code></p>
-      <a class="button" href="{main_url}" target="_blank" rel="noreferrer">Open Scanner</a>
+      <p><code>__MAIN_URL__</code></p>
+      <a class="button" href="__MAIN_URL__" target="_blank" rel="noreferrer">Open Scanner</a>
     </section>
     <section class="card">
       <h2>Outcome Dashboard</h2>
       <p>Proof engine: completed, pending, insufficient close, dirty ignored, and performance by symbol/flow bias.</p>
-      <p><code>{outcome_url}</code></p>
-      <a class="button" href="{outcome_url}" target="_blank" rel="noreferrer">Open Outcomes</a>
+      <p><code>__OUTCOME_URL__</code></p>
+      <a class="button" href="__OUTCOME_URL__" target="_blank" rel="noreferrer">Open Outcomes</a>
     </section>
   </main>
 </body>
 </html>
 """
+
+
+def render_html(main_url: str, outcome_url: str) -> str:
+    return HTML_TEMPLATE.replace("__MAIN_URL__", main_url).replace("__OUTCOME_URL__", outcome_url)
 
 
 class WorkbenchHandler(BaseHTTPRequestHandler):
@@ -74,7 +78,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if self.path == "/api/links":
             self.send_json({"main_dashboard": self.main_url, "outcome_dashboard": self.outcome_url})
             return
-        html = HTML_TEMPLATE.format(main_url=self.main_url, outcome_url=self.outcome_url)
+        html = render_html(self.main_url, self.outcome_url)
         payload = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
