@@ -1,12 +1,12 @@
 import json
 import unittest
 
-from tools.options_whale_workbench import HTML_TEMPLATE, WorkbenchHandler
+from tools.options_whale_workbench import WorkbenchHandler, render_html
 
 
 class OptionsWhaleWorkbenchTests(unittest.TestCase):
     def test_html_template_includes_dashboard_links(self):
-        html = HTML_TEMPLATE.format(
+        html = render_html(
             main_url="http://127.0.0.1:8765",
             outcome_url="http://127.0.0.1:8775",
         )
