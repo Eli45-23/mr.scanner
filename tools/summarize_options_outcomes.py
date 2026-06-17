@@ -127,6 +127,7 @@ def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     items = list(rows)
     completed = [row for row in items if is_clean_completed(row)]
     pending = [row for row in items if str(row.get("outcome_status")) == "pending" or is_dirty_completed(row)]
+    insufficient = [row for row in items if str(row.get("outcome_status")) == "insufficient_future_session"]
     dirty = [row for row in items if is_dirty_completed(row)]
     missing = [row for row in items if str(row.get("outcome_status")) == "missing_start_context"]
     favorable = [row for row in completed if is_favorable(row)]
@@ -141,6 +142,7 @@ def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "count": len(items),
         "completed": len(completed),
         "pending": len(pending),
+        "insufficient_future_session": len(insufficient),
         "dirty_completed_ignored": len(dirty),
         "missing_start_context": len(missing),
         "favorable_count": len(favorable),
@@ -177,7 +179,7 @@ def summarize_outcome_file(path: Path = OUTCOMES_PATH, *, min_completed: int = 1
         summaries: List[Tuple[str, Dict[str, Any]]] = []
         for key, group_rows in buckets.items():
             summary = summarize_group(group_rows)
-            if int(summary["completed"]) >= min_completed or int(summary["pending"]) > 0:
+            if int(summary["completed"]) >= min_completed or int(summary["pending"]) > 0 or int(summary["insufficient_future_session"]) > 0:
                 summaries.append((key, summary))
         summaries.sort(
             key=lambda item: (
@@ -195,14 +197,14 @@ def compact_table(report: Dict[str, Any], group: str, limit: int = 12) -> str:
     rows = report.get("groups", {}).get(group, [])[:limit]
     if not rows:
         return f"No rows for {group}."
-    lines = [f"{group} performance", "key | count | completed | pending | dirty_ignored | favorable_rate | avg_fav_move | avg_score"]
+    lines = [f"{group} performance", "key | count | completed | pending | insufficient | dirty_ignored | favorable_rate | avg_fav_move | avg_score"]
     for row in rows:
         rate = row.get("favorable_rate")
         rate_text = "pending" if rate is None else f"{rate * 100:.1f}%"
         fav = row.get("average_max_favorable_move_pct")
         fav_text = "" if fav is None else f"{fav:+.4f}%"
         lines.append(
-            f"{row['key']} | {row['count']} | {row['completed']} | {row['pending']} | {row.get('dirty_completed_ignored', 0)} | {rate_text} | {fav_text} | {row.get('average_whale_score')}"
+            f"{row['key']} | {row['count']} | {row['completed']} | {row['pending']} | {row.get('insufficient_future_session', 0)} | {row.get('dirty_completed_ignored', 0)} | {rate_text} | {fav_text} | {row.get('average_whale_score')}"
         )
     return "\n".join(lines)
 
@@ -226,8 +228,8 @@ def main() -> int:
         print(f"raw_records: {report['raw_record_count']} | unique_alerts: {report['unique_alert_count']}")
         print(
             f"overall: count={overall['count']} completed={overall['completed']} pending={overall['pending']} "
-            f"dirty_ignored={overall.get('dirty_completed_ignored', 0)} favorable_rate={overall['favorable_rate']} "
-            f"avg_fav_move={overall['average_max_favorable_move_pct']}"
+            f"insufficient={overall.get('insufficient_future_session', 0)} dirty_ignored={overall.get('dirty_completed_ignored', 0)} "
+            f"favorable_rate={overall['favorable_rate']} avg_fav_move={overall['average_max_favorable_move_pct']}"
         )
         print()
         print(compact_table(report, args.group, limit=max(1, args.limit)))
