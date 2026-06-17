@@ -1,6 +1,18 @@
+import os
 import unittest
 
 from scanner.options_data_client import OptionsDataClient
+
+
+ALPACA_ENV_KEYS = (
+    "ALPACA_API_KEY",
+    "ALPACA_SECRET_KEY",
+    "APCA_API_KEY_ID",
+    "APCA_API_SECRET_KEY",
+    "ALPACA_OPTIONS_CONTRACTS_BASE_URL",
+    "ALPACA_OPTIONS_DATA_BASE_URL",
+    "ALPACA_LIVE_TRADE",
+)
 
 
 class FakeResponse:
@@ -39,6 +51,18 @@ class FakeSession:
 
 
 class OptionsDataClientTests(unittest.TestCase):
+    def setUp(self):
+        self._old_env = {key: os.environ.get(key) for key in ALPACA_ENV_KEYS}
+        for key in ALPACA_ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     def test_access_check_graceful_success(self):
         client = OptionsDataClient("key", "secret", session=FakeSession())
         status = client.check_access()
