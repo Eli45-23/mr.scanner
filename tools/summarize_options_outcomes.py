@@ -79,9 +79,28 @@ def latest_by_alert_key(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(latest.values())
 
 
+def valid_completed_window_count(row: Dict[str, Any]) -> int:
+    windows = row.get("windows") or []
+    return sum(
+        1
+        for item in windows
+        if isinstance(item, dict)
+        and item.get("status") == "ok"
+        and safe_float(item.get("move_pct")) is not None
+    )
+
+
+def is_clean_completed(row: Dict[str, Any]) -> bool:
+    return str(row.get("outcome_status")) in COMPLETED_STATUSES and valid_completed_window_count(row) > 0
+
+
+def is_dirty_completed(row: Dict[str, Any]) -> bool:
+    return str(row.get("outcome_status")) in COMPLETED_STATUSES and not is_clean_completed(row)
+
+
 def is_favorable(row: Dict[str, Any]) -> bool:
     windows = row.get("windows") or []
-    return any(isinstance(item, dict) and item.get("favorable") is True for item in windows)
+    return any(isinstance(item, dict) and item.get("favorable") is True and safe_float(item.get("move_pct")) is not None for item in windows)
 
 
 def group_key(row: Dict[str, Any], group_by: str) -> str:
@@ -106,8 +125,9 @@ def group_key(row: Dict[str, Any], group_by: str) -> str:
 
 def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     items = list(rows)
-    completed = [row for row in items if str(row.get("outcome_status")) in COMPLETED_STATUSES]
-    pending = [row for row in items if str(row.get("outcome_status")) == "pending"]
+    completed = [row for row in items if is_clean_completed(row)]
+    pending = [row for row in items if str(row.get("outcome_status")) == "pending" or is_dirty_completed(row)]
+    dirty = [row for row in items if is_dirty_completed(row)]
     missing = [row for row in items if str(row.get("outcome_status")) == "missing_start_context"]
     favorable = [row for row in completed if is_favorable(row)]
     max_favorable_values = [
@@ -121,6 +141,7 @@ def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "count": len(items),
         "completed": len(completed),
         "pending": len(pending),
+        "dirty_completed_ignored": len(dirty),
         "missing_start_context": len(missing),
         "favorable_count": len(favorable),
         "favorable_rate": round(len(favorable) / len(completed), 4) if completed else None,
@@ -174,14 +195,14 @@ def compact_table(report: Dict[str, Any], group: str, limit: int = 12) -> str:
     rows = report.get("groups", {}).get(group, [])[:limit]
     if not rows:
         return f"No rows for {group}."
-    lines = [f"{group} performance", "key | count | completed | pending | favorable_rate | avg_fav_move | avg_score"]
+    lines = [f"{group} performance", "key | count | completed | pending | dirty_ignored | favorable_rate | avg_fav_move | avg_score"]
     for row in rows:
         rate = row.get("favorable_rate")
         rate_text = "pending" if rate is None else f"{rate * 100:.1f}%"
         fav = row.get("average_max_favorable_move_pct")
         fav_text = "" if fav is None else f"{fav:+.4f}%"
         lines.append(
-            f"{row['key']} | {row['count']} | {row['completed']} | {row['pending']} | {rate_text} | {fav_text} | {row.get('average_whale_score')}"
+            f"{row['key']} | {row['count']} | {row['completed']} | {row['pending']} | {row.get('dirty_completed_ignored', 0)} | {rate_text} | {fav_text} | {row.get('average_whale_score')}"
         )
     return "\n".join(lines)
 
@@ -205,7 +226,8 @@ def main() -> int:
         print(f"raw_records: {report['raw_record_count']} | unique_alerts: {report['unique_alert_count']}")
         print(
             f"overall: count={overall['count']} completed={overall['completed']} pending={overall['pending']} "
-            f"favorable_rate={overall['favorable_rate']} avg_fav_move={overall['average_max_favorable_move_pct']}"
+            f"dirty_ignored={overall.get('dirty_completed_ignored', 0)} favorable_rate={overall['favorable_rate']} "
+            f"avg_fav_move={overall['average_max_favorable_move_pct']}"
         )
         print()
         print(compact_table(report, args.group, limit=max(1, args.limit)))
