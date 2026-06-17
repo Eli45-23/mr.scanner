@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from scanner.options_alert_outcomes import evaluate_alert_outcome, infer_flow_bias, summarize_outcomes
+from scanner.options_alert_outcomes import evaluate_alert_outcome, infer_flow_bias, infer_flow_bias_details, summarize_outcomes
 
 
 class OptionsAlertOutcomeTests(unittest.TestCase):
@@ -14,6 +14,18 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
     def test_infers_bias_from_option_type(self):
         self.assertEqual(infer_flow_bias({"candidate": {"option_type": "CALL"}}), "BULLISH")
         self.assertEqual(infer_flow_bias({"candidate": {"option_type": "PUT"}}), "BEARISH")
+        details = infer_flow_bias_details({"candidate": {"option_type": "PUT"}})
+        self.assertEqual(details["flow_bias_source"], "option_type_fallback")
+        self.assertIn("PUT flow defaults bearish", details["flow_bias_reason"])
+
+    def test_direction_label_overrides_option_type_bias(self):
+        details = infer_flow_bias_details({
+            "direction_label": "Possible bullish sold-put flow",
+            "candidate": {"option_type": "PUT"},
+        })
+        self.assertEqual(details["flow_bias"], "BULLISH")
+        self.assertEqual(details["flow_bias_source"], "direction_label")
+        self.assertIn("bullish", details["flow_bias_reason"].lower())
 
     def test_call_flow_favorable_when_price_rises(self):
         start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
@@ -29,6 +41,7 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         outcome = evaluate_alert_outcome(alert, self.bars(start, [100, 101, 102, 103, 104, 105, 106]), windows=(5,))
         self.assertEqual(outcome["outcome_status"], "ok")
         self.assertEqual(outcome["flow_bias"], "BULLISH")
+        self.assertEqual(outcome["flow_bias_source"], "option_type_fallback")
         self.assertTrue(outcome["windows"][0]["favorable"])
         self.assertGreater(outcome["max_favorable_move_pct"], 0)
 
@@ -74,6 +87,7 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         outcome = evaluate_alert_outcome({"candidate": {"option_type": "CALL"}}, [], windows=(5,))
         self.assertEqual(outcome["outcome_status"], "missing_start_context")
         self.assertEqual(outcome["windows"], [])
+        self.assertIn("flow_bias_source", outcome)
 
     def test_summarizes_outcomes(self):
         rows = [
