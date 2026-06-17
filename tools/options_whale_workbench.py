@@ -42,12 +42,14 @@ HTML_TEMPLATE = """
     .button { display:inline-block; background:var(--teal); color:#fff; text-decoration:none; border:0; border-radius:9px; padding:9px 11px; font-weight:800; cursor:pointer; }
     .flow-list { display:grid; gap:10px; padding:12px; max-height:650px; overflow:auto; }
     .flow-card { border:1px solid var(--line); border-radius:12px; background:#fff; padding:12px; display:grid; gap:10px; }
+    .flow-card.near-miss { border-color:#f0d59b; background:#fffaf0; }
     .flow-top { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
     .contract { font-size:18px; font-weight:900; }
     .contract .type.put { color:var(--bad); }
     .contract .type.call { color:var(--good); }
     .badges { display:flex; gap:6px; flex-wrap:wrap; }
     .badge { border:1px solid var(--line); border-radius:999px; padding:4px 7px; font-size:12px; font-weight:800; background:#f6f8f9; }
+    .badge.warn { background:#fff3df; color:var(--warn); border-color:#f0d59b; }
     .score { color:var(--teal); }
     .flow-grid { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:8px; }
     .metric { border:1px solid var(--line); border-radius:8px; padding:8px; background:#fbfcfd; }
@@ -57,6 +59,7 @@ HTML_TEMPLATE = """
     .reason strong { color:var(--ink); }
     .muted { color:var(--muted); }
     .notice { padding:10px 12px; color:var(--muted); }
+    .notice.warn { color:var(--warn); font-weight:800; }
     .bad { color:var(--bad); }
     @media(max-width:900px){ .flow-grid { grid-template-columns:repeat(2,minmax(140px,1fr)); } iframe { height:62vh; } }
     @media(max-width:560px){ .flow-grid { grid-template-columns:1fr; } }
@@ -130,7 +133,7 @@ HTML_TEMPLATE = """
       const strike = pick(item,'strike') ?? item.strike ?? '';
       return `${symbol} <span class="type ${String(type).toLowerCase()}">${esc(type)}</span> ${money(strike)}`;
     }
-    function rowCard(item) {
+    function rowCard(item, kind) {
       const exp = pick(item,'expiration') || item.expiration || 'Unavailable';
       const dte = pick(item,'dte') ?? item.dte ?? item.days_to_expiration ?? 'Unavailable';
       const moneyness = pick(item,'moneyness') || item.moneyness || 'Unavailable';
@@ -141,14 +144,15 @@ HTML_TEMPLATE = """
       const spread = pick(item,'spread_percent') ?? item.spread_percent;
       const premium = pick(item,'estimated_premium') ?? item.estimated_premium;
       const score = item.whale_score ?? item.score ?? 'NA';
-      return `<article class="flow-card">
+      const isNearMiss = kind === 'near_miss';
+      return `<article class="flow-card ${isNearMiss ? 'near-miss' : ''}">
         <div class="flow-top">
           <div>
             <div class="contract">${contractTitle(item)}</div>
             <div class="muted">${esc(pick(item,'time_detected') || item.timestamp || '')} | Exp ${esc(exp)} | ${esc(dte)} DTE | ${esc(moneyness)}</div>
           </div>
           <div class="badges">
-            <span class="badge">${esc(item.alert_tier || pick(item,'tier') || 'No tier')}</span>
+            <span class="badge ${isNearMiss ? 'warn' : ''}">${isNearMiss ? 'Near miss / debug' : esc(item.alert_tier || pick(item,'tier') || 'No tier')}</span>
             <span class="badge score">Score ${esc(score)}</span>
             <span class="badge">${esc(item.classification || 'Unclassified')}</span>
           </div>
@@ -168,9 +172,15 @@ HTML_TEMPLATE = """
         const r = await fetch('/api/whales/latest');
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || r.statusText);
-        const rows = data.results || [];
-        if (!rows.length) { box.innerHTML = '<div class="notice">No whale-flow rows yet.</div>'; return; }
-        box.innerHTML = rows.slice(0,40).map(rowCard).join('');
+        const resultRows = data.results || [];
+        const nearMissRows = data.near_misses || [];
+        const rows = resultRows.length ? resultRows : nearMissRows;
+        const kind = resultRows.length ? 'alert' : 'near_miss';
+        if (!rows.length) { box.innerHTML = '<div class="notice">No whale-flow rows or near misses yet.</div>'; return; }
+        const banner = kind === 'near_miss'
+          ? '<div class="notice warn">Showing near misses because no real whale alerts passed the filters yet. These are debug candidates, not alert-quality flow.</div>'
+          : '<div class="notice">Showing alert-quality whale-flow candidates.</div>';
+        box.innerHTML = banner + rows.slice(0,40).map((row) => rowCard(row, kind)).join('');
       } catch (err) {
         box.innerHTML = `<div class="notice bad">${esc(err.message)}. Make sure the main scanner dashboard is running on __MAIN_URL__.</div>`;
       }
