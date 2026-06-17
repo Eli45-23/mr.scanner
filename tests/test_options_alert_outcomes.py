@@ -48,6 +48,28 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertTrue(outcome["windows"][0]["favorable"])
         self.assertGreater(outcome["max_favorable_move_pct"], 0)
 
+    def test_pending_when_no_future_window_bars_exist_yet(self):
+        start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+        alert = {
+            "timestamp": start.isoformat(),
+            "candidate": {"option_type": "CALL", "underlying_price": 100.0},
+        }
+        outcome = evaluate_alert_outcome(alert, self.bars(start, [100, 100.2]), windows=(5, 15))
+        self.assertEqual(outcome["outcome_status"], "pending")
+        self.assertEqual(outcome["completed_window_count"], 0)
+        self.assertEqual(outcome["pending_window_count"], 2)
+
+    def test_partial_when_some_windows_are_complete(self):
+        start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+        alert = {
+            "timestamp": start.isoformat(),
+            "candidate": {"option_type": "CALL", "underlying_price": 100.0},
+        }
+        outcome = evaluate_alert_outcome(alert, self.bars(start, [100, 101, 102, 103, 104, 105, 106]), windows=(5, 15))
+        self.assertEqual(outcome["outcome_status"], "partial")
+        self.assertEqual(outcome["completed_window_count"], 1)
+        self.assertEqual(outcome["pending_window_count"], 1)
+
     def test_missing_context_is_safe(self):
         outcome = evaluate_alert_outcome({"candidate": {"option_type": "CALL"}}, [], windows=(5,))
         self.assertEqual(outcome["outcome_status"], "missing_start_context")
@@ -56,12 +78,14 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
     def test_summarizes_outcomes(self):
         rows = [
             {"outcome_status": "ok", "max_favorable_move_pct": 1.2, "windows": [{"favorable": True}]},
-            {"outcome_status": "ok", "max_favorable_move_pct": -0.3, "windows": [{"favorable": False}]},
+            {"outcome_status": "partial", "max_favorable_move_pct": -0.3, "windows": [{"favorable": False}]},
+            {"outcome_status": "pending", "windows": []},
             {"outcome_status": "missing_start_context", "windows": []},
         ]
         summary = summarize_outcomes(rows)
-        self.assertEqual(summary["count"], 3)
+        self.assertEqual(summary["count"], 4)
         self.assertEqual(summary["completed"], 2)
+        self.assertEqual(summary["pending"], 1)
         self.assertEqual(summary["favorable_rate"], 0.5)
 
 
