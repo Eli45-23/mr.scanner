@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urljoin
 
 import requests
 
@@ -13,6 +14,7 @@ DATA_BASE = "https://data.alpaca.markets"
 PAPER_BASE = "https://paper-api.alpaca.markets"
 LIVE_BASE = "https://api.alpaca.markets"
 READ_ONLY_PATHS = (
+    "/v2/account",
     "/v2/options/contracts",
     "/v1beta1/options/snapshots",
     "/v1beta1/options/quotes",
@@ -35,6 +37,11 @@ class OptionsAccessStatus:
     last_error: str = ""
     data_plan_warning: str = ""
     rate_limit_status: Dict[str, Any] = field(default_factory=dict)
+    contracts_url_used: str = ""
+    data_url_used: str = ""
+    paper_or_live_mode: str = "paper"
+    endpoint_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    entitlement_hint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,6 +55,11 @@ class OptionsAccessStatus:
             "last_error": self.last_error,
             "data_plan_warning": self.data_plan_warning,
             "rate_limit_status": self.rate_limit_status,
+            "contracts_url_used": self.contracts_url_used,
+            "data_url_used": self.data_url_used,
+            "paper_or_live_mode": self.paper_or_live_mode,
+            "endpoint_diagnostics": self.endpoint_diagnostics,
+            "entitlement_hint": self.entitlement_hint,
         }
 
 
@@ -62,6 +74,31 @@ def chunked(values: List[str], size: int) -> Iterable[List[str]]:
         yield values[idx: idx + size]
 
 
+def _clean_base_url(value: str) -> str:
+    return (value or "").strip().rstrip("/")
+
+
+def _env_base(name: str, default: str) -> str:
+    return _clean_base_url(os.getenv(name, default) or default)
+
+
+def _short_body(response: requests.Response, limit: int = 500) -> str:
+    return (response.text or "")[:limit]
+
+
+def endpoint_hint(status_code: int, endpoint: str = "endpoint") -> str:
+    if status_code == 401:
+        return (
+            "Authenticated to Alpaca, but this endpoint is unauthorized. "
+            "Check whether the endpoint base URL is correct and whether this API key has options contract/data permissions."
+        )
+    if status_code == 403:
+        return "Options market data may require additional entitlement/subscription."
+    if status_code >= 400:
+        return f"{endpoint} returned HTTP {status_code}."
+    return ""
+
+
 class OptionsDataClient:
     def __init__(
         self,
@@ -72,6 +109,12 @@ class OptionsDataClient:
         options_feed: str = "opra",
         allow_indicative_fallback: bool = True,
         session: Optional[requests.Session] = None,
+        paper_base_url: Optional[str] = None,
+        live_base_url: Optional[str] = None,
+        trading_base_url: Optional[str] = None,
+        options_contracts_base_url: Optional[str] = None,
+        options_data_base_url: Optional[str] = None,
+        live_trade: Optional[bool] = None,
     ) -> None:
         self.api_key = api_key or os.getenv("ALPACA_API_KEY", "")
         self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY", "")
@@ -79,6 +122,25 @@ class OptionsDataClient:
         self.options_feed = (options_feed or "opra").lower()
         self.allow_indicative_fallback = allow_indicative_fallback
         self.session = session or requests.Session()
+        self.paper_base_url = _clean_base_url(paper_base_url or _env_base("ALPACA_PAPER_BASE_URL", PAPER_BASE))
+        self.live_base_url = _clean_base_url(live_base_url or _env_base("ALPACA_LIVE_BASE_URL", LIVE_BASE))
+        self.trading_base_url = _clean_base_url(trading_base_url or os.getenv("ALPACA_TRADING_BASE_URL", ""))
+        self.options_data_base_url = _clean_base_url(options_data_base_url or _env_base("ALPACA_OPTIONS_DATA_BASE_URL", DATA_BASE))
+        env_live_trade = str(os.getenv("ALPACA_LIVE_TRADE", "")).strip().lower() in {"1", "true", "yes", "on"}
+        self.live_trade = bool(env_live_trade if live_trade is None else live_trade)
+        explicit_contracts_base = _clean_base_url(options_contracts_base_url or os.getenv("ALPACA_OPTIONS_CONTRACTS_BASE_URL", ""))
+        if explicit_contracts_base:
+            self.options_contracts_base_url = explicit_contracts_base
+            self.paper_or_live_mode = "custom"
+        elif self.trading_base_url:
+            self.options_contracts_base_url = self.trading_base_url
+            self.paper_or_live_mode = "custom_trading_base"
+        elif self.live_trade:
+            self.options_contracts_base_url = self.live_base_url
+            self.paper_or_live_mode = "live"
+        else:
+            self.options_contracts_base_url = self.paper_base_url
+            self.paper_or_live_mode = "paper"
         if self.api_key and self.secret_key:
             self.session.headers.update({
                 "APCA-API-KEY-ID": self.api_key,
@@ -91,6 +153,20 @@ class OptionsDataClient:
         response = self.session.request(method, f"{base}{path}", params=params or {}, timeout=timeout)
         return response
 
+    def endpoint_url(self, base: str, path: str) -> str:
+        return urljoin(f"{base}/", path.lstrip("/"))
+
+    def _diagnostic(self, name: str, response: requests.Response, base: str, path: str) -> Dict[str, Any]:
+        return {
+            "endpoint": name,
+            "base_url": base,
+            "url": self.endpoint_url(base, path),
+            "path": path,
+            "http_status": response.status_code,
+            "response_body": _short_body(response),
+            "entitlement_hint": endpoint_hint(response.status_code, name),
+        }
+
     @staticmethod
     def _rate_headers(response: requests.Response) -> Dict[str, Any]:
         return {
@@ -100,7 +176,7 @@ class OptionsDataClient:
         }
 
     def get_assets(self) -> List[Dict[str, Any]]:
-        for base in (PAPER_BASE, LIVE_BASE):
+        for base in (self.options_contracts_base_url, self.paper_base_url, self.live_base_url):
             response = self._request("GET", base, "/v2/assets", params={"status": "active", "asset_class": "us_equity"})
             if response.status_code < 400:
                 data = response.json()
@@ -129,9 +205,15 @@ class OptionsDataClient:
                 params["underlying_symbols"] = ",".join(underlying_symbols)
             if token:
                 params["page_token"] = token
-            response = self._request("GET", PAPER_BASE, "/v2/options/contracts", params=params, timeout=45)
+            response = self._request("GET", self.options_contracts_base_url, "/v2/options/contracts", params=params, timeout=45)
             if response.status_code >= 400:
-                raise RuntimeError(f"option contracts unavailable: {response.status_code} {response.text[:180]}")
+                hint = endpoint_hint(response.status_code, "options contracts")
+                raise RuntimeError(
+                    "option contracts unavailable: "
+                    f"{response.status_code} {response.text[:180]} "
+                    f"url={self.endpoint_url(self.options_contracts_base_url, '/v2/options/contracts')} "
+                    f"hint={hint}"
+                )
             body = response.json()
             rows = body.get("option_contracts") or body.get("contracts") or body.get("data") or []
             contracts.extend([row for row in rows if isinstance(row, dict)])
@@ -145,10 +227,10 @@ class OptionsDataClient:
         snapshots: Dict[str, Dict[str, Any]] = {}
         for batch in chunked(option_symbols, 100):
             params = {"symbols": ",".join(batch), "feed": feed, "limit": 1000}
-            response = self._request("GET", DATA_BASE, "/v1beta1/options/snapshots", params=params, timeout=45)
+            response = self._request("GET", self.options_data_base_url, "/v1beta1/options/snapshots", params=params, timeout=45)
             if response.status_code >= 400 and feed == "opra" and self.allow_indicative_fallback:
                 params["feed"] = "indicative"
-                response = self._request("GET", DATA_BASE, "/v1beta1/options/snapshots", params=params, timeout=45)
+                response = self._request("GET", self.options_data_base_url, "/v1beta1/options/snapshots", params=params, timeout=45)
             if response.status_code >= 400:
                 raise RuntimeError(f"option snapshots unavailable: {response.status_code} {response.text[:180]}")
             body = response.json()
@@ -166,7 +248,7 @@ class OptionsDataClient:
         for batch in chunked(option_symbols, 100):
             response = self._request(
                 "GET",
-                DATA_BASE,
+                self.options_data_base_url,
                 "/v1beta1/options/quotes/latest",
                 params={"symbols": ",".join(batch), "feed": feed},
                 timeout=30,
@@ -179,14 +261,13 @@ class OptionsDataClient:
         return quotes
 
     def get_option_trades(self, option_symbols: List[str], *, start: datetime, end: datetime, feed: Optional[str] = None, limit: int = 10000) -> Dict[str, List[Dict[str, Any]]]:
-        feed = (feed or self.options_feed).lower()
         out: Dict[str, List[Dict[str, Any]]] = {}
         for batch in chunked(option_symbols, 100):
             response = self._request(
                 "GET",
-                DATA_BASE,
+                self.options_data_base_url,
                 "/v1beta1/options/trades",
-                params={"symbols": ",".join(batch), "feed": feed, "start": _iso(start), "end": _iso(end), "limit": limit},
+                params={"symbols": ",".join(batch), "start": _iso(start), "end": _iso(end), "limit": limit},
                 timeout=45,
             )
             if response.status_code >= 400:
@@ -200,7 +281,7 @@ class OptionsDataClient:
     def get_stock_bars(self, symbols: List[str], *, start: datetime, end: datetime, timeframe: str = "1Min") -> Dict[str, List[Dict[str, Any]]]:
         response = self._request(
             "GET",
-            DATA_BASE,
+            self.options_data_base_url,
             "/v2/stocks/bars",
             params={
                 "symbols": ",".join(symbols),
@@ -219,25 +300,34 @@ class OptionsDataClient:
 
     def check_access(self) -> Dict[str, Any]:
         status = OptionsAccessStatus()
+        status.contracts_url_used = self.endpoint_url(self.options_contracts_base_url, "/v2/options/contracts")
+        status.data_url_used = self.options_data_base_url
+        status.paper_or_live_mode = self.paper_or_live_mode
         if not self.api_key or not self.secret_key:
             status.last_error = "Alpaca API key/secret are not configured."
             return status.to_dict()
         today = datetime.now(timezone.utc).date()
         rate: Dict[str, Any] = {}
+        diagnostics: Dict[str, Any] = {}
         try:
-            stock = self._request("GET", DATA_BASE, "/v2/stocks/bars/latest", params={"symbols": "AAPL", "feed": self.stock_feed}, timeout=15)
+            stock = self._request("GET", self.options_data_base_url, "/v2/stocks/bars/latest", params={"symbols": "AAPL", "feed": self.stock_feed}, timeout=15)
+            diagnostics["stock_latest_bar"] = self._diagnostic("stock_latest_bar", stock, self.options_data_base_url, "/v2/stocks/bars/latest")
             status.alpaca_connected = stock.status_code < 400
             rate = self._rate_headers(stock)
             contracts = self._request(
                 "GET",
-                PAPER_BASE,
+                self.options_contracts_base_url,
                 "/v2/options/contracts",
                 params={"status": "active", "expiration_date_gte": today.isoformat(), "expiration_date_lte": (today + timedelta(days=7)).isoformat(), "limit": 1},
                 timeout=15,
             )
+            diagnostics["contracts"] = self._diagnostic("contracts", contracts, self.options_contracts_base_url, "/v2/options/contracts")
             status.options_contracts_available = contracts.status_code < 400
             if contracts.status_code >= 400:
+                hint = endpoint_hint(contracts.status_code, "contracts")
                 status.last_error = f"contracts: {contracts.status_code} {contracts.text[:120]}"
+                status.entitlement_hint = hint
+                status.data_plan_warning = hint
             symbols: List[str] = []
             if contracts.status_code < 400:
                 rows = contracts.json().get("option_contracts") or []
@@ -246,19 +336,25 @@ class OptionsDataClient:
                     if sym:
                         symbols.append(sym)
             if symbols:
-                snapshot = self._request("GET", DATA_BASE, "/v1beta1/options/snapshots", params={"symbols": symbols[0], "feed": self.options_feed}, timeout=15)
+                snapshot = self._request("GET", self.options_data_base_url, "/v1beta1/options/snapshots", params={"symbols": symbols[0], "feed": self.options_feed}, timeout=15)
+                diagnostics["snapshots"] = self._diagnostic("snapshots", snapshot, self.options_data_base_url, "/v1beta1/options/snapshots")
                 status.options_snapshots_available = snapshot.status_code < 400
                 status.official_options_feed_available = self.options_feed == "opra" and snapshot.status_code < 400
-                if snapshot.status_code == 403:
-                    status.data_plan_warning = "Alpaca options data unavailable or not enabled for this account."
-                quote = self._request("GET", DATA_BASE, "/v1beta1/options/quotes/latest", params={"symbols": symbols[0], "feed": self.options_feed}, timeout=15)
+                if snapshot.status_code >= 400:
+                    status.data_plan_warning = endpoint_hint(snapshot.status_code, "options snapshots")
+                    status.entitlement_hint = status.data_plan_warning
+                quote = self._request("GET", self.options_data_base_url, "/v1beta1/options/quotes/latest", params={"symbols": symbols[0], "feed": self.options_feed}, timeout=15)
+                diagnostics["quotes_latest"] = self._diagnostic("quotes_latest", quote, self.options_data_base_url, "/v1beta1/options/quotes/latest")
                 status.options_quotes_available = quote.status_code < 400
                 start = datetime.now(timezone.utc) - timedelta(minutes=15)
-                trades = self._request("GET", DATA_BASE, "/v1beta1/options/trades", params={"symbols": symbols[0], "feed": self.options_feed, "start": _iso(start), "limit": 1}, timeout=15)
+                trades = self._request("GET", self.options_data_base_url, "/v1beta1/options/trades", params={"symbols": symbols[0], "start": _iso(start), "limit": 1}, timeout=15)
+                diagnostics["trades"] = self._diagnostic("trades", trades, self.options_data_base_url, "/v1beta1/options/trades")
                 status.options_trades_available = trades.status_code < 400
-                bars = self._request("GET", DATA_BASE, "/v1beta1/options/bars", params={"symbols": symbols[0], "feed": self.options_feed, "timeframe": "1Min", "start": _iso(start), "limit": 1}, timeout=15)
+                bars = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params={"symbols": symbols[0], "timeframe": "1Min", "start": _iso(start), "limit": 1}, timeout=15)
+                diagnostics["bars"] = self._diagnostic("bars", bars, self.options_data_base_url, "/v1beta1/options/bars")
                 status.options_bars_available = bars.status_code < 400
             status.rate_limit_status = rate
         except Exception as exc:
             status.last_error = str(exc)
+        status.endpoint_diagnostics = diagnostics
         return status.to_dict()

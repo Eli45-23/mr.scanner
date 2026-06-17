@@ -70,7 +70,27 @@ def build_optionable_universe(
     except Exception as exc:
         cached = load_universe_cache(cache_path or default_universe_path())
         cached["status"] = "fallback_cache"
-        cached["warning"] = f"Full-market discovery partial — using cached optionable universe. {exc}"
+        contracts_url = getattr(client, "options_contracts_base_url", "")
+        if contracts_url:
+            contracts_url = f"{contracts_url.rstrip('/')}/v2/options/contracts"
+        has_keys = bool(getattr(client, "api_key", "") and getattr(client, "secret_key", ""))
+        failure = str(exc)
+        if "401" in failure:
+            hint = (
+                "Authenticated to Alpaca, but this endpoint is unauthorized. "
+                "Check whether the endpoint base URL is correct and whether this API key has options contract/data permissions."
+            )
+        elif "403" in failure:
+            hint = "Options market data may require additional entitlement/subscription."
+        else:
+            hint = "Contract discovery failed; using cached universe if available."
+        cached["warning"] = (
+            "Full-market discovery partial — using cached optionable universe. "
+            f"contracts_url_used={contracts_url or 'unknown'} "
+            f"keys_configured={has_keys} "
+            f"hint={hint} "
+            f"error={failure}"
+        )
         return cached
 
     by_underlying: Dict[str, Dict[str, Any]] = {}
