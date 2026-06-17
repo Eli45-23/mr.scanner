@@ -442,6 +442,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_next_day_oi_review": True,
         "enable_notifications": True,
         "notify_tier_2": False,
+        "debug_loose_mode": False,
+        "priority_seed_symbols": ["SPY", "QQQ", "IWM", "DIA", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL", "NFLX", "AVGO", "COIN", "MSTR", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "HYG", "GLD", "SLV"],
+        "priority_batch_size": 50,
     },
     "alert_quality": {
         "sms_min_grade": "B",
@@ -7722,6 +7725,21 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     whale["enable_notifications"] = env_bool(
         "OPTIONS_WHALE_ENABLE_NOTIFICATIONS",
         bool(whale.get("enable_notifications", True)),
+    )
+    whale["debug_loose_mode"] = env_bool(
+        "OPTIONS_WHALE_DEBUG_LOOSE_MODE",
+        bool(whale.get("debug_loose_mode", False)),
+    )
+    raw_priority_seeds = os.getenv("OPTIONS_WHALE_PRIORITY_SEEDS")
+    if raw_priority_seeds is not None:
+        whale["priority_seed_symbols"] = [
+            part.strip().upper()
+            for part in raw_priority_seeds.split(",")
+            if part.strip()
+        ]
+    whale["priority_batch_size"] = env_int(
+        "OPTIONS_WHALE_PRIORITY_BATCH_SIZE",
+        int(whale.get("priority_batch_size", 50)),
     )
     if not config["enable_legacy_momentum_scanner"]:
         for key in config.setdefault("alert_rules", {}):
