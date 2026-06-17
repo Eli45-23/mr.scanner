@@ -41,6 +41,7 @@
     "enable_notifications": true,
     "notify_tier_2": false,
     "debug_loose_mode": false,
+    "dashboard_auto_scan": true,
     "priority_seed_symbols": ["SPY", "QQQ", "IWM", "DIA", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL", "NFLX", "AVGO", "COIN", "MSTR", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "HYG", "GLD", "SLV"],
     "priority_batch_size": 50
   },

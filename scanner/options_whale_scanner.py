@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -198,6 +199,7 @@ class OptionsWhaleScanner:
         self.storage = storage
         self.root = root or Path.cwd()
         self.universe_path = self.root / "data" / "options_universe.json"
+        self.latest_path = self.root / "data" / "options_whale_latest.json"
         self.last_scan: Dict[str, Any] = {}
         self.latest_results: List[Dict[str, Any]] = []
         self.last_scan_order: Dict[str, Any] = {}
@@ -589,6 +591,11 @@ class OptionsWhaleScanner:
         self.last_scan = scan_record
         self.latest_results = results
         self.storage.append_scan({k: v for k, v in scan_record.items() if k != "results"})
+        try:
+            self.latest_path.parent.mkdir(parents=True, exist_ok=True)
+            self.latest_path.write_text(json.dumps(scan_record, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        except OSError:
+            pass
         for result in results:
             if result.get("should_notify"):
                 self.storage.append_alert(result)
@@ -598,7 +605,20 @@ class OptionsWhaleScanner:
         return {"alerts": self.storage.latest_alerts(limit=limit)}
 
     def latest(self) -> Dict[str, Any]:
-        return {"results": self.latest_results, "last_scan": {k: v for k, v in self.last_scan.items() if k != "results"}}
+        if not self.last_scan and self.latest_path.exists():
+            try:
+                payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    self.last_scan = payload
+                    self.latest_results = list(payload.get("results") or [])
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {
+            "results": self.latest_results,
+            "near_misses": self.last_scan.get("near_misses", []),
+            "diagnostics": {k: v for k, v in self.last_scan.items() if k not in {"results", "near_misses"}},
+            "last_scan": {k: v for k, v in self.last_scan.items() if k != "results"},
+        }
 
     def review_next_day_oi(self, oi_by_contract: Dict[str, int]) -> List[Dict[str, Any]]:
         reviews = review_alerts_with_next_day_oi(self.storage.latest_alerts(limit=10000), oi_by_contract)

@@ -385,6 +385,7 @@ class LiquiditySweepTelegramTests(unittest.TestCase):
         snap = scanner.SymbolSnapshot(symbol="AAPL", latest_bar=bar, recent_bars=[bar])
         with (
             patch("tools.preview_liquidity_sweeps.build_liquidity_sweep_preview", return_value=self.payload("SWEEP_CONFIRMED")),
+            patch.object(scanner, "should_send_liquidity_sweep_telegram", return_value=(True, "meaningful new liquidity sweep event", {"suppression_type": ""})),
             patch.object(scanner, "claim_sweep_delivery", return_value=(True, "first sweep alert", None)),
             patch.object(scanner, "send_telegram_message", return_value=(True, "")) as send,
             patch.object(scanner, "append_sweep_telegram_log") as log,

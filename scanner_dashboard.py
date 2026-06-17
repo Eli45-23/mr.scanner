@@ -44,6 +44,7 @@ MARKET_STRUCTURE_LOG_PATHS = {
 LIQUIDITY_SWEEP_LOG_PATH = APP_DIR / "logs" / "liquidity_sweeps.jsonl"
 ALERT_ORCHESTRATOR_LOG_PATH = APP_DIR / "logs" / "alert_orchestrator.jsonl"
 CHOP_MODE_LOG_PATH = APP_DIR / "logs" / "chop_mode.jsonl"
+OPTIONS_WHALE_LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -372,6 +373,15 @@ class DashboardState:
         self.liquidity_sweep_updated_monotonic = 0.0
         self.options_whale_scanner: Optional[OptionsWhaleScanner] = None
         self.options_whale_filters: Optional[Dict[str, Any]] = None
+        self.options_whale_scan_lock = threading.Lock()
+        self.options_whale_auto_scan_thread: Optional[threading.Thread] = None
+        self.options_whale_auto_scan_started = False
+        self.options_whale_auto_scan_paused = False
+        self.options_whale_scan_running = False
+        self.options_whale_last_scan_started_at: Optional[str] = None
+        self.options_whale_last_scan_finished_at: Optional[str] = None
+        self.options_whale_last_scan_error = ""
+        self.options_whale_next_scan_monotonic = 0.0
 
     def snapshot(self) -> Dict[str, Any]:
         config = scanner_app.load_config(self.config_path)
@@ -447,9 +457,155 @@ def options_whale_scanner() -> OptionsWhaleScanner:
         return STATE.options_whale_scanner
 
 
+def options_whale_interval(config: Optional[Dict[str, Any]] = None) -> int:
+    config = config or scanner_app.load_config(STATE.config_path)
+    whale = config.get("options_whale_scanner", {})
+    return max(5, int(whale.get("scan_interval_seconds", 30)))
+
+
+def options_whale_auto_scan_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    config = config or scanner_app.load_config(STATE.config_path)
+    whale = config.get("options_whale_scanner", {})
+    return bool(whale.get("dashboard_auto_scan", True))
+
+
+def parse_scan_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def scan_age_seconds(timestamp: Optional[str]) -> Optional[float]:
+    parsed = parse_scan_timestamp(timestamp)
+    if not parsed:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+
+
+def read_latest_options_whale_scan() -> Dict[str, Any]:
+    if not OPTIONS_WHALE_LATEST_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(OPTIONS_WHALE_LATEST_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_latest_options_whale_scan(payload: Dict[str, Any]) -> None:
+    try:
+        OPTIONS_WHALE_LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        OPTIONS_WHALE_LATEST_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
+    acquired = STATE.options_whale_scan_lock.acquire(blocking=False)
+    if not acquired:
+        latest = options_whales_latest()
+        latest["scan_already_running"] = True
+        latest["message"] = "scan already running"
+        return latest
+    try:
+        with STATE.lock:
+            STATE.options_whale_scan_running = True
+            STATE.options_whale_last_scan_started_at = iso_now()
+            STATE.options_whale_last_scan_error = ""
+        scanner = options_whale_scanner()
+        result = scanner.scan()
+        result["scan_trigger"] = reason
+        write_latest_options_whale_scan(result)
+        send_options_whale_notifications(result)
+        with STATE.lock:
+            STATE.last_scan_at = result.get("timestamp") or iso_now()
+            STATE.options_whale_last_scan_finished_at = iso_now()
+            STATE.options_whale_last_scan_error = ""
+        return result
+    except Exception as exc:
+        with STATE.lock:
+            STATE.options_whale_last_scan_error = str(exc)
+            STATE.options_whale_last_scan_finished_at = iso_now()
+        latest = options_whales_latest()
+        latest["error"] = str(exc)
+        latest["kept_last_good_result"] = bool(latest.get("results"))
+        return latest
+    finally:
+        with STATE.lock:
+            STATE.options_whale_scan_running = False
+        STATE.options_whale_scan_lock.release()
+
+
+def options_whale_auto_scan_loop() -> None:
+    while not STATE.stop_event.is_set():
+        config = scanner_app.load_config(STATE.config_path)
+        interval = options_whale_interval(config)
+        with STATE.lock:
+            paused = STATE.options_whale_auto_scan_paused
+            STATE.options_whale_next_scan_monotonic = time.monotonic() + interval
+        if not paused:
+            run_options_whale_scan_locked("auto")
+        if STATE.stop_event.wait(interval):
+            break
+
+
+def ensure_options_whale_auto_scan() -> None:
+    config = scanner_app.load_config(STATE.config_path)
+    if not options_whale_auto_scan_enabled(config):
+        return
+    with STATE.lock:
+        if STATE.options_whale_auto_scan_started and STATE.options_whale_auto_scan_thread and STATE.options_whale_auto_scan_thread.is_alive():
+            return
+        STATE.options_whale_auto_scan_started = True
+        STATE.options_whale_auto_scan_paused = False
+        thread = threading.Thread(target=options_whale_auto_scan_loop, name="options-whale-auto-scan", daemon=True)
+        STATE.options_whale_auto_scan_thread = thread
+        thread.start()
+
+
+def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = scanner_app.load_config(STATE.config_path)
+    interval = options_whale_interval(config)
+    latest = latest or read_latest_options_whale_scan()
+    timestamp = latest.get("timestamp")
+    age = scan_age_seconds(timestamp)
+    with STATE.lock:
+        running = STATE.options_whale_scan_running
+        paused = STATE.options_whale_auto_scan_paused
+        last_started = STATE.options_whale_last_scan_started_at
+        last_finished = STATE.options_whale_last_scan_finished_at
+        last_error = STATE.options_whale_last_scan_error
+        next_eta = max(0.0, STATE.options_whale_next_scan_monotonic - time.monotonic()) if STATE.options_whale_next_scan_monotonic else None
+    stale = bool(age is not None and age > interval * 2)
+    return {
+        "auto_scan_enabled": options_whale_auto_scan_enabled(config),
+        "auto_scan_paused": paused,
+        "scan_interval_seconds": interval,
+        "scan_running": running,
+        "last_scan_started_at": last_started,
+        "last_scan_finished_at": last_finished,
+        "last_scan_age_seconds": round(age, 1) if age is not None else None,
+        "next_scan_eta_seconds": round(next_eta, 1) if next_eta is not None else None,
+        "last_scan_error": last_error,
+        "latest_result_count": len(latest.get("results") or []),
+        "latest_near_miss_count": len(latest.get("near_misses") or []),
+        "contracts_scanned": latest.get("contracts_scanned", 0),
+        "candidates_found": latest.get("candidates_found", 0),
+        "stale": stale,
+        "stale_warning": "Scan results are stale. Latest scan is stale. Auto-scan may not be running." if stale else "",
+    }
+
+
 def options_whales_status() -> Dict[str, Any]:
     try:
-        return options_whale_scanner().status()
+        latest = read_latest_options_whale_scan()
+        return {**options_whale_scanner().status(), **options_whale_scan_runtime_status(latest)}
     except Exception as exc:
         return {
             "scanner_name": "Options Whale Scanner",
@@ -463,16 +619,12 @@ def options_whales_status() -> Dict[str, Any]:
             "official_options_feed_available": False,
             "last_error": str(exc),
             "data_plan_warning": "Alpaca options data unavailable or not enabled for this account.",
+            **options_whale_scan_runtime_status(read_latest_options_whale_scan()),
         }
 
 
 def options_whales_scan() -> Dict[str, Any]:
-    scanner = options_whale_scanner()
-    result = scanner.scan()
-    send_options_whale_notifications(result)
-    with STATE.lock:
-        STATE.last_scan_at = iso_now()
-    return result
+    return run_options_whale_scan_locked("manual")
 
 
 def send_options_whale_notifications(scan_result: Dict[str, Any]) -> None:
@@ -513,7 +665,36 @@ def send_options_whale_notifications(scan_result: Dict[str, Any]) -> None:
 
 
 def options_whales_latest() -> Dict[str, Any]:
-    return options_whale_scanner().latest()
+    payload = read_latest_options_whale_scan()
+    if not payload:
+        payload = options_whale_scanner().latest().get("last_scan", {})
+        if payload:
+            payload["results"] = options_whale_scanner().latest().get("results", [])
+    runtime = options_whale_scan_runtime_status(payload)
+    timestamp = payload.get("timestamp")
+    return {
+        "timestamp": timestamp,
+        "scan_age_seconds": runtime["last_scan_age_seconds"],
+        "results": payload.get("results", []),
+        "near_misses": payload.get("near_misses", []),
+        "diagnostics": {k: v for k, v in payload.items() if k not in {"results", "near_misses"}},
+        "last_scan": {k: v for k, v in payload.items() if k != "results"},
+        "stale": runtime["stale"],
+        "stale_warning": runtime["stale_warning"],
+    }
+
+
+def pause_options_whale_auto_scan() -> Dict[str, Any]:
+    with STATE.lock:
+        STATE.options_whale_auto_scan_paused = True
+    return options_whales_status()
+
+
+def resume_options_whale_auto_scan() -> Dict[str, Any]:
+    with STATE.lock:
+        STATE.options_whale_auto_scan_paused = False
+    ensure_options_whale_auto_scan()
+    return options_whales_status()
 
 
 def options_whales_history(limit: int = 100) -> Dict[str, Any]:
@@ -2674,6 +2855,11 @@ INDEX_HTML = r"""<!doctype html>
           <h2>Options Whale Scanner</h2>
           <span class="muted" id="optionsWhalesUpdated">Waiting for scan</span>
         </div>
+        <div class="controls">
+          <button id="whaleScanNowBtn">Run Whale Scan Now</button>
+          <button id="whalePauseBtn">Pause Auto Scan</button>
+          <button id="whaleResumeBtn">Resume Auto Scan</button>
+        </div>
         <div class="structure-body" id="optionsWhales"></div>
       </section>
       <section>
@@ -2749,6 +2935,9 @@ INDEX_HTML = r"""<!doctype html>
       controlCenterUpdated: document.getElementById('controlCenterUpdated'),
       optionsWhales: document.getElementById('optionsWhales'),
       optionsWhalesUpdated: document.getElementById('optionsWhalesUpdated'),
+      whaleScanNowBtn: document.getElementById('whaleScanNowBtn'),
+      whalePauseBtn: document.getElementById('whalePauseBtn'),
+      whaleResumeBtn: document.getElementById('whaleResumeBtn'),
       clear: document.getElementById('clearBtn'),
       dot: document.getElementById('statusDot'),
       status: document.getElementById('statusText'),
@@ -3242,8 +3431,14 @@ INDEX_HTML = r"""<!doctype html>
     function renderOptionsWhales(status, latest) {
       const rows = latest.results || [];
       const scan = latest.last_scan || {};
-      els.optionsWhalesUpdated.textContent = fmtTime(scan.timestamp || status.last_scan_time);
+      const scanTimestamp = latest.timestamp || scan.timestamp || status.last_scan_time;
+      els.optionsWhalesUpdated.textContent = `${fmtTime(scanTimestamp)}${latest.stale ? ' | STALE' : ''}`;
       const warning = status.data_plan_warning || status.last_error || '';
+      const staleWarning = latest.stale_warning || status.stale_warning || '';
+      const autoLabel = status.auto_scan_enabled
+        ? (status.auto_scan_paused ? 'Paused' : 'Running')
+        : 'Disabled';
+      const scanState = status.scan_running ? 'Running' : 'Idle';
       const topRows = rows.slice(0, 50).map((item) => {
         const c = item.candidate || {};
         return `
@@ -3278,8 +3473,16 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="label">Universe</span><div><strong>${status.universe?.entry_count ?? 0} symbols</strong></div></div>
           <div><span class="label">Contracts scanned</span><div><strong>${scan.contracts_scanned ?? 0}</strong></div></div>
           <div><span class="label">Candidates</span><div><strong>${scan.candidates_found ?? 0}</strong></div></div>
+          <div><span class="label">Last scan</span><div><strong>${fmtTime(scanTimestamp)}</strong></div></div>
+          <div><span class="label">Scan age</span><div><strong>${status.last_scan_age_seconds !== null && status.last_scan_age_seconds !== undefined ? fmtNum(status.last_scan_age_seconds, 's') : 'Unknown'}</strong></div></div>
+          <div><span class="label">Next scan ETA</span><div><strong>${status.next_scan_eta_seconds !== null && status.next_scan_eta_seconds !== undefined ? fmtNum(status.next_scan_eta_seconds, 's') : 'Unknown'}</strong></div></div>
+          <div><span class="label">Auto scan</span><div><strong>${esc(autoLabel)}</strong></div></div>
+          <div><span class="label">Current scan</span><div><strong>${esc(scanState)}</strong></div></div>
+          <div><span class="label">Near misses</span><div><strong>${status.latest_near_miss_count ?? (latest.near_misses || []).length}</strong></div></div>
         </div>
         ${warning ? `<div class="empty">${esc(warning)}</div>` : ''}
+        ${staleWarning ? `<div class="empty">${esc(staleWarning)}</div>` : ''}
+        ${status.last_scan_error ? `<div class="empty">Last scan error: ${esc(status.last_scan_error)}</div>` : ''}
         <div class="copy-block">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
         <table>
           <thead><tr>
@@ -3717,6 +3920,25 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
     els.refresh.addEventListener('click', refresh);
+    els.whaleScanNowBtn.addEventListener('click', async () => {
+      els.whaleScanNowBtn.disabled = true;
+      els.whaleScanNowBtn.textContent = 'Scanning...';
+      try {
+        await api('/api/options-whales/scan');
+      } finally {
+        els.whaleScanNowBtn.disabled = false;
+        els.whaleScanNowBtn.textContent = 'Run Whale Scan Now';
+        refresh();
+      }
+    });
+    els.whalePauseBtn.addEventListener('click', async () => {
+      await api('/api/options-whales/auto-scan/pause', { method: 'POST', body: '{}' });
+      refresh();
+    });
+    els.whaleResumeBtn.addEventListener('click', async () => {
+      await api('/api/options-whales/auto-scan/resume', { method: 'POST', body: '{}' });
+      refresh();
+    });
     els.alpacaHealthBtn.addEventListener('click', checkAlpacaHealth);
     els.openaiReviewBtn.addEventListener('click', checkOpenAiReview);
     els.clear.addEventListener('click', async () => {
@@ -3730,7 +3952,7 @@ INDEX_HTML = r"""<!doctype html>
         refresh();
       }
     });
-    setInterval(refresh, 3000);
+    setInterval(refresh, 5000);
     refresh();
   </script>
 </body>
@@ -3842,6 +4064,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(update_options_whales_filters(body))
             elif parsed.path == "/api/options-whales/universe/rebuild":
                 self.send_json(options_whale_scanner().rebuild_universe())
+            elif parsed.path == "/api/options-whales/auto-scan/pause":
+                self.send_json(pause_options_whale_auto_scan())
+            elif parsed.path == "/api/options-whales/auto-scan/resume":
+                self.send_json(resume_options_whale_auto_scan())
             elif parsed.path == "/api/ai-review":
                 self.send_json(ai_review(body))
             elif parsed.path == "/api/clear":
@@ -3868,6 +4094,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     url = f"http://{args.host}:{args.port}"
     logger.info("Dashboard running at %s", url)
+    ensure_options_whale_auto_scan()
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

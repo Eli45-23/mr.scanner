@@ -443,6 +443,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enable_notifications": True,
         "notify_tier_2": False,
         "debug_loose_mode": False,
+        "dashboard_auto_scan": True,
         "priority_seed_symbols": ["SPY", "QQQ", "IWM", "DIA", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL", "NFLX", "AVGO", "COIN", "MSTR", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "HYG", "GLD", "SLV"],
         "priority_batch_size": 50,
     },
@@ -7729,6 +7730,10 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     whale["debug_loose_mode"] = env_bool(
         "OPTIONS_WHALE_DEBUG_LOOSE_MODE",
         bool(whale.get("debug_loose_mode", False)),
+    )
+    whale["dashboard_auto_scan"] = env_bool(
+        "OPTIONS_WHALE_DASHBOARD_AUTO_SCAN",
+        bool(whale.get("dashboard_auto_scan", True)),
     )
     raw_priority_seeds = os.getenv("OPTIONS_WHALE_PRIORITY_SEEDS")
     if raw_priority_seeds is not None:

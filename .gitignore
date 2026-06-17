@@ -17,6 +17,7 @@ logs/
 state/
 exports/
 data/options_universe.json
+data/options_whale_latest.json
 dashboard_export_*.json
 *.pid
 *.log
