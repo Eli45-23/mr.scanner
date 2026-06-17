@@ -54,6 +54,26 @@ def classify_score(score: int) -> str:
     return "IGNORE"
 
 
+def _moneyness_quality(candidate: Dict[str, Any]) -> tuple[int, List[str]]:
+    moneyness = str(candidate.get("moneyness") or "UNKNOWN").upper()
+    distance_pct = safe_float(candidate.get("distance_percent"), 0.0)
+    warnings: List[str] = []
+    abs_distance = abs(distance_pct)
+    if moneyness == "ATM" or abs_distance <= 1.0:
+        return 5, warnings
+    if moneyness == "OTM" and abs_distance <= 5.0:
+        return 4, warnings
+    if moneyness == "ITM" and abs_distance <= 5.0:
+        return 3, warnings
+    if moneyness == "ITM" and abs_distance > 10.0:
+        warnings.append("Deep ITM premium-heavy flow: premium may be inflated by intrinsic value.")
+        return 1, warnings
+    if moneyness == "OTM" and abs_distance > 8.0:
+        warnings.append("Far OTM lotto-flow risk: volume can be noisy without strong confirmation.")
+        return 1, warnings
+    return 2, warnings
+
+
 def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
     context = context or {}
     config = config or {}
@@ -64,26 +84,27 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     sweep = 15 if candidate.get("is_possible_sweep") else 0
     block = 8 if candidate.get("is_possible_block") else 0
     dte = int(candidate.get("dte") or 0)
-    moneyness = str(candidate.get("moneyness") or "OTM").upper()
     price_context_score = safe_float(context.get("price_context_score") or candidate.get("price_context_score"))
+    unusualness_score = min(20, int(safe_float(candidate.get("unusualness_score") or context.get("unusualness_score"))))
 
-    premium_score = min(20, int(premium / 25000))
-    ratio_score = 0 if voi is None else min(15, int(safe_float(voi) * 5))
-    aggression_score = min(20, int(aggression))
-    sweep_score = min(15, sweep + block)
+    premium_score = min(15, int(premium / 50000))
+    ratio_score = 0 if voi is None else min(12, int(safe_float(voi) * 4))
+    aggression_score = min(18, int(aggression))
+    sweep_score = min(12, sweep + block)
     liquidity_score = 0
     if spread is not None:
         if spread <= 5:
-            liquidity_score = 10
+            liquidity_score = 8
         elif spread <= 10:
-            liquidity_score = 7
+            liquidity_score = 5
         elif spread <= 15:
-            liquidity_score = 4
+            liquidity_score = 3
     urgency_score = 5 if dte <= 1 else 3 if dte <= 7 else 0
-    moneyness_score = 5 if moneyness in {"ATM", "ITM"} else 2
+    moneyness_score, moneyness_warnings = _moneyness_quality(candidate)
     context_score = min(10, int(price_context_score))
 
     components = {
+        "historical_unusualness": unusualness_score,
         "premium_size": premium_score,
         "volume_oi_ratio": ratio_score,
         "trade_quote_aggression": aggression_score,
@@ -95,9 +116,15 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     }
     total = max(0, min(100, sum(components.values())))
     reasons: List[str] = []
-    if premium_score >= 12:
+    warnings: List[str] = list(moneyness_warnings)
+    unusualness_label = candidate.get("unusualness_label") or context.get("unusualness_label")
+    if unusualness_score >= 13:
+        reasons.append(f"Flow is historically unusual versus local baseline ({unusualness_label}).")
+    elif unusualness_score <= 4:
+        warnings.append("Unusualness is not yet confirmed versus historical baseline.")
+    if premium_score >= 10:
         reasons.append(f"Large estimated premium near ${premium:,.0f}.")
-    if ratio_score >= 10:
+    if ratio_score >= 8:
         reasons.append(f"Volume/OI ratio is elevated at {safe_float(voi):.2f}x.")
     if aggression_score >= 12:
         reasons.append("Activity appears aggressive versus bid/ask context.")
@@ -105,10 +132,13 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
         reasons.append("Possible sweep-like repeated activity detected.")
     if block:
         reasons.append("Possible block-like premium concentration detected.")
-    if liquidity_score <= 4:
-        reasons.append("Spread/liquidity quality is a risk.")
+    if liquidity_score <= 3:
+        warnings.append("Spread/liquidity quality is a risk.")
     if context_score >= 7:
         reasons.append("Underlying price action provides some confirmation.")
+    if candidate.get("possible_multileg"):
+        warnings.append("Possible multi-leg structure reduces directional clarity.")
+        total = max(0, total - 5)
     if not reasons:
         reasons.append("Flow is measurable but lacks strong confirming evidence.")
 
@@ -118,4 +148,5 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
         "classification": classify_score(total),
         "reason_summary": " ".join(reasons[:2]),
         "detailed_reasons": reasons,
+        "score_warnings": warnings,
     }
