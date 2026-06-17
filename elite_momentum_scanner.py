@@ -171,13 +171,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_price": 1000.0,
         "min_day_volume": 100000,
     },
+    "enable_options_whale_scanner": True,
+    "enable_legacy_momentum_scanner": False,
     "alert_rules": {
-        "fast_move": True,
-        "high_relative_volume": True,
-        "premarket_high_break": True,
-        "premarket_low_break": True,
-        "opening_range_break": True,
-        "news_catalyst": True,
+        "fast_move": False,
+        "high_relative_volume": False,
+        "premarket_high_break": False,
+        "premarket_low_break": False,
+        "opening_range_break": False,
+        "news_catalyst": False,
     },
     "discord": {
         "enabled": True,
@@ -189,7 +191,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "messages_enabled": True,
         "messages_watch_enabled": True,
         "telegram_enabled": False,
-        "telegram_alert_types": ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
+        "telegram_alert_types": ["OPTIONS_WHALE_FLOW", "PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
         "telegram_aapl_only": True,
         "telegram_send_test_on_start": False,
         "telegram_timeout_seconds": 8,
@@ -417,6 +419,29 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "stock_feed": "sip",
         "api_rate_limit_mode": "Algo Trader Plus expected",
         "websocket_symbol_limit": "paid/unlimited expected",
+    },
+    "options_whale_scanner": {
+        "enabled": True,
+        "legacy_momentum_enabled": False,
+        "full_market": True,
+        "max_dte": 7,
+        "include_0dte": True,
+        "include_weeklies": True,
+        "min_score": 75,
+        "min_premium": 100000,
+        "min_volume": 500,
+        "min_volume_oi_ratio": 2.0,
+        "max_spread_percent": 15,
+        "scan_interval_seconds": 30,
+        "max_contracts_per_scan": 10000,
+        "max_results": 100,
+        "enable_sweep_detection": True,
+        "enable_block_detection": True,
+        "enable_multileg_detection": True,
+        "enable_price_action_context": True,
+        "enable_next_day_oi_review": True,
+        "enable_notifications": True,
+        "notify_tier_2": False,
     },
     "alert_quality": {
         "sms_min_grade": "B",
@@ -650,7 +675,11 @@ def telegram_destination_metadata(chat_id: Optional[str] = None) -> Dict[str, st
 def resolve_active_alert_types(config: Optional[Dict[str, Any]] = None) -> List[str]:
     # These are the scanner's supported user-facing alert paths. Telegram route
     # selection remains separately configurable and is not changed here.
-    return ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"]
+    config = config or {}
+    alert_types = ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"]
+    if config.get("enable_options_whale_scanner", True):
+        alert_types.insert(0, "OPTIONS_WHALE_FLOW")
+    return alert_types
 
 
 def scanner_identity(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -7632,6 +7661,72 @@ def env_float(name: str, default: float) -> float:
 
 
 def apply_strategy_env_config(config: Dict[str, Any]) -> None:
+    config["enable_options_whale_scanner"] = env_bool(
+        "ENABLE_OPTIONS_WHALE_SCANNER",
+        bool(config.get("enable_options_whale_scanner", True)),
+    )
+    config["enable_legacy_momentum_scanner"] = env_bool(
+        "ENABLE_LEGACY_MOMENTUM_SCANNER",
+        bool(config.get("enable_legacy_momentum_scanner", False)),
+    )
+    whale = config.setdefault("options_whale_scanner", {})
+    whale["enabled"] = env_bool("ENABLE_OPTIONS_WHALE_SCANNER", bool(whale.get("enabled", True)))
+    whale["legacy_momentum_enabled"] = env_bool(
+        "ENABLE_LEGACY_MOMENTUM_SCANNER",
+        bool(whale.get("legacy_momentum_enabled", False)),
+    )
+    whale["full_market"] = env_bool("OPTIONS_WHALE_FULL_MARKET", bool(whale.get("full_market", True)))
+    whale["max_dte"] = env_int("OPTIONS_WHALE_MAX_DTE", int(whale.get("max_dte", 7)))
+    whale["include_0dte"] = env_bool("OPTIONS_WHALE_INCLUDE_0DTE", bool(whale.get("include_0dte", True)))
+    whale["include_weeklies"] = env_bool("OPTIONS_WHALE_INCLUDE_WEEKLIES", bool(whale.get("include_weeklies", True)))
+    whale["min_score"] = env_int("OPTIONS_WHALE_MIN_SCORE", int(whale.get("min_score", 75)))
+    whale["min_premium"] = env_float("OPTIONS_WHALE_MIN_PREMIUM", float(whale.get("min_premium", 100000)))
+    whale["min_volume"] = env_int("OPTIONS_WHALE_MIN_VOLUME", int(whale.get("min_volume", 500)))
+    whale["min_volume_oi_ratio"] = env_float(
+        "OPTIONS_WHALE_MIN_VOLUME_OI_RATIO",
+        float(whale.get("min_volume_oi_ratio", 2.0)),
+    )
+    whale["max_spread_percent"] = env_float(
+        "OPTIONS_WHALE_MAX_SPREAD_PERCENT",
+        float(whale.get("max_spread_percent", 15)),
+    )
+    whale["scan_interval_seconds"] = env_int(
+        "OPTIONS_WHALE_SCAN_INTERVAL_SECONDS",
+        int(whale.get("scan_interval_seconds", 30)),
+    )
+    whale["max_contracts_per_scan"] = env_int(
+        "OPTIONS_WHALE_MAX_CONTRACTS_PER_SCAN",
+        int(whale.get("max_contracts_per_scan", 10000)),
+    )
+    whale["max_results"] = env_int("OPTIONS_WHALE_MAX_RESULTS", int(whale.get("max_results", 100)))
+    whale["enable_sweep_detection"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_SWEEP_DETECTION",
+        bool(whale.get("enable_sweep_detection", True)),
+    )
+    whale["enable_block_detection"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_BLOCK_DETECTION",
+        bool(whale.get("enable_block_detection", True)),
+    )
+    whale["enable_multileg_detection"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_MULTI_LEG_DETECTION",
+        bool(whale.get("enable_multileg_detection", True)),
+    )
+    whale["enable_price_action_context"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_PRICE_ACTION_CONTEXT",
+        bool(whale.get("enable_price_action_context", True)),
+    )
+    whale["enable_next_day_oi_review"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_NEXT_DAY_OI_REVIEW",
+        bool(whale.get("enable_next_day_oi_review", True)),
+    )
+    whale["enable_notifications"] = env_bool(
+        "OPTIONS_WHALE_ENABLE_NOTIFICATIONS",
+        bool(whale.get("enable_notifications", True)),
+    )
+    if not config["enable_legacy_momentum_scanner"]:
+        for key in config.setdefault("alert_rules", {}):
+            config["alert_rules"][key] = False
+
     raw_alert_symbols = os.getenv("ALERT_SYMBOLS")
     if raw_alert_symbols is not None:
         symbols = [part.strip().upper() for part in raw_alert_symbols.split(",") if part.strip()]
@@ -7650,6 +7745,14 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
             for part in raw_telegram_alert_types.split(",")
             if part.strip()
         ]
+    if config.get("enable_options_whale_scanner", True):
+        alert_types = {
+            str(value).strip().upper()
+            for value in notifications.get("telegram_alert_types", [])
+            if str(value).strip()
+        }
+        alert_types.add("OPTIONS_WHALE_FLOW")
+        notifications["telegram_alert_types"] = sorted(alert_types)
     notifications["telegram_aapl_only"] = env_bool(
         "TELEGRAM_AAPL_ONLY",
         bool(notifications.get("telegram_aapl_only", True)),

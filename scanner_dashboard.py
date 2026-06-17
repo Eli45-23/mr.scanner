@@ -22,6 +22,9 @@ from zoneinfo import ZoneInfo
 
 import elite_momentum_scanner as scanner_app
 import requests
+from scanner.options_data_client import OptionsDataClient
+from scanner.options_whale_scanner import OptionsWhaleScanner
+from scanner.options_whale_storage import OptionsWhaleStorage
 from tools import dashboard_snapshot_exporter as snapshot_exporter
 from tools.preview_liquidity_sweeps import (
     build_liquidity_sweep_preview,
@@ -367,6 +370,8 @@ class DashboardState:
         self.liquidity_sweep_live: Optional[Dict[str, Any]] = None
         self.liquidity_sweep_engine_live: Optional[Dict[str, Any]] = None
         self.liquidity_sweep_updated_monotonic = 0.0
+        self.options_whale_scanner: Optional[OptionsWhaleScanner] = None
+        self.options_whale_filters: Optional[Dict[str, Any]] = None
 
     def snapshot(self) -> Dict[str, Any]:
         config = scanner_app.load_config(self.config_path)
@@ -412,10 +417,153 @@ class DashboardState:
                 "scanner_identity": scanner_identity,
                 "market_structure": market_structure,
                 "liquidity_sweeps": liquidity_sweeps,
+                "product_name": "Options Whale Scanner" if config.get("enable_options_whale_scanner", True) else "Elite Momentum Scanner",
+                "legacy_momentum_enabled": bool(config.get("enable_legacy_momentum_scanner", False)),
             }
 
 
 STATE = DashboardState()
+
+
+def make_options_whale_scanner(config: Optional[Dict[str, Any]] = None) -> OptionsWhaleScanner:
+    scanner_app.load_dotenv()
+    config = config or scanner_app.load_config(STATE.config_path)
+    if STATE.options_whale_filters:
+        config = json.loads(json.dumps(config))
+        config.setdefault("options_whale_scanner", {}).update(STATE.options_whale_filters)
+    client = OptionsDataClient(
+        stock_feed=str(config.get("market_data", {}).get("stock_feed", "sip")),
+        options_feed=str(config.get("options", {}).get("feed", "opra")),
+        allow_indicative_fallback=bool(config.get("options", {}).get("allow_indicative_fallback", True)),
+    )
+    storage = OptionsWhaleStorage(APP_DIR)
+    return OptionsWhaleScanner(config, client, storage, root=APP_DIR)
+
+
+def options_whale_scanner() -> OptionsWhaleScanner:
+    with STATE.lock:
+        if STATE.options_whale_scanner is None:
+            STATE.options_whale_scanner = make_options_whale_scanner()
+        return STATE.options_whale_scanner
+
+
+def options_whales_status() -> Dict[str, Any]:
+    try:
+        return options_whale_scanner().status()
+    except Exception as exc:
+        return {
+            "scanner_name": "Options Whale Scanner",
+            "enabled": False,
+            "alpaca_connected": False,
+            "options_contracts_available": False,
+            "options_snapshots_available": False,
+            "options_quotes_available": False,
+            "options_trades_available": False,
+            "options_bars_available": False,
+            "official_options_feed_available": False,
+            "last_error": str(exc),
+            "data_plan_warning": "Alpaca options data unavailable or not enabled for this account.",
+        }
+
+
+def options_whales_scan() -> Dict[str, Any]:
+    scanner = options_whale_scanner()
+    result = scanner.scan()
+    send_options_whale_notifications(result)
+    with STATE.lock:
+        STATE.last_scan_at = iso_now()
+    return result
+
+
+def send_options_whale_notifications(scan_result: Dict[str, Any]) -> None:
+    config = scanner_app.load_config(STATE.config_path)
+    whale = config.get("options_whale_scanner", {})
+    notifications = config.get("notifications", {})
+    if not whale.get("enable_notifications", True) or not notifications.get("telegram_enabled", False):
+        return
+    active = {str(item).strip().upper() for item in notifications.get("telegram_alert_types", [])}
+    if "OPTIONS_WHALE_FLOW" not in active:
+        return
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    timeout = int(notifications.get("telegram_timeout_seconds", 8))
+    for item in scan_result.get("results", []):
+        if not item.get("should_notify"):
+            continue
+        candidate = item.get("candidate") or {}
+        message = str(item.get("message_preview") or "")
+        if "Possible whale flow — not a trade signal." not in message:
+            continue
+        scanner_app.send_telegram_message(
+            token=token,
+            chat_id=chat_id,
+            message=message,
+            timeout_seconds=timeout,
+            alert_type="OPTIONS_WHALE_FLOW",
+            alert_source="options_whale_scanner",
+            symbol=str(candidate.get("underlying_symbol") or "UNKNOWN"),
+            sms_sent=False,
+            alert_tier=str(item.get("alert_tier") or ""),
+            alert_tier_reason=str(item.get("notify_reason") or ""),
+            message_source_path="scanner/options_whale_scanner.py",
+            phone_conclusion=str(item.get("classification") or "POSSIBLE WHALE FLOW"),
+            phone_conclusion_reason=str(item.get("reason_summary") or ""),
+            no_trade_reason="Possible whale flow — not a trade signal.",
+        )
+
+
+def options_whales_latest() -> Dict[str, Any]:
+    return options_whale_scanner().latest()
+
+
+def options_whales_history(limit: int = 100) -> Dict[str, Any]:
+    return options_whale_scanner().history(limit=limit)
+
+
+def options_whales_filters() -> Dict[str, Any]:
+    config = scanner_app.load_config(STATE.config_path)
+    filters = dict(config.get("options_whale_scanner", {}))
+    if STATE.options_whale_filters:
+        filters.update(STATE.options_whale_filters)
+    return {"filters": filters}
+
+
+def update_options_whales_filters(body: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {
+        "max_dte", "include_0dte", "include_weeklies", "min_score", "min_premium",
+        "min_volume", "min_volume_oi_ratio", "max_spread_percent", "max_results",
+        "enable_sweep_detection", "enable_block_detection", "enable_multileg_detection",
+        "enable_price_action_context",
+    }
+    updates = {key: body[key] for key in allowed if key in body}
+    with STATE.lock:
+        STATE.options_whale_filters = {**(STATE.options_whale_filters or {}), **updates}
+        STATE.options_whale_scanner = None
+    return options_whales_filters()
+
+
+def options_whales_export_json() -> Dict[str, Any]:
+    return options_whales_history(limit=10000)
+
+
+def options_whales_export_csv() -> str:
+    records = options_whales_history(limit=10000).get("alerts", [])
+    fields = sorted({key for row in records for key in row.keys()})
+    lines: List[str] = []
+    if fields:
+        lines.append(",".join(fields))
+        for row in records:
+            values = []
+            for field in fields:
+                value = row.get(field, "")
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value, sort_keys=True)
+                text = str(value).replace('"', '""')
+                values.append(f'"{text}"')
+            lines.append(",".join(values))
+    return "\n".join(lines)
+
+
 ALPACA_HEALTH_CACHE_SECONDS = 30
 ALPACA_HEALTH_LOCK = threading.RLock()
 ALPACA_HEALTH_CACHE: Dict[str, Any] = {"result": None, "checked_monotonic": 0.0}
@@ -1945,7 +2093,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Elite Momentum Scanner</title>
+  <title>Options Whale Scanner</title>
   <style>
     :root {
       color-scheme: light;
@@ -2453,7 +2601,7 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <div class="bar">
       <div>
-        <h1>Elite Momentum Scanner</h1>
+        <h1>Options Whale Scanner</h1>
         <div class="sub" id="subtitle">Loading</div>
       </div>
       <div class="status-pill"><span class="dot" id="statusDot"></span><span id="statusText">Loading</span></div>
@@ -2521,6 +2669,13 @@ INDEX_HTML = r"""<!doctype html>
       <div class="symbols" id="symbols"></div>
     </aside>
     <div class="content">
+      <section>
+        <div class="table-head">
+          <h2>Options Whale Scanner</h2>
+          <span class="muted" id="optionsWhalesUpdated">Waiting for scan</span>
+        </div>
+        <div class="structure-body" id="optionsWhales"></div>
+      </section>
       <section>
         <div class="table-head">
           <h2>Dashboard Control Center</h2>
@@ -2592,6 +2747,8 @@ INDEX_HTML = r"""<!doctype html>
       notificationStatusDetails: document.getElementById('notificationStatusDetails'),
       dashboardControlCenter: document.getElementById('dashboardControlCenter'),
       controlCenterUpdated: document.getElementById('controlCenterUpdated'),
+      optionsWhales: document.getElementById('optionsWhales'),
+      optionsWhalesUpdated: document.getElementById('optionsWhalesUpdated'),
       clear: document.getElementById('clearBtn'),
       dot: document.getElementById('statusDot'),
       status: document.getElementById('statusText'),
@@ -3082,12 +3239,65 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
 
+    function renderOptionsWhales(status, latest) {
+      const rows = latest.results || [];
+      const scan = latest.last_scan || {};
+      els.optionsWhalesUpdated.textContent = fmtTime(scan.timestamp || status.last_scan_time);
+      const warning = status.data_plan_warning || status.last_error || '';
+      const topRows = rows.slice(0, 50).map((item) => {
+        const c = item.candidate || {};
+        return `
+          <tr>
+            <td>${esc(c.time_detected || '')}</td>
+            <td>${esc(item.alert_tier || '')}</td>
+            <td>${esc(c.underlying_symbol || '')}</td>
+            <td>${esc(c.option_type || '')}</td>
+            <td>${fmtMoney(c.strike)}</td>
+            <td>${esc(c.expiration || '')}</td>
+            <td>${c.dte ?? ''}</td>
+            <td>${esc(c.moneyness || '')}</td>
+            <td>${fmtInt(c.volume)}</td>
+            <td>${fmtInt(c.open_interest)}</td>
+            <td>${c.volume_oi_ratio ?? ''}</td>
+            <td>${fmtMoney(c.last || c.midpoint)}</td>
+            <td>${fmtNum(c.spread_percent, '%')}</td>
+            <td>${fmtMoney(c.estimated_premium)}</td>
+            <td><span class="score ${scoreClass(item.whale_score || 0)}">${item.whale_score || 0}</span></td>
+            <td>${esc(item.classification || '')}</td>
+            <td>${esc(item.direction_label || '')}</td>
+            <td>${esc(item.price_confirmation_label || '')}</td>
+            <td>${esc(item.reason_summary || '')}</td>
+          </tr>
+        `;
+      }).join('');
+      els.optionsWhales.innerHTML = `
+        <div class="structure-status">
+          <div><span class="label">Alpaca</span><div><strong>${status.alpaca_connected ? 'Connected' : 'Unavailable'}</strong></div></div>
+          <div><span class="label">Options data</span><div><strong>${status.options_snapshots_available ? 'Available' : 'Unavailable'}</strong></div></div>
+          <div><span class="label">Official feed</span><div><strong>${status.official_options_feed_available ? 'OPRA available' : 'Check OPRA'}</strong></div></div>
+          <div><span class="label">Universe</span><div><strong>${status.universe?.entry_count ?? 0} symbols</strong></div></div>
+          <div><span class="label">Contracts scanned</span><div><strong>${scan.contracts_scanned ?? 0}</strong></div></div>
+          <div><span class="label">Candidates</span><div><strong>${scan.candidates_found ?? 0}</strong></div></div>
+        </div>
+        ${warning ? `<div class="empty">${esc(warning)}</div>` : ''}
+        <div class="copy-block">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
+        <table>
+          <thead><tr>
+            <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Vol</th><th>OI</th><th>Vol/OI</th><th>Last/Mid</th><th>Spread</th><th>Premium</th><th>Score</th><th>Class</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+          </tr></thead>
+          <tbody>${topRows || '<tr><td colspan="19" class="muted">No whale-flow candidates yet.</td></tr>'}</tbody>
+        </table>
+      `;
+    }
+
     function renderStatus(data) {
       els.mode.value = data.mode || 'live';
       els.scope.value = data.scope || 'watchlist';
       els.dot.className = `dot ${data.last_error ? 'err' : data.running ? 'on' : ''}`;
       els.status.textContent = data.last_error ? 'Needs Attention' : data.running ? 'Running' : 'Stopped';
-      els.subtitle.textContent = `${(data.symbols || []).length} watchlist symbols | ${data.mode || 'live'} mode | ${data.scope || 'watchlist'} scope`;
+      els.subtitle.textContent = data.product_name === 'Options Whale Scanner'
+        ? `Full-market options flow | legacy momentum ${data.legacy_momentum_enabled ? 'enabled' : 'disabled'}`
+        : `${(data.symbols || []).length} watchlist symbols | ${data.mode || 'live'} mode | ${data.scope || 'watchlist'} scope`;
       els.scanCount.textContent = data.scan_count || 0;
       els.lastAlerts.textContent = data.last_alert_count || 0;
       els.symbolCount.textContent = data.last_symbol_count || 0;
@@ -3469,8 +3679,17 @@ INDEX_HTML = r"""<!doctype html>
 
     async function refresh() {
       try {
-        const [status, alerts, symbols, brain, controlCenter] = await Promise.all([api('/api/status'), api('/api/alerts'), api('/api/symbols'), api('/api/alert-brain'), api('/api/control-center')]);
+        const [status, alerts, symbols, brain, controlCenter, whaleStatus, whaleLatest] = await Promise.all([
+          api('/api/status'),
+          api('/api/alerts'),
+          api('/api/symbols'),
+          api('/api/alert-brain'),
+          api('/api/control-center'),
+          api('/api/options-whales/status'),
+          api('/api/options-whales/latest')
+        ]);
         renderStatus(status);
+        renderOptionsWhales(whaleStatus, whaleLatest);
         renderMarket(symbols.symbols || []);
         renderAlerts(alerts.alerts || []);
         renderAlertDecisionBrain(brain);
@@ -3548,6 +3767,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def send_csv(self, text: str) -> None:
+        payload = text.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", "attachment; filename=options_whale_history.csv")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def handle_error(self, exc: Exception) -> None:
         logger.exception("Request failed: %s", exc)
         self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -3570,6 +3798,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(load_alert_brain())
             elif parsed.path == "/api/control-center":
                 self.send_json(load_dashboard_control_center())
+            elif parsed.path == "/api/options-whales/status":
+                self.send_json(options_whales_status())
+            elif parsed.path == "/api/options-whales/scan":
+                self.send_json(options_whales_scan())
+            elif parsed.path == "/api/options-whales/latest":
+                self.send_json(options_whales_latest())
+            elif parsed.path == "/api/options-whales/history":
+                limit = int(parse_qs(parsed.query).get("limit", ["100"])[0])
+                self.send_json(options_whales_history(limit=limit))
+            elif parsed.path == "/api/options-whales/filters":
+                self.send_json(options_whales_filters())
+            elif parsed.path == "/api/options-whales/universe/status":
+                self.send_json(options_whale_scanner().universe_status())
+            elif parsed.path == "/api/options-whales/export.json":
+                self.send_json(options_whales_export_json())
+            elif parsed.path == "/api/options-whales/export.csv":
+                self.send_csv(options_whales_export_csv())
             elif parsed.path == "/api/alpaca-health":
                 force_refresh = parse_qs(parsed.query).get("force_refresh", ["false"])[0].lower() == "true"
                 self.send_json(alpaca_health_check(force_refresh=force_refresh))
@@ -3593,6 +3838,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(stop_scanner())
             elif parsed.path == "/api/scan-once":
                 self.send_json(run_once(mode, scope))
+            elif parsed.path == "/api/options-whales/filters":
+                self.send_json(update_options_whales_filters(body))
+            elif parsed.path == "/api/options-whales/universe/rebuild":
+                self.send_json(options_whale_scanner().rebuild_universe())
             elif parsed.path == "/api/ai-review":
                 self.send_json(ai_review(body))
             elif parsed.path == "/api/clear":

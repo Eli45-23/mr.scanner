@@ -1,64 +1,49 @@
-# Elite Momentum Scanner
+# Options Whale Scanner
 
 For installation on another Mac, see [docs/RUN_ON_IMAC.md](docs/RUN_ON_IMAC.md).
 
-A real-time stock momentum alert system built for traders who want to catch **unusual movement early** without auto-trading.
+A read-only full-market options-flow scanner. It discovers optionable contracts from Alpaca, scans contracts across the market, scores unusual options activity, and ranks possible whale flow.
+
+Every result includes:
+
+> Possible whale flow — not a trade signal.
 
 ## What it detects
-- Premarket movers
-- Fast price jumps
-- Relative volume spikes
-- Premarket high / low breaks
-- Opening range breakouts and breakdowns
-- Big day movers with news catalysts
+- Full-market unusual call/put activity
+- Large premium contracts
+- High volume relative to open interest
+- Possible sweep-like activity
+- Possible block prints
+- Possible multi-leg/spread/roll/hedge structures
+- Opening-vs-closing estimates that require next-day OI review
+- Underlying price-action context when available
 
-## Strategy and confirmation logic
-Phase 1 classifies alert setups so the scanner can describe what is forming:
-- Clean breakout / breakdown
-- Liquidity sweep reclaim / rejection
-- VWAP reclaim / rejection / loss / hold
-- 5-minute and 15-minute opening range breakouts / breakdowns
-- Fakeout risk and do-not-chase conditions
+## What tiers mean
+- `Tier 1`: highest-quality possible whale-flow read with aggressive activity, large premium, acceptable spread, and price context.
+- `Tier 2`: high-scoring flow with some confirmation or minor warnings.
+- `Tier 3`: unusual but unclear; dashboard/history only by default.
+- `Ignore`: below threshold or too low quality.
 
-Phase 2 adds confirmation and entry-quality context beside the existing legacy alert grade (`A+`, `A`, `B`, `C`, `Avoid`):
-- Volume quality / RVOL: labels weak, normal, strong, or climax volume and warns on low-volume fakeout risk.
-- Candle strength: detects buyer control, seller control, rejection wicks, and high-volume indecision/churn.
-- Retest / hold logic: detects breakout retest holding, breakdown retest rejecting, VWAP retest behavior, better entry areas, and late-entry risk.
-- Extension / exhaustion: checks distance from VWAP, EMA9, and key levels, plus consecutive large candles and climax volume.
-- Relative strength / weakness: compares watched stocks against SPY and QQQ when those bars are available.
-- Market regime: classifies SPY/QQQ context as bull trend, bear trend, choppy, mixed, or unknown.
-- Optional pressure score: when trade/quote data is explicitly supplied and enabled, estimates top-of-book buyer/seller pressure from latest trades, bid/ask, bid size, ask size, spread, and large prints.
+Unusual options flow is not predictive by itself. Large prints may be spreads, hedges, rolls, closing transactions, or noisy data. The scanner uses probabilistic language only.
 
-The final alert can show both the old grade and the newer strategy/confirmation fields:
-- Primary setup and secondary setups
-- Strategy confidence
-- Confirmation score and label
-- Entry quality
-- Risk label
-- Volume, candle, relative strength, market regime, and optional pressure labels
-
-These layers are alert intelligence only. They do not submit orders, select contracts for execution, close positions, cancel orders, or auto buy/sell.
-
-### Alpaca data limitations
-The scanner can use bars, snapshots, latest trades, and top-of-book quotes where those are available from the configured Alpaca data path. The optional pressure score is not full Level 2 order book analysis. It does not detect hidden institutional orders, dark-pool intent, iceberg orders, or any unavailable market-depth signal. If trade/quote pressure data is missing, pressure remains `UNKNOWN` and should not be treated as confirmation.
-
-## What it sends
-- Discord alerts with:
-  - ticker
-  - price
-  - fast move %
-  - day move %
-  - relative volume
-  - premarket levels
-  - opening range levels
-  - headline + news link when available
+## Data requirements and limitations
+The scanner uses Alpaca market-data endpoints for option contracts, snapshots, quotes, trades, and stock bars when available. OPRA is the official options feed. Indicative data is fallback/limited data and is displayed with warnings. If an endpoint or entitlement is unavailable, the dashboard shows a clear warning and keeps running.
 
 ## What it does not do
 - No trade execution
-- No buy/sell automation
+- No broker order endpoints
+- No auto-trading automation
 - No account access
 
-The separate `paper_trade_cli.py` helper can be used for Alpaca paper-trading experiments, but it is not part of the scanner loop and does not change scanner alerts.
+## Legacy momentum scanner
+The old stock momentum scanner is disabled by default with:
+
+```bash
+ENABLE_OPTIONS_WHALE_SCANNER=true
+ENABLE_LEGACY_MOMENTUM_SCANNER=false
+```
+
+Legacy paper-trading helper files remain in the repo only as deprecated historical tooling. They are not part of the Options Whale Scanner workflow.
 
 ## Setup
 
@@ -148,39 +133,23 @@ python elite_momentum_scanner.py --test-desktop-notification
 
 ### 4. Dry-run test
 ```bash
-python elite_momentum_scanner.py --mode test
-python elite_momentum_scanner.py --mode dry-run
+python tools/test_options_access.py
+python tools/rebuild_options_universe.py
+python tools/run_options_whale_scan.py
 ```
 
-### 5. Live mode
-```bash
-python elite_momentum_scanner.py --mode live
-```
-
-### 6. Browser dashboard
+### 5. Dashboard
 ```bash
 python scanner_dashboard.py --open
 ```
 
-The dashboard can scan three scopes:
-- `Watchlist`: only the configured symbols.
-- `Discovery`: broad-market candidates selected from active Alpaca symbols.
-- `Hybrid`: configured watchlist plus top discovery candidates.
+### 6. Export whale-flow history
+```bash
+python tools/export_options_whale_history.py --format json
+python tools/export_options_whale_history.py --format csv
+```
 
-The Market View labels each row with data quality:
-- `Fresh`: current enough to score and alert.
-- `Stale`: latest bar is older than the configured freshness window.
-- `Incomplete`: not enough recent 1-minute bars for reliable calculations.
-- `Low volume`: below the minimum volume filter.
-
-`Recent RVOL` compares the latest 1-minute bar volume to recent 1-minute bars in the current scan window. It is not historical same-time-of-day RVOL.
-
-The dashboard also includes an options view for day-trade calls and puts:
-- `Best Call` and `Best Put` show the selected contract for each ticker.
-- `Option Quality` is `Tradable`, `Wide spread`, `Low liquidity`, `Stale quote`, or `No clean contract`.
-- `Opt Score` ranks contract quality using bid/ask spread, quote freshness, liquidity, delta fit, and 0DTE preference.
-- The feed badge is `OPRA`, `Indicative`, or `Simulated`; treat `Indicative` as non-execution-grade because it is not the official OPRA quote feed.
-- Dry-run option contracts are simulated and labeled as simulated data.
+The dashboard defaults to full-market options whale flow. It does not require a watchlist or symbol parameter.
 
 The dashboard `Clear` button stops any running scan and resets visible Market View rows, alert history, counters, and alert cooldown state. It does not remove your API keys or scanner configuration.
 
@@ -195,84 +164,9 @@ alpaca account get --quiet
 
 If `ALPACA_LIVE_TRADE=true` is set, the dashboard will warn that Alpaca CLI calls appear pointed at live trading. Treat that as a high-caution configuration signal even though the health check is read-only.
 
-### Alpaca CLI paper-trading lab
+### Deprecated legacy paper tooling
 
-`paper_trade_cli.py` is a separate paper-only helper for learning and testing Alpaca CLI order flow. It defaults to dry-run order previews and refuses to run when `ALPACA_LIVE_TRADE=true`.
-
-`ai_paper_trade_lab.py` is an AI-assisted paper-trading lab. It can prepare only three actions: `PAPER_ORDER`, `CLOSE_POSITION`, or `NO_TRADE`. It requires AI confidence to be exactly `100` before execution is allowed, and it still requires `--execute-paper --confirm PAPER`.
-
-`spy_paper_autotrader.py` is the SPY-only paper autotrader. It reads scanner alerts and can open or close SPY paper positions only when hard 100-confidence rules pass. Its default instrument is SPY options: bullish signals buy the scanner-selected SPY call, bearish signals buy the scanner-selected SPY put, and opposite signals close the open SPY option paper position.
-
-Health check:
-```bash
-python paper_trade_cli.py health
-```
-
-Preview a paper order request without submitting:
-```bash
-python paper_trade_cli.py preview-order --symbol AAPL --side buy --type market --qty 1
-```
-
-Submit a paper order only with an explicit confirmation:
-```bash
-python paper_trade_cli.py submit-paper-order --symbol AAPL --side buy --type market --qty 1 --execute-paper --confirm PAPER
-```
-
-List paper orders:
-```bash
-python paper_trade_cli.py list-orders
-```
-
-Ask AI for a paper-trading action:
-```bash
-python ai_paper_trade_lab.py plan --notional 100
-```
-
-Execute the stored AI paper plan only if it passed the 100-confidence gate:
-```bash
-python ai_paper_trade_lab.py execute --execute-paper --confirm PAPER
-```
-
-Check what the SPY-only paper autotrader would do:
-```bash
-python spy_paper_autotrader.py once
-```
-
-Let the SPY-only bot execute one SPY option paper action by itself:
-```bash
-python spy_paper_autotrader.py --execute-paper --confirm PAPER once
-```
-
-Run the SPY-only options paper bot continuously:
-```bash
-python spy_paper_autotrader.py --execute-paper --confirm PAPER loop --interval-seconds 10
-```
-
-Run the bot in SPY stock-paper mode instead of options:
-```bash
-python spy_paper_autotrader.py --instrument stock --execute-paper --confirm PAPER loop --interval-seconds 10
-```
-
-By default, SPY bearish signals do not open paper shorts. To allow paper shorts:
-```bash
-python spy_paper_autotrader.py --instrument stock --allow-paper-shorts --execute-paper --confirm PAPER loop --interval-seconds 10
-```
-
-Close a paper position manually:
-```bash
-python paper_trade_cli.py close-position --symbol AAPL --execute-paper --confirm PAPER
-```
-
-Safety notes:
-- This helper uses the Alpaca CLI profile, not scanner API env vars.
-- It strips scanner Alpaca API env vars before calling the CLI so the CLI profile stays in control.
-- It blocks obvious live mode via `ALPACA_LIVE_TRADE=true`.
-- It limits symbols to the scanner watchlist unless `--allow-non-watchlist` is supplied.
-- It logs paper order attempts to `logs/paper_trade_cli.jsonl`.
-- It is for paper trading practice only and is not financial advice.
-- The AI lab refuses execution unless the AI plan confidence is exactly `100`; this is a safety gate, not a real guarantee that a trade will work.
-- The SPY paper autotrader is SPY-only and uses hard scanner gates: fresh full alert, A+ grade, score >= 90, aligned market, scanner-selected SPY option contract present, tradable option context, spread <= 5%, RVOL >= 2.0x, no stale/extended/opposing/cooldown blocker, and fast/day direction agreement.
-- In options mode it only buys options to open; it does not sell options to open.
+Older paper-trading helper files remain in the repository for history only. They are quarantined from the Options Whale Scanner workflow and are not part of the default dashboard, scanner loop, alerts, or docs workflow.
 
 The `AI Review` button is also diagnostic only. It sends a compact snapshot of current scanner rows and recent alerts to OpenAI for a structured timing/direction review. Results are cached briefly to avoid repeated API calls from button clicks. The live scanner still uses its Python Alpaca rule engine for all watch and alert decisions, and the AI review cannot trigger texts or trades.
 
@@ -280,9 +174,10 @@ The AI Review response is displayed as a structured card with timing, direction 
 
 ## Your workflow
 This tool is intended to do this:
-1. alert you to unusual movement
-2. send context quickly
-3. let **you** check the chart and decide whether to trade
+1. surface unusual options flow
+2. explain why the flow may matter
+3. show risk and uncertainty
+4. require your own chart confirmation
 
 ## Files generated
 - `logs/alerts.csv`
