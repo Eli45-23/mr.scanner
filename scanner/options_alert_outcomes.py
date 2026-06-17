@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
+
+
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+REGULAR_MARKET_CLOSE = datetime_time(16, 0)
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -36,6 +41,12 @@ def _bar_close(bar: Dict[str, Any]) -> Optional[float]:
 
 def _candidate(alert: Dict[str, Any]) -> Dict[str, Any]:
     return alert.get("candidate") if isinstance(alert.get("candidate"), dict) else alert
+
+
+def _regular_close_for(timestamp: datetime) -> datetime:
+    local = timestamp.astimezone(MARKET_TIMEZONE)
+    close_local = datetime.combine(local.date(), REGULAR_MARKET_CLOSE, tzinfo=MARKET_TIMEZONE)
+    return close_local.astimezone(timezone.utc)
 
 
 def infer_flow_bias_details(alert: Dict[str, Any]) -> Dict[str, str]:
@@ -125,13 +136,21 @@ def evaluate_alert_outcome(
             **bias_details,
             "base_price": base_price,
             "windows": [],
+            "completed_window_count": 0,
+            "pending_window_count": 0,
+            "insufficient_window_count": 0,
+            "market_close_time": None,
             "max_favorable_move_pct": None,
             "max_adverse_move_pct": None,
         }
 
+    market_close = _regular_close_for(detected_at)
     outcomes: List[OutcomeWindow] = []
     for minutes in windows:
         target = detected_at.replace(microsecond=0) + timedelta(minutes=int(minutes))
+        if target > market_close:
+            outcomes.append(OutcomeWindow(int(minutes), None, None, None, "insufficient_future_session"))
+            continue
         bar = _first_bar_at_or_after(bars, target)
         close = _bar_close(bar or {})
         if close is None:
@@ -146,14 +165,18 @@ def evaluate_alert_outcome(
         outcomes.append(OutcomeWindow(int(minutes), round(close, 4), move_pct, favorable, "ok"))
 
     completed_windows = [item for item in outcomes if item.status == "ok" and item.move_pct is not None]
+    pending_windows = [item for item in outcomes if item.status == "missing_bar"]
+    insufficient_windows = [item for item in outcomes if item.status == "insufficient_future_session"]
     if not outcomes:
         outcome_status = "no_windows"
-    elif not completed_windows:
-        outcome_status = "pending"
-    elif len(completed_windows) < len(outcomes):
-        outcome_status = "partial"
-    else:
+    elif completed_windows and not pending_windows and not insufficient_windows:
         outcome_status = "ok"
+    elif completed_windows:
+        outcome_status = "partial"
+    elif insufficient_windows and not pending_windows:
+        outcome_status = "insufficient_future_session"
+    else:
+        outcome_status = "pending"
 
     favorable_moves: List[float] = []
     adverse_moves: List[float] = []
@@ -173,7 +196,9 @@ def evaluate_alert_outcome(
         "base_price": round(base_price, 4),
         "windows": [item.to_dict() for item in outcomes],
         "completed_window_count": len(completed_windows),
-        "pending_window_count": len(outcomes) - len(completed_windows),
+        "pending_window_count": len(pending_windows),
+        "insufficient_window_count": len(insufficient_windows),
+        "market_close_time": market_close.isoformat(),
         "max_favorable_move_pct": round(max(favorable_moves), 4) if favorable_moves else None,
         "max_adverse_move_pct": round(min(adverse_moves), 4) if adverse_moves else None,
     }
@@ -183,11 +208,13 @@ def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     rows = list(outcomes)
     finished = [row for row in rows if row.get("outcome_status") in {"ok", "partial"}]
     pending = [row for row in rows if row.get("outcome_status") == "pending"]
+    insufficient = [row for row in rows if row.get("outcome_status") == "insufficient_future_session"]
     if not finished:
         return {
             "count": len(rows),
             "completed": 0,
             "pending": len(pending),
+            "insufficient_future_session": len(insufficient),
             "favorable_rate": None,
             "average_max_favorable_move_pct": None,
         }
@@ -204,6 +231,7 @@ def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "count": len(rows),
         "completed": len(finished),
         "pending": len(pending),
+        "insufficient_future_session": len(insufficient),
         "favorable_rate": round(favorable_count / len(finished), 4),
         "average_max_favorable_move_pct": round(sum(max_favorable) / len(max_favorable), 4) if max_favorable else None,
     }
