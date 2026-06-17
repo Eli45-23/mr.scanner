@@ -19,34 +19,64 @@ HTML_TEMPLATE = """
   <style>
     :root { --bg:#f5f7f8; --card:#fff; --ink:#102027; --muted:#65737e; --line:#d8e0e4; --teal:#1e7f86; }
     body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-    header { background:#0f2d35; color:#fff; padding:22px; }
-    h1 { margin:0; font-size:24px; }
-    .sub { color:#b9d4d9; margin-top:5px; }
-    main { padding:20px; display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
-    h2 { margin:0 0 8px; font-size:18px; }
+    header { background:#0f2d35; color:#fff; padding:16px 22px; position:sticky; top:0; z-index:10; }
+    h1 { margin:0; font-size:22px; }
+    .sub { color:#b9d4d9; margin-top:4px; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .tab { border:1px solid rgba(255,255,255,.22); border-radius:999px; padding:8px 10px; color:#fff; text-decoration:none; font-weight:800; background:rgba(255,255,255,.08); }
+    .tab.active { background:#fff; color:#0f2d35; }
+    main { padding:14px; display:grid; gap:14px; }
+    .frame-card { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+    .frame-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line); background:#fbfcfd; }
+    .frame-head h2 { margin:0; font-size:16px; }
+    .frame-head a { color:var(--teal); font-weight:800; text-decoration:none; }
+    iframe { width:100%; height:78vh; border:0; display:block; background:white; }
+    .outcome iframe { height:58vh; }
+    .links { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+    .link-card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
     p { color:var(--muted); line-height:1.45; }
-    a.button { display:inline-block; background:var(--teal); color:#fff; text-decoration:none; border-radius:9px; padding:10px 12px; font-weight:800; }
     code { background:#eef3f5; padding:2px 5px; border-radius:5px; }
+    .button { display:inline-block; background:var(--teal); color:#fff; text-decoration:none; border-radius:9px; padding:9px 11px; font-weight:800; }
   </style>
 </head>
 <body>
   <header>
     <h1>Options Whale Workbench</h1>
-    <div class="sub">One place to open the scanner dashboard and outcome proof engine.</div>
+    <div class="sub">One page for scanner control and outcome proof.</div>
+    <nav class="tabs">
+      <a class="tab active" href="#scanner">Scanner</a>
+      <a class="tab" href="#outcomes">Outcomes</a>
+      <a class="tab" href="#links">Open Separate Tabs</a>
+    </nav>
   </header>
   <main>
-    <section class="card">
-      <h2>Main Scanner Dashboard</h2>
-      <p>Live options whale scanner, flow rows, score components, market context, and scan controls.</p>
-      <p><code>__MAIN_URL__</code></p>
-      <a class="button" href="__MAIN_URL__" target="_blank" rel="noreferrer">Open Scanner</a>
+    <section class="frame-card scanner" id="scanner">
+      <div class="frame-head">
+        <h2>Main Scanner Dashboard</h2>
+        <a href="__MAIN_URL__" target="_blank" rel="noreferrer">Open separate tab</a>
+      </div>
+      <iframe title="Main Scanner Dashboard" src="__MAIN_URL__"></iframe>
     </section>
-    <section class="card">
-      <h2>Outcome Dashboard</h2>
-      <p>Proof engine: completed, pending, insufficient close, dirty ignored, and performance by symbol/flow bias.</p>
-      <p><code>__OUTCOME_URL__</code></p>
-      <a class="button" href="__OUTCOME_URL__" target="_blank" rel="noreferrer">Open Outcomes</a>
+    <section class="frame-card outcome" id="outcomes">
+      <div class="frame-head">
+        <h2>Outcome Dashboard</h2>
+        <a href="__OUTCOME_URL__" target="_blank" rel="noreferrer">Open separate tab</a>
+      </div>
+      <iframe title="Outcome Dashboard" src="__OUTCOME_URL__"></iframe>
+    </section>
+    <section class="links" id="links">
+      <div class="link-card">
+        <h2>Main Scanner Dashboard</h2>
+        <p>Live options whale scanner, flow rows, score components, market context, and scan controls.</p>
+        <p><code>__MAIN_URL__</code></p>
+        <a class="button" href="__MAIN_URL__" target="_blank" rel="noreferrer">Open Scanner</a>
+      </div>
+      <div class="link-card">
+        <h2>Outcome Dashboard</h2>
+        <p>Proof engine: completed, pending, insufficient close, dirty ignored, and performance by symbol/flow bias.</p>
+        <p><code>__OUTCOME_URL__</code></p>
+        <a class="button" href="__OUTCOME_URL__" target="_blank" rel="noreferrer">Open Outcomes</a>
+      </div>
     </section>
   </main>
 </body>
@@ -88,7 +118,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Open a small link page for the options whale scanner workbench.")
+    parser = argparse.ArgumentParser(description="Open a one-page options whale scanner workbench.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--main-url", default="http://127.0.0.1:8765")
