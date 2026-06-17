@@ -38,19 +38,44 @@ def _candidate(alert: Dict[str, Any]) -> Dict[str, Any]:
     return alert.get("candidate") if isinstance(alert.get("candidate"), dict) else alert
 
 
-def infer_flow_bias(alert: Dict[str, Any]) -> str:
+def infer_flow_bias_details(alert: Dict[str, Any]) -> Dict[str, str]:
     candidate = _candidate(alert)
     option_type = str(candidate.get("option_type") or "").upper()
-    direction = str(alert.get("direction_label") or candidate.get("direction_label") or "").lower()
+    direction_label = str(alert.get("direction_label") or candidate.get("direction_label") or "")
+    direction = direction_label.lower()
     if "bearish" in direction:
-        return "BEARISH"
+        return {
+            "flow_bias": "BEARISH",
+            "flow_bias_source": "direction_label",
+            "flow_bias_reason": f"Direction label says bearish: {direction_label}",
+        }
     if "bullish" in direction:
-        return "BULLISH"
+        return {
+            "flow_bias": "BULLISH",
+            "flow_bias_source": "direction_label",
+            "flow_bias_reason": f"Direction label says bullish: {direction_label}",
+        }
     if option_type == "CALL":
-        return "BULLISH"
+        return {
+            "flow_bias": "BULLISH",
+            "flow_bias_source": "option_type_fallback",
+            "flow_bias_reason": "No clear direction label, so CALL flow defaults bullish.",
+        }
     if option_type == "PUT":
-        return "BEARISH"
-    return "UNKNOWN"
+        return {
+            "flow_bias": "BEARISH",
+            "flow_bias_source": "option_type_fallback",
+            "flow_bias_reason": "No clear direction label, so PUT flow defaults bearish.",
+        }
+    return {
+        "flow_bias": "UNKNOWN",
+        "flow_bias_source": "unknown",
+        "flow_bias_reason": "No clear direction label or option type was available.",
+    }
+
+
+def infer_flow_bias(alert: Dict[str, Any]) -> str:
+    return infer_flow_bias_details(alert)["flow_bias"]
 
 
 @dataclass
@@ -92,11 +117,12 @@ def evaluate_alert_outcome(
     candidate = _candidate(alert)
     detected_at = _parse_time(alert.get("timestamp") or alert.get("time_detected") or candidate.get("time_detected"))
     base_price = _safe_float(candidate.get("underlying_price") or alert.get("underlying_price") or alert.get("price"))
-    bias = infer_flow_bias(alert)
+    bias_details = infer_flow_bias_details(alert)
+    bias = bias_details["flow_bias"]
     if detected_at is None or base_price is None or base_price <= 0:
         return {
             "outcome_status": "missing_start_context",
-            "flow_bias": bias,
+            **bias_details,
             "base_price": base_price,
             "windows": [],
             "max_favorable_move_pct": None,
@@ -143,7 +169,7 @@ def evaluate_alert_outcome(
             adverse_moves.append(-move)
     return {
         "outcome_status": outcome_status,
-        "flow_bias": bias,
+        **bias_details,
         "base_price": round(base_price, 4),
         "windows": [item.to_dict() for item in outcomes],
         "completed_window_count": len(completed_windows),
