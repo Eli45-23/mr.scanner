@@ -71,6 +71,7 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertEqual(outcome["outcome_status"], "pending")
         self.assertEqual(outcome["completed_window_count"], 0)
         self.assertEqual(outcome["pending_window_count"], 2)
+        self.assertEqual(outcome["insufficient_window_count"], 0)
 
     def test_partial_when_some_windows_are_complete(self):
         start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
@@ -83,6 +84,30 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertEqual(outcome["completed_window_count"], 1)
         self.assertEqual(outcome["pending_window_count"], 1)
 
+    def test_market_close_marks_unavailable_windows_insufficient(self):
+        start = datetime(2026, 6, 17, 19, 58, tzinfo=timezone.utc)  # 3:58 PM New York time.
+        alert = {
+            "timestamp": start.isoformat(),
+            "candidate": {"option_type": "CALL", "underlying_price": 100.0},
+        }
+        outcome = evaluate_alert_outcome(alert, self.bars(start, [100, 100.2]), windows=(5, 15, 30, 60))
+        self.assertEqual(outcome["outcome_status"], "insufficient_future_session")
+        self.assertEqual(outcome["completed_window_count"], 0)
+        self.assertEqual(outcome["pending_window_count"], 0)
+        self.assertEqual(outcome["insufficient_window_count"], 4)
+        self.assertTrue(all(item["status"] == "insufficient_future_session" for item in outcome["windows"]))
+
+    def test_market_close_can_still_return_partial_for_available_window(self):
+        start = datetime(2026, 6, 17, 19, 50, tzinfo=timezone.utc)  # 3:50 PM New York time.
+        alert = {
+            "timestamp": start.isoformat(),
+            "candidate": {"option_type": "CALL", "underlying_price": 100.0},
+        }
+        outcome = evaluate_alert_outcome(alert, self.bars(start, [100, 101, 102, 103, 104, 105, 106]), windows=(5, 15))
+        self.assertEqual(outcome["outcome_status"], "partial")
+        self.assertEqual(outcome["completed_window_count"], 1)
+        self.assertEqual(outcome["insufficient_window_count"], 1)
+
     def test_missing_context_is_safe(self):
         outcome = evaluate_alert_outcome({"candidate": {"option_type": "CALL"}}, [], windows=(5,))
         self.assertEqual(outcome["outcome_status"], "missing_start_context")
@@ -94,12 +119,14 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
             {"outcome_status": "ok", "max_favorable_move_pct": 1.2, "windows": [{"favorable": True}]},
             {"outcome_status": "partial", "max_favorable_move_pct": -0.3, "windows": [{"favorable": False}]},
             {"outcome_status": "pending", "windows": []},
+            {"outcome_status": "insufficient_future_session", "windows": []},
             {"outcome_status": "missing_start_context", "windows": []},
         ]
         summary = summarize_outcomes(rows)
-        self.assertEqual(summary["count"], 4)
+        self.assertEqual(summary["count"], 5)
         self.assertEqual(summary["completed"], 2)
         self.assertEqual(summary["pending"], 1)
+        self.assertEqual(summary["insufficient_future_session"], 1)
         self.assertEqual(summary["favorable_rate"], 0.5)
 
 
