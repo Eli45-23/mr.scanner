@@ -35,6 +35,18 @@ The scanner uses Alpaca market-data endpoints for option contracts, snapshots, q
 - No auto-trading automation
 - No account access
 
+## Whale-only dashboard
+
+The clean dashboard is now `options_whale_dashboard.py`. It only serves the Options Whale Scanner UI and only polls `/api/options-whales/*` routes. It does not load the old Market View, Watchlist, Alert Brain, Control Center, legacy alerts table, or old setup panels.
+
+Run it with:
+
+```bash
+python options_whale_dashboard.py --open
+```
+
+The old `scanner_dashboard.py` remains in the repo for compatibility while the project is being refactored, but the whale-only dashboard is the preferred dashboard for the Options Whale Scanner workflow.
+
 ## Legacy momentum scanner
 The old stock momentum scanner is disabled by default with:
 
@@ -61,74 +73,17 @@ Required for live mode:
 export ALPACA_API_KEY="your_key"
 export ALPACA_SECRET_KEY="your_secret"
 ```
+
+For read-only options contract discovery, your `.env` may need:
+
+```bash
+ALPACA_OPTIONS_CONTRACTS_BASE_URL=https://api.alpaca.markets
+ALPACA_OPTIONS_DATA_BASE_URL=https://data.alpaca.markets
+```
+
 Optional:
 ```bash
 export DISCORD_WEBHOOK_URL="your_discord_webhook"
-```
-
-Optional manual AI review:
-```bash
-export OPENAI_API_KEY="your_openai_key"
-export OPENAI_MODEL="gpt-4.1-mini"
-export ENABLE_AI_REVIEW="true"
-export AI_REVIEW_TIMEOUT_SECONDS="8"
-export AI_REVIEW_MAX_ALERTS="10"
-export AI_REVIEW_MAX_WATCHLIST_ROWS="20"
-```
-
-OpenAI is used only for manual dashboard diagnostics. It reviews current scanner rows and recent alert history to help spot timing, direction-label, missed-context, risk, or rule-tuning issues. It does not make live alert decisions, send texts, submit orders, or change the scanner loop.
-
-For reliable phone alerts, use Pushover instead of texting yourself through Apple Messages:
-```bash
-export PUSHOVER_APP_TOKEN="your_pushover_app_token"
-export PUSHOVER_USER_KEY="your_pushover_user_key"
-```
-
-You can test phone push after adding those values to `.env`:
-```bash
-python elite_momentum_scanner.py --test-phone-push
-```
-
-Telegram can be enabled as an additional notification channel. It only receives Phase 3 heads-ups or normal alerts that already passed their existing gates:
-```bash
-export ENABLE_TELEGRAM_ALERTS="false"
-export TELEGRAM_BOT_TOKEN=""
-export TELEGRAM_CHAT_ID=""
-export TELEGRAM_ALERT_TYPES="PHASE3_HEADS_UP,NORMAL_SMS"
-export TELEGRAM_AAPL_ONLY="true"
-export TELEGRAM_SEND_TEST_ON_START="false"
-export TELEGRAM_TIMEOUT_SECONDS="8"
-```
-
-The scanner can also send one protective `AAPL Morning Playbook` per weekday
-near 09:25 ET. It reuses the existing Telegram destination and summarizes
-PMH/PML/PDH/PDL/PDC, current market structure, liquidity-sweep context, and
-discipline reminders. The playbook is context-only, cannot approve trades, and
-does not change existing alert gates.
-
-```bash
-export ENABLE_MORNING_PLAYBOOK="true"
-export MORNING_PLAYBOOK_SEND_TIME_ET="09:25"
-export MORNING_PLAYBOOK_TELEGRAM_ENABLED="true"
-export MORNING_PLAYBOOK_MAX_CHARS="1200"
-```
-
-Send-once state is stored in `state/morning_playbook_state.json`. Delivery and
-failure records are written to `logs/morning_playbook.jsonl`. Both runtime
-paths are ignored by Git. Telegram failures are logged safely and do not stop
-the scanner.
-
-After messaging the bot once, find the chat ID and send a test:
-```bash
-python tools/get_telegram_chat_id.py
-python tools/send_telegram_test.py
-```
-
-The scanner sends Mac desktop notifications and Apple Messages texts for high-quality alerts. Keep the Messages thread open on your Macs if you want to see the text-alert history across computers using the same iCloud account.
-
-You can test computer alerts on the Mac running the scanner:
-```bash
-python elite_momentum_scanner.py --test-desktop-notification
 ```
 
 ### 4. Dry-run test
@@ -139,6 +94,14 @@ python tools/run_options_whale_scan.py
 ```
 
 ### 5. Dashboard
+Preferred whale-only dashboard:
+
+```bash
+python options_whale_dashboard.py --open
+```
+
+Compatibility dashboard:
+
 ```bash
 python scanner_dashboard.py --open
 ```
@@ -149,28 +112,7 @@ python tools/export_options_whale_history.py --format json
 python tools/export_options_whale_history.py --format csv
 ```
 
-The dashboard defaults to full-market options whale flow. It does not require a watchlist or symbol parameter.
-
-The dashboard `Clear` button stops any running scan and resets visible Market View rows, alert history, counters, and alert cooldown state. It does not remove your API keys or scanner configuration.
-
-The `Alpaca Health` button is diagnostic only. It uses the Alpaca CLI for manual pre-market troubleshooting checks such as account status, authentication, and the market clock; the scanner engine still uses the Python Alpaca API/WebSocket path for market data and alert decisions. The health check does not submit, cancel, close, or change orders.
-
-Manual Alpaca CLI checks:
-```bash
-alpaca doctor
-alpaca clock --quiet
-alpaca account get --quiet
-```
-
-If `ALPACA_LIVE_TRADE=true` is set, the dashboard will warn that Alpaca CLI calls appear pointed at live trading. Treat that as a high-caution configuration signal even though the health check is read-only.
-
-### Deprecated legacy paper tooling
-
-Older paper-trading helper files remain in the repository for history only. They are quarantined from the Options Whale Scanner workflow and are not part of the default dashboard, scanner loop, alerts, or docs workflow.
-
-The `AI Review` button is also diagnostic only. It sends a compact snapshot of current scanner rows and recent alerts to OpenAI for a structured timing/direction review. Results are cached briefly to avoid repeated API calls from button clicks. The live scanner still uses its Python Alpaca rule engine for all watch and alert decisions, and the AI review cannot trigger texts or trades.
-
-The AI Review response is displayed as a structured card with timing, direction label quality, missed setup, rule strictness, risk level, confidence, suggested tuning, plain-English summary, next watch item, and do-not-chase warning. If `ENABLE_AI_REVIEW=false`, the dashboard stays fully usable and the scanner keeps running without AI review.
+The scanner defaults to full-market options whale flow. It does not require a watchlist or symbol parameter.
 
 ## Your workflow
 This tool is intended to do this:
@@ -179,16 +121,18 @@ This tool is intended to do this:
 3. show risk and uncertainty
 4. require your own chart confirmation
 
-## Files generated
-- `logs/alerts.csv`
-- `logs/alerts.jsonl`
-- `state/scanner_state.json`
+## Runtime files generated
+- `logs/options_whale_alerts.jsonl`
+- `logs/options_whale_scans.jsonl`
+- `logs/options_oi_reviews.jsonl`
+- `data/options_universe.json`
+- `data/options_whale_latest.json`
+
+These runtime files should stay out of Git.
 
 ## Good next upgrades
-- SMS / email alerts
-- browser dashboard
-- options-flow provider integration
-- float / short interest filters
-- earnings calendar filter
-- sector/industry momentum grouping
-- watchlist import from CSV
+- Stronger underlying price-action confirmation
+- Better ask-side/bid-side aggression scoring
+- Next-day OI review automation
+- Historical validation of which flow types mattered
+- Cleaner sector/group filters for full-market context
