@@ -6,6 +6,21 @@ from typing import Any, Dict, Iterable, List
 from scanner.options_whale_scoring import safe_float
 
 
+def normalize_multileg_type(label: str) -> str:
+    text = str(label or "").lower()
+    if "call spread" in text or "put spread" in text:
+        return "possible_vertical"
+    if "calendar" in text:
+        return "possible_calendar"
+    if "roll" in text:
+        return "possible_roll"
+    if "straddle" in text or "strangle" in text:
+        return "possible_straddle_strangle"
+    if text in {"none", "single_leg", "single leg"}:
+        return "single_leg"
+    return "unknown"
+
+
 def detect_possible_multileg(candidates: Iterable[Dict[str, Any]], *, size_tolerance_pct: float = 20.0) -> Dict[str, Dict[str, Any]]:
     rows = [dict(c) for c in candidates if c]
     grouped: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
@@ -38,8 +53,11 @@ def detect_possible_multileg(candidates: Iterable[Dict[str, Any]], *, size_toler
                 kind, clarity = "possible related multi-leg flow", "unclear"
             output[str(row.get("option_symbol"))] = {
                 "possible_multileg": True,
-                "multileg_type": kind,
+                "multileg_type": normalize_multileg_type(kind),
+                "multileg_raw_type": kind,
+                "multileg_confidence": "MEDIUM",
                 "linked_contracts": [str(item.get("option_symbol")) for item in related],
+                "related_contracts": [str(item.get("option_symbol")) for item in related],
                 "direction_clarity": clarity,
                 "multileg_warning": "Possible multi-leg, spread, roll, or hedge; directional read is less certain.",
             }
@@ -49,8 +67,11 @@ def detect_possible_multileg(candidates: Iterable[Dict[str, Any]], *, size_toler
 def default_multileg_result() -> Dict[str, Any]:
     return {
         "possible_multileg": False,
-        "multileg_type": "none",
+        "multileg_type": "single_leg",
+        "multileg_raw_type": "none",
+        "multileg_confidence": "LOW",
         "linked_contracts": [],
+        "related_contracts": [],
         "direction_clarity": "clear",
         "multileg_warning": "",
     }

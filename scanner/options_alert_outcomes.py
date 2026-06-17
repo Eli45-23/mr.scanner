@@ -206,7 +206,22 @@ def evaluate_alert_outcome(
 
 def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     rows = list(outcomes)
-    finished = [row for row in rows if row.get("outcome_status") in {"ok", "partial"}]
+    def clean_completed(row: Dict[str, Any]) -> bool:
+        if row.get("outcome_status") not in {"ok", "partial", "completed"}:
+            return False
+        windows = row.get("windows") or []
+        return any(
+            isinstance(item, dict)
+            and item.get("status") in {"ok", "completed"}
+            and _safe_float(item.get("move_pct")) is not None
+            for item in windows
+        )
+
+    finished = [row for row in rows if clean_completed(row)]
+    dirty = [
+        row for row in rows
+        if row.get("outcome_status") in {"ok", "partial", "completed"} and not clean_completed(row)
+    ]
     pending = [row for row in rows if row.get("outcome_status") == "pending"]
     insufficient = [row for row in rows if row.get("outcome_status") == "insufficient_future_session"]
     if not finished:
@@ -215,6 +230,7 @@ def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             "completed": 0,
             "pending": len(pending),
             "insufficient_future_session": len(insufficient),
+            "dirty_completed_ignored": len(dirty),
             "favorable_rate": None,
             "average_max_favorable_move_pct": None,
         }
@@ -232,6 +248,7 @@ def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "completed": len(finished),
         "pending": len(pending),
         "insufficient_future_session": len(insufficient),
+        "dirty_completed_ignored": len(dirty),
         "favorable_rate": round(favorable_count / len(finished), 4),
         "average_max_favorable_move_pct": round(sum(max_favorable) / len(max_favorable), 4) if max_favorable else None,
     }

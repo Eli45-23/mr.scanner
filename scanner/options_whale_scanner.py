@@ -14,9 +14,10 @@ from scanner.options_multileg_detector import default_multileg_result, detect_po
 from scanner.options_oi_review import review_alerts_with_next_day_oi
 from scanner.options_price_context import classify_price_context
 from scanner.options_sweep_detector import approximate_sweep_from_snapshot, detect_sweep_activity
+from scanner.options_unusualness_baseline import OptionsUnusualnessBaseline
 from scanner.options_universe import build_optionable_universe, default_universe_path, load_universe_cache, universe_status
 from scanner.options_whale_models import DISCLAIMER, OptionFlowCandidate, utc_now_iso
-from scanner.options_whale_scoring import estimated_premium, midpoint, safe_float, score_options_whale_flow, spread_percent, volume_oi_ratio
+from scanner.options_whale_scoring import classify_score, estimated_premium, midpoint, safe_float, score_options_whale_flow, spread_percent, volume_oi_ratio
 from scanner.options_whale_storage import OptionsWhaleStorage
 
 
@@ -25,6 +26,8 @@ DEFAULT_PRIORITY_SEEDS = [
     "AMZN", "GOOGL", "NFLX", "AVGO", "COIN", "MSTR", "SMH", "XLK", "XLF", "XLE",
     "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "HYG", "GLD", "SLV",
 ]
+
+INDEX_0DTE_SYMBOLS = {"SPY", "QQQ", "IWM", "DIA"}
 
 FORBIDDEN_ALERT_PHRASES = (
     "b" + "uy this",
@@ -66,6 +69,10 @@ def default_options_whale_config() -> Dict[str, Any]:
         "debug_loose_mode": False,
         "priority_seed_symbols": DEFAULT_PRIORITY_SEEDS,
         "priority_batch_size": 50,
+        "index_0dte_min_score": 85,
+        "index_0dte_min_premium": 250000,
+        "index_0dte_max_spread_percent": 8,
+        "index_0dte_min_price_confirmation_score": 6,
     }
 
 
@@ -173,6 +180,68 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     return "Ignore", False, "Below whale-flow threshold."
 
 
+def _unusualness_bucket(score: Any) -> str:
+    value = safe_float(score)
+    if value >= 17:
+        return "EXTREME"
+    if value >= 13:
+        return "HIGH"
+    if value >= 8:
+        return "MODERATE"
+    return "LOW_OR_UNCONFIRMED"
+
+
+def _baseline_public_fields(candidate: Dict[str, Any], baseline: Dict[str, Any]) -> Dict[str, Any]:
+    stats = baseline.get("unusualness_baseline") if isinstance(baseline.get("unusualness_baseline"), dict) else {}
+    baseline_volume = safe_float(stats.get("average_volume"))
+    baseline_premium = safe_float(stats.get("average_premium"))
+    baseline_vol_oi_ratio = None
+    volume = safe_float(candidate.get("volume"))
+    premium = safe_float(candidate.get("estimated_premium"))
+    volume_multiple = volume / baseline_volume if baseline_volume > 0 else None
+    premium_multiple = premium / baseline_premium if baseline_premium > 0 else None
+    multiples = [item for item in (volume_multiple, premium_multiple) if item is not None]
+    warnings = list(baseline.get("unusualness_warnings") or [])
+    return {
+        "baseline_volume": round(baseline_volume, 2) if baseline_volume else None,
+        "baseline_premium": round(baseline_premium, 2) if baseline_premium else None,
+        "baseline_vol_oi_ratio": baseline_vol_oi_ratio,
+        "unusualness_multiple": round(max(multiples), 2) if multiples else None,
+        "unusualness_bucket": _unusualness_bucket(baseline.get("unusualness_score")),
+        "baseline_sample_size": int(baseline.get("unusualness_sample_size") or 0),
+        "low_sample_warning": "limited historical baseline" in " ".join(str(w).lower() for w in warnings),
+    }
+
+
+def apply_index_0dte_noise_filter(result: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else result
+    symbol = str(candidate.get("underlying_symbol") or "").upper()
+    dte = int(candidate.get("dte") or 0)
+    score = int(result.get("whale_score") or 0)
+    adjusted_score = score
+    reasons: List[str] = []
+    if symbol in INDEX_0DTE_SYMBOLS and dte == 0:
+        min_score = int(cfg.get("index_0dte_min_score", 85))
+        min_premium = float(cfg.get("index_0dte_min_premium", 250000))
+        max_spread = float(cfg.get("index_0dte_max_spread_percent", 8))
+        min_price_score = int(cfg.get("index_0dte_min_price_confirmation_score", 6))
+        if score < min_score:
+            reasons.append(f"score below stronger 0DTE index threshold ({min_score})")
+        if safe_float(candidate.get("estimated_premium")) < min_premium:
+            reasons.append(f"premium below stronger 0DTE index threshold (${min_premium:,.0f})")
+        if candidate.get("spread_percent") is None or safe_float(candidate.get("spread_percent")) > max_spread:
+            reasons.append(f"spread wider than stronger 0DTE index threshold ({max_spread:g}%)")
+        if safe_float(result.get("price_confirmation_score") or candidate.get("price_confirmation_score")) < min_price_score:
+            reasons.append("price confirmation below stronger 0DTE index threshold")
+        if reasons:
+            adjusted_score = max(0, score - 15)
+    return {
+        "index_0dte_noise_flag": bool(reasons),
+        "noise_filter_reason": "; ".join(reasons),
+        "noise_adjusted_score": adjusted_score,
+    }
+
+
 def format_whale_alert(result: Dict[str, Any]) -> str:
     candidate = result.get("candidate") or {}
     lines = [
@@ -200,6 +269,7 @@ class OptionsWhaleScanner:
         self.root = root or Path.cwd()
         self.universe_path = self.root / "data" / "options_universe.json"
         self.latest_path = self.root / "data" / "options_whale_latest.json"
+        self.baseline = OptionsUnusualnessBaseline(self.root)
         self.last_scan: Dict[str, Any] = {}
         self.latest_results: List[Dict[str, Any]] = []
         self.last_scan_order: Dict[str, Any] = {}
@@ -468,6 +538,7 @@ class OptionsWhaleScanner:
         prices = self._underlying_prices(underlyings[:500])
         end = datetime.now(timezone.utc)
         stock_bars = self.client.get_stock_bars(underlyings[:50], start=end - timedelta(minutes=90), end=end) if self.whale.get("enable_price_action_context", True) else {}
+        baseline_records = self.baseline.load_records()
         raw_candidates: List[Dict[str, Any]] = []
         evaluated: List[Dict[str, Any]] = []
         skipped_reasons: Dict[str, int] = {}
@@ -483,9 +554,18 @@ class OptionsWhaleScanner:
             candidate.update(classify_aggression(candidate))
             candidate.update(estimate_opening_flow(candidate))
             candidate.update(context)
+            unusualness = self.baseline.evaluate_candidate(candidate, baseline_records)
+            baseline_fields = _baseline_public_fields(candidate, unusualness)
+            candidate.update(unusualness)
+            candidate.update(baseline_fields)
+            if unusualness.get("unusualness_warnings"):
+                candidate["warnings"] = list(candidate.get("warnings") or []) + list(unusualness.get("unusualness_warnings") or [])
             approximate = approximate_sweep_from_snapshot(candidate)
             block = detect_block_print(candidate, [], {"min_premium": effective_cfg.get("min_premium", 100000)}) if self.whale.get("enable_block_detection", True) else {}
             scored = score_options_whale_flow({**candidate, **approximate, **block}, context, effective_cfg)
+            scored.update(apply_index_0dte_noise_filter({**scored, "candidate": candidate, **context}, effective_cfg))
+            scored["whale_score"] = scored["noise_adjusted_score"]
+            scored["classification"] = classify_score(scored["whale_score"])
             reasons = self._filter_rejections(candidate, effective_cfg)
             if scored["whale_score"] < int(effective_cfg.get("min_score", 75)):
                 reasons.append("score_below_threshold")
@@ -525,6 +605,9 @@ class OptionsWhaleScanner:
             candidate.update(opening)
             candidate.update(context)
             scored = score_options_whale_flow({**candidate, **sweep, **block, **flow}, context, effective_cfg)
+            scored.update(apply_index_0dte_noise_filter({**scored, "candidate": candidate, **flow, **context}, effective_cfg))
+            scored["whale_score"] = scored["noise_adjusted_score"]
+            scored["classification"] = classify_score(scored["whale_score"])
             if scored["whale_score"] < int(effective_cfg.get("min_score", 75)):
                 continue
             result = {
@@ -536,6 +619,10 @@ class OptionsWhaleScanner:
                 **multileg,
                 **opening,
                 **context,
+                "next_day_oi_status": "pending",
+                "next_day_oi_reason": "awaiting next trading day OI",
+                "learned_quality_score": None,
+                "learned_quality_reason": "not enough outcome history yet",
             }
             tier, should_notify, notify_reason = result_alert_tier(result, effective_cfg)
             if debug_loose:
@@ -599,6 +686,10 @@ class OptionsWhaleScanner:
         for result in results:
             if result.get("should_notify"):
                 self.storage.append_alert(result)
+        try:
+            self.baseline.append_observations(evaluated)
+        except Exception:
+            pass
         return scan_record
 
     def history(self, limit: int = 100) -> Dict[str, Any]:

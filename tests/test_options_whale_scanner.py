@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from scanner.options_whale_scanner import OptionsWhaleScanner, format_whale_alert
+from scanner.options_whale_scanner import OptionsWhaleScanner, apply_index_0dte_noise_filter, format_whale_alert
 from scanner.options_whale_storage import OptionsWhaleStorage
 
 
@@ -79,6 +79,12 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertGreaterEqual(result["results_count"], 1)
             self.assertIn("Possible whale flow", result["results"][0]["message_preview"])
             self.assertIn("first_20_underlyings_scanned", result)
+            candidate = result["results"][0]["candidate"]
+            self.assertIn("baseline_sample_size", candidate)
+            self.assertIn("unusualness_bucket", candidate)
+            self.assertTrue(candidate["low_sample_warning"])
+            self.assertEqual(result["results"][0]["next_day_oi_status"], "pending")
+            self.assertIsNone(result["results"][0]["learned_quality_score"])
 
     def test_priority_seed_symbols_scan_before_obscure_names_and_continue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,6 +179,42 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         })
         self.assertIn("Possible whale flow — not a trade signal.", message)
         self.assertNotRegex(message.replace("buy/sell", ""), r"\bbuy\b|\bsell\b|\benter\b")
+
+    def test_index_0dte_noise_filter_downgrades_weak_flow(self):
+        result = {
+            "whale_score": 82,
+            "candidate": {
+                "underlying_symbol": "SPY",
+                "dte": 0,
+                "estimated_premium": 100000,
+                "spread_percent": 12,
+            },
+            "price_confirmation_score": 3,
+        }
+        noise = apply_index_0dte_noise_filter(result, {
+            "index_0dte_min_score": 85,
+            "index_0dte_min_premium": 250000,
+            "index_0dte_max_spread_percent": 8,
+            "index_0dte_min_price_confirmation_score": 6,
+        })
+        self.assertTrue(noise["index_0dte_noise_flag"])
+        self.assertLess(noise["noise_adjusted_score"], 82)
+        self.assertIn("0DTE index", noise["noise_filter_reason"])
+
+    def test_index_0dte_noise_filter_allows_clean_strong_flow_and_non_0dte(self):
+        clean = apply_index_0dte_noise_filter({
+            "whale_score": 92,
+            "candidate": {"underlying_symbol": "QQQ", "dte": 0, "estimated_premium": 500000, "spread_percent": 4},
+            "price_confirmation_score": 8,
+        }, {})
+        self.assertFalse(clean["index_0dte_noise_flag"])
+        self.assertEqual(clean["noise_adjusted_score"], 92)
+        non_0dte = apply_index_0dte_noise_filter({
+            "whale_score": 70,
+            "candidate": {"underlying_symbol": "SPY", "dte": 2, "estimated_premium": 1000, "spread_percent": 50},
+            "price_confirmation_score": 0,
+        }, {})
+        self.assertFalse(non_0dte["index_0dte_noise_flag"])
 
 
 if __name__ == "__main__":

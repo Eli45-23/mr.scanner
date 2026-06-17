@@ -52,6 +52,27 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("/api/options-whales/latest", html)
         self.assertIn("/api/options-whales/universe/status", html)
 
+    def test_whale_dashboard_debug_candidates_are_hidden_by_default(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        self.assertIn("Debug Candidates — Not Alerts", html)
+        self.assertIn("Show Debug Candidates", html)
+        self.assertIn("No real whale alerts passed the filters right now.", html)
+        self.assertIn("No real whale alerts right now. Debug candidates are hidden.", html)
+
+    def test_whale_dashboard_detail_explains_real_alerts(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        for label in (
+            "Why unusual",
+            "Bid/ask aggression",
+            "Opening / closing estimate",
+            "Price confirmation",
+            "Multi-leg warning",
+            "0DTE / index noise warning",
+            "Outcome / learning status",
+            "Watch only — not a trade signal",
+        ):
+            self.assertIn(label, html)
+
     def test_root_serves_whale_dashboard(self):
         text = Path(scanner_dashboard.__file__).read_text(encoding="utf-8")
         self.assertIn("self.send_html(WHALE_INDEX_HTML)", text)

@@ -18,6 +18,8 @@ state/
 exports/
 data/options_universe.json
 data/options_whale_latest.json
+data/options_whale_outcomes.jsonl
+data/options_unusualness_baseline.jsonl
 dashboard_export_*.json
 *.pid
 *.log

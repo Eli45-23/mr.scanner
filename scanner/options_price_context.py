@@ -31,6 +31,8 @@ def classify_price_context(
             "price_context": {"symbol": underlying_symbol, "status": "unavailable"},
             "price_context_score": 0,
             "price_confirmation_label": "stock price not confirming yet",
+            "price_confirmation_score": 0,
+            "price_confirmation_reason": "Underlying price context is unavailable.",
             "price_warning": "Underlying price data unavailable.",
         }
     highs = [safe_float(b.get("high") or b.get("h")) for b in rows]
@@ -89,5 +91,7 @@ def classify_price_context(
         },
         "price_context_score": max(0, min(10, score)),
         "price_confirmation_label": label,
+        "price_confirmation_score": max(0, min(10, score)),
+        "price_confirmation_reason": "; ".join(labels),
         "price_warning": "" if score >= 4 else "Needs price confirmation.",
     }

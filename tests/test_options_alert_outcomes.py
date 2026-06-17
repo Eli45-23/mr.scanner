@@ -116,17 +116,19 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
 
     def test_summarizes_outcomes(self):
         rows = [
-            {"outcome_status": "ok", "max_favorable_move_pct": 1.2, "windows": [{"favorable": True}]},
-            {"outcome_status": "partial", "max_favorable_move_pct": -0.3, "windows": [{"favorable": False}]},
+            {"outcome_status": "ok", "max_favorable_move_pct": 1.2, "windows": [{"status": "ok", "move_pct": 1.2, "favorable": True}]},
+            {"outcome_status": "partial", "max_favorable_move_pct": -0.3, "windows": [{"status": "ok", "move_pct": -0.3, "favorable": False}]},
+            {"outcome_status": "partial", "max_favorable_move_pct": None, "windows": [{"status": "missing_bar", "favorable": None}]},
             {"outcome_status": "pending", "windows": []},
             {"outcome_status": "insufficient_future_session", "windows": []},
             {"outcome_status": "missing_start_context", "windows": []},
         ]
         summary = summarize_outcomes(rows)
-        self.assertEqual(summary["count"], 5)
+        self.assertEqual(summary["count"], 6)
         self.assertEqual(summary["completed"], 2)
         self.assertEqual(summary["pending"], 1)
         self.assertEqual(summary["insufficient_future_session"], 1)
+        self.assertEqual(summary["dirty_completed_ignored"], 1)
         self.assertEqual(summary["favorable_rate"], 0.5)
 
 

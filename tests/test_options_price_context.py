@@ -11,11 +11,15 @@ class OptionsPriceContextTests(unittest.TestCase):
         ]
         result = classify_price_context("AAPL", "CALL", 103, bars)
         self.assertGreaterEqual(result["price_context_score"], 6)
+        self.assertEqual(result["price_confirmation_score"], result["price_context_score"])
+        self.assertIn("flow aligns", result["price_confirmation_reason"])
         self.assertIn("flow aligns", " ".join(result["price_context"]["labels"]))
 
     def test_missing_price_is_safe(self):
         result = classify_price_context("AAPL", "CALL", None, [])
         self.assertEqual(result["price_context_score"], 0)
+        self.assertEqual(result["price_confirmation_score"], 0)
+        self.assertIn("unavailable", result["price_confirmation_reason"])
 
 
 if __name__ == "__main__":

@@ -4157,49 +4157,73 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     function renderRows(latest) {
       const official = latest.results || [];
       const near = latest.near_misses || [];
-      const useNear = official.length === 0 && near.length > 0;
       latestRows = official;
-      if (useNear) {
-        els.modeNotice.innerHTML = '<div class="notice warn">Near misses / debug visibility — not alert quality.</div>';
-        els.flowRows.innerHTML = near.map((item, idx) => `
-          <tr class="clickable" data-kind="near" data-index="${idx}">
-            <td></td><td>Near miss</td><td>${esc(item.underlying)}</td><td></td><td></td><td></td><td></td><td></td>
-            <td>${intFmt(item.volume)}</td><td>${intFmt(item.open_interest)}</td><td></td><td></td>
-            <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium)}</td><td><span class="score">${esc(item.score)}</span></td>
-            <td>Not alert quality</td><td>Watch only</td><td>Needs price confirmation</td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
-          </tr>
-        `).join('');
-        els.rowCount.textContent = `${near.length} near misses`;
-        return;
-      }
-      els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : '';
-      els.rowCount.textContent = `${official.length} rows`;
-      els.flowRows.innerHTML = official.length ? official.map((item, idx) => {
+      const candidateField = (item, field) => {
         const c = item.candidate || {};
+        const value = c[field];
+        return value !== undefined && value !== null && value !== '' ? value : item[field];
+      };
+      const resultRow = (item, idx) => {
         return `<tr class="clickable" data-kind="result" data-index="${idx}">
-          <td>${esc(c.time_detected || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(c.underlying_symbol || '')}</td><td>${esc(c.option_type || '')}</td>
-          <td>${money(c.strike)}</td><td>${esc(c.expiration || '')}</td><td>${esc(c.dte ?? '')}</td><td>${esc(c.moneyness || '')}</td>
-          <td>${intFmt(c.volume)}</td><td>${intFmt(c.open_interest)}</td><td>${esc(c.volume_oi_ratio ?? '')}</td><td>${money(c.last || c.midpoint)}</td>
-          <td>${num(c.spread_percent, '%')}</td><td>${money(c.estimated_premium)}</td><td><span class="score">${esc(item.whale_score || 0)}</span></td>
+          <td>${esc(candidateField(item, 'time_detected') || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
+          <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
+          <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
+          <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
           <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
-      }).join('') : '<tr><td colspan="19" class="muted">No whale-flow candidates or near-misses yet.</td></tr>';
+      };
+      const debugRow = (item, idx) => `
+        <tr class="clickable" data-kind="debug" data-index="${idx}">
+          <td></td><td>Debug only</td><td>${esc(item.underlying || item.underlying_symbol || '')}</td><td colspan="5" class="muted">Debug candidate — not alert quality</td>
+          <td>${intFmt(item.volume)}</td><td>${intFmt(item.open_interest)}</td><td></td><td></td>
+          <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium || item.estimated_premium)}</td><td><span class="score">${esc(item.score)}</span></td>
+          <td>Not alert quality</td><td>Watch only</td><td>Needs confirmation</td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
+        </tr>`;
+      window.__showDebugCandidates = () => {
+        els.modeNotice.innerHTML = '<div class="notice warn">Debug Candidates — Not Alerts. Use this only to tune filters, not as whale-flow signals.</div>';
+        els.rowCount.textContent = `${near.length} debug candidates`;
+        els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="19" class="muted">No debug candidates.</td></tr>';
+      };
+      if (official.length) {
+        els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : '<div class="notice good">Real whale-flow alerts. Watch only — not a trade signal.</div>';
+        els.rowCount.textContent = `${official.length} real whale alerts`;
+        els.flowRows.innerHTML = official.map(resultRow).join('');
+        return;
+      }
+      els.rowCount.textContent = '0 real whale alerts';
+      if (near.length) {
+        els.modeNotice.innerHTML = `<div class="notice warn">No real whale alerts passed the filters right now. ${near.length} debug candidates are hidden because they are not alert quality. <button type="button" onclick="window.__showDebugCandidates()">Show Debug Candidates</button></div>`;
+        els.flowRows.innerHTML = '<tr><td colspan="19" class="muted">No real whale alerts right now. Debug candidates are hidden.</td></tr>';
+      } else {
+        els.modeNotice.innerHTML = '';
+        els.flowRows.innerHTML = '<tr><td colspan="19" class="muted">No real whale alerts yet.</td></tr>';
+      }
     }
     function renderDetail(item) {
       if (!item) return;
       const c = item.candidate || {};
+      const cf = (field) => {
+        const value = c[field];
+        return value !== undefined && value !== null && value !== '' ? value : item[field];
+      };
+      const reasons = item.detailed_reasons || [];
+      const warnings = [...(c.warnings || []), ...(item.score_warnings || [])].filter(Boolean);
       els.detailPanel.innerHTML = `
         <div class="detail-grid">
-          <div class="card"><span class="label">Contract</span><div>${esc(c.option_symbol)} ${esc(c.option_type)} ${money(c.strike)} exp ${esc(c.expiration)}</div></div>
+          <div class="card"><span class="label">Contract</span><div>${esc(cf('option_symbol'))} ${esc(cf('option_type'))} ${money(cf('strike'))} exp ${esc(cf('expiration'))}</div></div>
+          <div class="card"><span class="label">Why unusual</span><div>${esc(item.reason_summary || 'No unusualness explanation available yet.')}<br>${esc(reasons.join(' '))}</div></div>
+          <div class="card"><span class="label">Historical baseline</span><div>Volume baseline: ${esc(cf('baseline_volume') ?? 'not enough history')}<br>Premium baseline: ${money(cf('baseline_premium')) || 'not enough history'}<br>Multiple: ${esc(cf('unusualness_multiple') ?? 'n/a')} | Sample: ${esc(cf('baseline_sample_size') ?? 0)}${cf('low_sample_warning') ? '<br><span class="warn">Low sample warning</span>' : ''}</div></div>
           <div class="card"><span class="label">Score breakdown</span><pre>${esc(JSON.stringify(item.score_components || {}, null, 2))}</pre></div>
-          <div class="card"><span class="label">Aggression</span><div>${esc(item.aggression_side || 'unknown')} | ${esc(item.direction_label || '')} | ${esc(item.direction_confidence || '')}</div></div>
+          <div class="card"><span class="label">Bid/ask aggression</span><div>${esc(item.aggression_side || cf('aggression_side') || 'unknown')} | ${esc(item.aggression_confidence || item.direction_confidence || '')}<br>${esc(item.bid_ask_reason || cf('bid_ask_reason') || '')}<br>${esc(item.quote_stale_warning || cf('quote_stale_warning') || '')}</div></div>
           <div class="card"><span class="label">Sweep / Block</span><div>Sweep: ${esc(item.is_possible_sweep)} ${esc(item.sweep_reason || '')}<br>Block: ${esc(item.is_possible_block)} ${esc(item.block_reason || '')}</div></div>
-          <div class="card"><span class="label">Multi-leg</span><div>${esc(item.multileg_type || 'none')} | ${esc(item.multileg_warning || '')}</div></div>
-          <div class="card"><span class="label">Opening / closing estimate</span><div>${esc(item.opening_flow_estimate || 'unknown')} | ${esc(item.oi_warning || '')}</div></div>
-          <div class="card"><span class="label">Underlying price context</span><div>${esc(item.price_confirmation_label || '')}<br>${esc(item.price_warning || '')}</div></div>
-          <div class="card"><span class="label">Warnings</span><div>${esc((c.warnings || []).join(', ') || 'None')}</div></div>
+          <div class="card"><span class="label">Multi-leg warning</span><div>${esc(item.multileg_type || 'single_leg')} | ${esc(item.multileg_confidence || '')}<br>${esc(item.multileg_warning || 'No related legs detected.')}</div></div>
+          <div class="card"><span class="label">Opening / closing estimate</span><div>${esc(item.open_close_estimate || item.opening_flow_estimate || 'unknown')} | ${esc(item.open_close_confidence || item.opening_confidence || '')}<br>${esc(item.open_close_reason || item.oi_warning || '')}<br>${esc(item.awaiting_next_day_oi_confirmation ? 'Awaiting next-day OI confirmation' : '')}</div></div>
+          <div class="card"><span class="label">Price confirmation</span><div>${esc(item.price_confirmation_label || '')} | Score ${esc(item.price_confirmation_score ?? item.price_context_score ?? '')}<br>${esc(item.price_confirmation_reason || '')}<br>${esc(item.price_warning || '')}</div></div>
+          <div class="card"><span class="label">0DTE / index noise warning</span><div>${esc(item.index_0dte_noise_flag ? 'Noise filter active' : 'No index 0DTE noise flag')}<br>${esc(item.noise_filter_reason || '')}<br>${esc(item.noise_adjusted_score !== undefined ? 'Noise-adjusted score: ' + item.noise_adjusted_score : '')}</div></div>
+          <div class="card"><span class="label">Outcome / learning status</span><div>${esc(item.next_day_oi_status || 'pending')} — ${esc(item.next_day_oi_reason || 'awaiting next trading day OI')}<br>${esc(item.learned_quality_reason || 'not enough outcome history yet')}</div></div>
+          <div class="card"><span class="label">Warnings</span><div>${esc(warnings.join(', ') || 'None')}</div></div>
         </div>
-        <div class="notice">Possible whale flow — not a trade signal.</div>
+        <div class="notice">Watch only — not a trade signal. Possible whale flow — not a trade signal.</div>
       `;
     }
     async function loadFilters() {
