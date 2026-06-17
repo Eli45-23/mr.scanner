@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -104,9 +104,8 @@ def evaluate_alert_outcome(
         }
 
     outcomes: List[OutcomeWindow] = []
-    closes: List[float] = []
     for minutes in windows:
-        target = detected_at.replace(microsecond=0) + __import__("datetime").timedelta(minutes=int(minutes))
+        target = detected_at.replace(microsecond=0) + timedelta(minutes=int(minutes))
         bar = _first_bar_at_or_after(bars, target)
         close = _bar_close(bar or {})
         if close is None:
@@ -118,13 +117,24 @@ def evaluate_alert_outcome(
             favorable = move_pct > 0
         elif bias == "BEARISH":
             favorable = move_pct < 0
-        closes.append(close)
         outcomes.append(OutcomeWindow(int(minutes), round(close, 4), move_pct, favorable, "ok"))
 
-    all_moves = [item.move_pct for item in outcomes if item.move_pct is not None]
+    completed_windows = [item for item in outcomes if item.status == "ok" and item.move_pct is not None]
+    if not outcomes:
+        outcome_status = "no_windows"
+    elif not completed_windows:
+        outcome_status = "pending"
+    elif len(completed_windows) < len(outcomes):
+        outcome_status = "partial"
+    else:
+        outcome_status = "ok"
+
     favorable_moves: List[float] = []
     adverse_moves: List[float] = []
-    for move in all_moves:
+    for item in completed_windows:
+        move = item.move_pct
+        if move is None:
+            continue
         if bias == "BULLISH":
             favorable_moves.append(move)
             adverse_moves.append(move)
@@ -132,10 +142,12 @@ def evaluate_alert_outcome(
             favorable_moves.append(-move)
             adverse_moves.append(-move)
     return {
-        "outcome_status": "ok" if outcomes else "no_windows",
+        "outcome_status": outcome_status,
         "flow_bias": bias,
         "base_price": round(base_price, 4),
         "windows": [item.to_dict() for item in outcomes],
+        "completed_window_count": len(completed_windows),
+        "pending_window_count": len(outcomes) - len(completed_windows),
         "max_favorable_move_pct": round(max(favorable_moves), 4) if favorable_moves else None,
         "max_adverse_move_pct": round(min(adverse_moves), 4) if adverse_moves else None,
     }
@@ -143,9 +155,16 @@ def evaluate_alert_outcome(
 
 def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     rows = list(outcomes)
-    finished = [row for row in rows if row.get("outcome_status") == "ok"]
+    finished = [row for row in rows if row.get("outcome_status") in {"ok", "partial"}]
+    pending = [row for row in rows if row.get("outcome_status") == "pending"]
     if not finished:
-        return {"count": len(rows), "completed": 0, "favorable_rate": None, "average_max_favorable_move_pct": None}
+        return {
+            "count": len(rows),
+            "completed": 0,
+            "pending": len(pending),
+            "favorable_rate": None,
+            "average_max_favorable_move_pct": None,
+        }
     favorable_count = 0
     max_favorable: List[float] = []
     for row in finished:
@@ -158,6 +177,7 @@ def summarize_outcomes(outcomes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "count": len(rows),
         "completed": len(finished),
+        "pending": len(pending),
         "favorable_rate": round(favorable_count / len(finished), 4),
         "average_max_favorable_move_pct": round(sum(max_favorable) / len(max_favorable), 4) if max_favorable else None,
     }
