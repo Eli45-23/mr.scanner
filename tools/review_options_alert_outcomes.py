@@ -15,6 +15,7 @@ from scanner.options_data_client import OptionsDataClient
 APP_DIR = Path(__file__).resolve().parents[1]
 LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
+FINAL_OUTCOME_STATUSES = {"ok"}
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -53,10 +54,10 @@ def alert_key(row: Dict[str, Any]) -> str:
     ))
 
 
-def load_existing_keys(path: Path = OUTCOMES_PATH) -> set[str]:
+def load_finalized_keys(path: Path = OUTCOMES_PATH) -> set[str]:
     if not path.exists():
         return set()
-    keys: set[str] = set()
+    latest_by_key: Dict[str, Dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             row = json.loads(line)
@@ -64,8 +65,12 @@ def load_existing_keys(path: Path = OUTCOMES_PATH) -> set[str]:
             continue
         key = row.get("alert_key")
         if key:
-            keys.add(str(key))
-    return keys
+            latest_by_key[str(key)] = row
+    return {
+        key
+        for key, row in latest_by_key.items()
+        if str(row.get("outcome_status") or "") in FINAL_OUTCOME_STATUSES
+    }
 
 
 def append_outcomes(rows: Iterable[Dict[str, Any]], path: Path = OUTCOMES_PATH) -> None:
@@ -92,15 +97,15 @@ def review_alerts(limit: int = 25, *, include_near_misses: bool = False, dry_run
     if include_near_misses:
         results.extend(latest.get("near_misses") or [])
     results = results[: max(1, int(limit))]
-    existing = load_existing_keys()
+    finalized = load_finalized_keys()
     reviewed: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
     for row in results:
         c = candidate(row)
         key = alert_key(row)
-        if key in existing:
-            skipped.append({"alert_key": key, "reason": "already_reviewed"})
+        if key in finalized:
+            skipped.append({"alert_key": key, "reason": "already_finalized"})
             continue
         symbol = str(c.get("underlying_symbol") or c.get("underlying") or "").upper()
         detected_at = parse_time(row.get("timestamp") or c.get("time_detected") or latest.get("timestamp"))
