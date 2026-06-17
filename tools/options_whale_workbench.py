@@ -20,7 +20,7 @@ HTML_TEMPLATE = """
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Options Whale Workbench</title>
   <style>
-    :root { --bg:#f5f7f8; --card:#fff; --ink:#102027; --muted:#65737e; --line:#d8e0e4; --teal:#1e7f86; }
+    :root { --bg:#f5f7f8; --card:#fff; --ink:#102027; --muted:#65737e; --line:#d8e0e4; --teal:#1e7f86; --good:#0b7a44; --warn:#b66d00; --bad:#b3261e; }
     body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     header { background:#0f2d35; color:#fff; padding:16px 22px; position:sticky; top:0; z-index:10; }
     h1 { margin:0; font-size:22px; }
@@ -39,23 +39,35 @@ HTML_TEMPLATE = """
     .link-card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
     p { color:var(--muted); line-height:1.45; }
     code { background:#eef3f5; padding:2px 5px; border-radius:5px; }
-    .button { display:inline-block; background:var(--teal); color:#fff; text-decoration:none; border-radius:9px; padding:9px 11px; font-weight:800; }
-    .table-wrap { overflow:auto; max-height:520px; }
-    table { width:100%; min-width:1180px; border-collapse:collapse; font-size:13px; }
-    th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
-    th { color:var(--muted); background:#fbfcfd; font-size:12px; }
-    .score { color:#087f8c; font-weight:900; }
+    .button { display:inline-block; background:var(--teal); color:#fff; text-decoration:none; border:0; border-radius:9px; padding:9px 11px; font-weight:800; cursor:pointer; }
+    .flow-list { display:grid; gap:10px; padding:12px; max-height:650px; overflow:auto; }
+    .flow-card { border:1px solid var(--line); border-radius:12px; background:#fff; padding:12px; display:grid; gap:10px; }
+    .flow-top { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
+    .contract { font-size:18px; font-weight:900; }
+    .contract .type.put { color:var(--bad); }
+    .contract .type.call { color:var(--good); }
+    .badges { display:flex; gap:6px; flex-wrap:wrap; }
+    .badge { border:1px solid var(--line); border-radius:999px; padding:4px 7px; font-size:12px; font-weight:800; background:#f6f8f9; }
+    .score { color:var(--teal); }
+    .flow-grid { display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); gap:8px; }
+    .metric { border:1px solid var(--line); border-radius:8px; padding:8px; background:#fbfcfd; }
+    .metric span { display:block; color:var(--muted); font-size:12px; font-weight:750; margin-bottom:3px; }
+    .metric strong { font-size:14px; overflow-wrap:anywhere; }
+    .reason { border-top:1px solid var(--line); padding-top:8px; color:var(--muted); line-height:1.35; }
+    .reason strong { color:var(--ink); }
     .muted { color:var(--muted); }
     .notice { padding:10px 12px; color:var(--muted); }
-    .bad { color:#b3261e; }
+    .bad { color:var(--bad); }
+    @media(max-width:900px){ .flow-grid { grid-template-columns:repeat(2,minmax(140px,1fr)); } iframe { height:62vh; } }
+    @media(max-width:560px){ .flow-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <header>
     <h1>Options Whale Workbench</h1>
-    <div class="sub">One page for scanner control, clean whale-flow rows, and outcome proof.</div>
+    <div class="sub">One page for scanner control, readable whale-flow cards, and outcome proof.</div>
     <nav class="tabs">
-      <a class="tab active" href="#clean-flow">Clean Flow Table</a>
+      <a class="tab active" href="#clean-flow">Flow Cards</a>
       <a class="tab" href="#scanner">Scanner</a>
       <a class="tab" href="#outcomes">Outcomes</a>
       <a class="tab" href="#links">Open Separate Tabs</a>
@@ -64,11 +76,11 @@ HTML_TEMPLATE = """
   <main>
     <section class="frame-card" id="clean-flow">
       <div class="frame-head">
-        <h2>Clean Whale Flow Table</h2>
+        <h2>Readable Whale Flow</h2>
         <button class="button" id="refreshFlow">Refresh Flow</button>
       </div>
-      <div class="notice">This table reads both nested and flat scanner rows so Type / Strike / Exp / DTE do not disappear.</div>
-      <div class="table-wrap" id="flowTable"><div class="notice">Loading whale-flow rows...</div></div>
+      <div class="notice">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
+      <div class="flow-list" id="flowTable"><div class="notice">Loading whale-flow rows...</div></div>
     </section>
     <section class="frame-card scanner" id="scanner">
       <div class="frame-head">
@@ -102,9 +114,54 @@ HTML_TEMPLATE = """
   <script>
     const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
     const pick = (item, field) => (item.candidate && item.candidate[field] !== undefined && item.candidate[field] !== null && item.candidate[field] !== '') ? item.candidate[field] : item[field];
-    const money = (v) => v === null || v === undefined || v === '' ? '' : `$${Number(v).toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2})}`;
-    const num = (v) => v === null || v === undefined || v === '' ? '' : Number(v).toLocaleString();
-    const pct = (v) => v === null || v === undefined || v === '' ? '' : `${Number(v).toFixed(2)}%`;
+    const money = (v) => v === null || v === undefined || v === '' || Number.isNaN(Number(v)) ? 'Unavailable' : `$${Number(v).toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2})}`;
+    const compactMoney = (v) => {
+      if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return 'Unavailable';
+      const n = Number(v);
+      if (Math.abs(n) >= 1000000) return `$${(n / 1000000).toFixed(1)}M`;
+      if (Math.abs(n) >= 1000) return `$${(n / 1000).toFixed(1)}K`;
+      return money(n);
+    };
+    const num = (v) => v === null || v === undefined || v === '' || Number.isNaN(Number(v)) ? 'Unavailable' : Number(v).toLocaleString();
+    const pct = (v) => v === null || v === undefined || v === '' || Number.isNaN(Number(v)) ? 'Unavailable' : `${Number(v).toFixed(2)}%`;
+    function contractTitle(item) {
+      const symbol = pick(item,'underlying_symbol') || item.underlying_symbol || 'UNKNOWN';
+      const type = pick(item,'option_type') || item.option_type || 'OPTION';
+      const strike = pick(item,'strike') ?? item.strike ?? '';
+      return `${symbol} <span class="type ${String(type).toLowerCase()}">${esc(type)}</span> ${money(strike)}`;
+    }
+    function rowCard(item) {
+      const exp = pick(item,'expiration') || item.expiration || 'Unavailable';
+      const dte = pick(item,'dte') ?? item.dte ?? item.days_to_expiration ?? 'Unavailable';
+      const moneyness = pick(item,'moneyness') || item.moneyness || 'Unavailable';
+      const vol = pick(item,'volume') ?? item.volume;
+      const oi = pick(item,'open_interest') ?? item.open_interest;
+      const volOi = pick(item,'volume_oi_ratio') ?? item.volume_oi_ratio;
+      const last = pick(item,'last') ?? pick(item,'midpoint') ?? item.last ?? item.midpoint;
+      const spread = pick(item,'spread_percent') ?? item.spread_percent;
+      const premium = pick(item,'estimated_premium') ?? item.estimated_premium;
+      const score = item.whale_score ?? item.score ?? 'NA';
+      return `<article class="flow-card">
+        <div class="flow-top">
+          <div>
+            <div class="contract">${contractTitle(item)}</div>
+            <div class="muted">${esc(pick(item,'time_detected') || item.timestamp || '')} | Exp ${esc(exp)} | ${esc(dte)} DTE | ${esc(moneyness)}</div>
+          </div>
+          <div class="badges">
+            <span class="badge">${esc(item.alert_tier || pick(item,'tier') || 'No tier')}</span>
+            <span class="badge score">Score ${esc(score)}</span>
+            <span class="badge">${esc(item.classification || 'Unclassified')}</span>
+          </div>
+        </div>
+        <div class="flow-grid">
+          <div class="metric"><span>Flow Size</span><strong>Vol ${num(vol)} / OI ${num(oi)}</strong></div>
+          <div class="metric"><span>Vol/OI</span><strong>${esc(volOi ?? 'Unavailable')}</strong></div>
+          <div class="metric"><span>Premium</span><strong>${compactMoney(premium)}</strong></div>
+          <div class="metric"><span>Price / Spread</span><strong>${money(last)} / ${pct(spread)}</strong></div>
+        </div>
+        <div class="reason"><strong>Direction:</strong> ${esc(item.direction_label || 'Unavailable')}<br><strong>Price context:</strong> ${esc(item.price_confirmation_label || 'Unavailable')}<br><strong>Why it matters:</strong> ${esc(item.reason_summary || item.reason || 'No reason available')}</div>
+      </article>`;
+    }
     async function loadFlow() {
       const box = document.getElementById('flowTable');
       try {
@@ -113,29 +170,7 @@ HTML_TEMPLATE = """
         if (!r.ok) throw new Error(data.error || r.statusText);
         const rows = data.results || [];
         if (!rows.length) { box.innerHTML = '<div class="notice">No whale-flow rows yet.</div>'; return; }
-        box.innerHTML = `<table><thead><tr>
-          <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Last/Mid</th><th>Spread</th><th>Premium</th><th>Score</th><th>Class</th><th>Direction</th><th>Price Context</th><th>Reason</th>
-        </tr></thead><tbody>${rows.slice(0,80).map((item) => `<tr>
-          <td>${esc(pick(item,'time_detected') || item.timestamp || '')}</td>
-          <td>${esc(item.alert_tier || pick(item,'tier') || '')}</td>
-          <td><strong>${esc(pick(item,'underlying_symbol') || item.underlying_symbol || '')}</strong></td>
-          <td>${esc(pick(item,'option_type') || item.option_type || '')}</td>
-          <td>${money(pick(item,'strike') ?? item.strike)}</td>
-          <td>${esc(pick(item,'expiration') || item.expiration || '')}</td>
-          <td>${esc(pick(item,'dte') ?? item.dte ?? item.days_to_expiration ?? '')}</td>
-          <td>${esc(pick(item,'moneyness') || item.moneyness || '')}</td>
-          <td>${num(pick(item,'volume') ?? item.volume)}</td>
-          <td>${num(pick(item,'open_interest') ?? item.open_interest)}</td>
-          <td>${esc(pick(item,'volume_oi_ratio') ?? item.volume_oi_ratio ?? '')}</td>
-          <td>${money(pick(item,'last') ?? pick(item,'midpoint') ?? item.last ?? item.midpoint)}</td>
-          <td>${pct(pick(item,'spread_percent') ?? item.spread_percent)}</td>
-          <td>${money(pick(item,'estimated_premium') ?? item.estimated_premium)}</td>
-          <td><span class="score">${esc(item.whale_score ?? item.score ?? '')}</span></td>
-          <td>${esc(item.classification || '')}</td>
-          <td>${esc(item.direction_label || '')}</td>
-          <td>${esc(item.price_confirmation_label || '')}</td>
-          <td>${esc(item.reason_summary || item.reason || '')}</td>
-        </tr>`).join('')}</tbody></table>`;
+        box.innerHTML = rows.slice(0,40).map(rowCard).join('');
       } catch (err) {
         box.innerHTML = `<div class="notice bad">${esc(err.message)}. Make sure the main scanner dashboard is running on __MAIN_URL__.</div>`;
       }
