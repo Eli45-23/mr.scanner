@@ -86,6 +86,24 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     dte = int(candidate.get("dte") or 0)
     price_context_score = safe_float(context.get("price_context_score") or candidate.get("price_context_score"))
     unusualness_score = min(20, int(safe_float(candidate.get("unusualness_score") or context.get("unusualness_score"))))
+    if unusualness_score <= 0:
+        fallback = 0
+        if premium >= 1000000:
+            fallback += 6
+        elif premium >= 500000:
+            fallback += 4
+        elif premium >= 250000:
+            fallback += 2
+        ratio = safe_float(voi)
+        if ratio >= 20:
+            fallback += 6
+        elif ratio >= 10:
+            fallback += 4
+        elif ratio >= 3:
+            fallback += 2
+        if str(candidate.get("underlying_symbol") or "").upper() in {"SPY", "QQQ", "IWM"} and dte == 0:
+            fallback = max(0, fallback - 3)
+        unusualness_score = min(12, fallback)
 
     premium_score = min(15, int(premium / 50000))
     ratio_score = 0 if voi is None else min(12, int(safe_float(voi) * 4))
@@ -120,6 +138,8 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     unusualness_label = candidate.get("unusualness_label") or context.get("unusualness_label")
     if unusualness_score >= 13:
         reasons.append(f"Flow is historically unusual versus local baseline ({unusualness_label}).")
+    elif unusualness_score >= 8:
+        reasons.append("Flow is unusually large versus fallback thresholds; historical baseline should confirm.")
     elif unusualness_score <= 4:
         warnings.append("Unusualness is not yet confirmed versus historical baseline.")
     if premium_score >= 10:
