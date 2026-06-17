@@ -37,6 +37,25 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Run Whale Scan Now", text)
         self.assertIn("Scan results are stale", text)
 
+    def test_whale_dashboard_does_not_poll_legacy_endpoints(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        legacy_paths = [
+            "/api/symbols",
+            "/api/alerts",
+            "/api/alert-brain",
+            "/api/status",
+            "/api/control-center",
+        ]
+        for path in legacy_paths:
+            self.assertNotIn(path, html)
+        self.assertIn("/api/options-whales/status", html)
+        self.assertIn("/api/options-whales/latest", html)
+        self.assertIn("/api/options-whales/universe/status", html)
+
+    def test_root_serves_whale_dashboard(self):
+        text = Path(scanner_dashboard.__file__).read_text(encoding="utf-8")
+        self.assertIn("self.send_html(WHALE_INDEX_HTML)", text)
+
     def write_latest(self, root: Path, timestamp: str):
         scanner_dashboard.OPTIONS_WHALE_LATEST_PATH = root / "data" / "options_whale_latest.json"
         scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)

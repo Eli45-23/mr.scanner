@@ -3960,6 +3960,318 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+WHALE_INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Options Whale Scanner</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0f14; --panel:#111821; --muted:#8fa1b3; --text:#e8f0f8; --line:#223042; --good:#40d48a; --warn:#f1c84b; --bad:#ff6b6b; --accent:#5db7ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:16px; }
+    h1 { margin:0; font-size:22px; letter-spacing:0; }
+    h2 { margin:0 0 12px; font-size:16px; }
+    main { padding:18px 22px 28px; display:grid; gap:16px; }
+    section, aside { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:10px; }
+    .card { border:1px solid var(--line); border-radius:6px; padding:10px; min-height:68px; }
+    .label { color:var(--muted); font-size:12px; display:block; margin-bottom:6px; }
+    .value { font-size:18px; font-weight:700; overflow-wrap:anywhere; }
+    .muted { color:var(--muted); }
+    .warn { color:var(--warn); }
+    .bad { color:var(--bad); }
+    .good { color:var(--good); }
+    .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    button, a.button { border:1px solid var(--line); background:#162233; color:var(--text); border-radius:6px; padding:9px 11px; cursor:pointer; text-decoration:none; font-size:13px; }
+    button.primary { background:#16466d; border-color:#266b9e; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .filters { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px; }
+    .field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+    input, select { width:100%; background:#0d141d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
+    tr.clickable { cursor:pointer; }
+    tr.clickable:hover { background:#15202e; }
+    .table-wrap { overflow:auto; max-height:520px; border:1px solid var(--line); border-radius:6px; }
+    .score { font-weight:800; color:var(--accent); }
+    .notice { border:1px solid var(--line); border-radius:6px; padding:10px; background:#0d141d; margin-top:10px; }
+    .detail-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
+    pre { white-space:pre-wrap; word-break:break-word; background:#0d141d; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:300px; overflow:auto; }
+    .topbar { display:flex; justify-content:space-between; gap:16px; align-items:center; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Options Whale Scanner</h1>
+      <div class="muted">Full-market options flow scanner. Read-only. Possible whale flow — not a trade signal.</div>
+    </div>
+    <div id="pollStatus" class="muted">Loading</div>
+  </header>
+  <main>
+    <section>
+      <div class="topbar">
+        <h2>Scanner Status</h2>
+        <span id="lastUpdated" class="muted">Waiting for scan</span>
+      </div>
+      <div class="grid" id="statusCards"></div>
+      <div id="warnings"></div>
+    </section>
+
+    <section>
+      <h2>Controls</h2>
+      <div class="controls">
+        <button class="primary" id="runScanBtn">Run Whale Scan Now</button>
+        <button id="pauseScanBtn">Pause Auto Scan</button>
+        <button id="resumeScanBtn">Resume Auto Scan</button>
+        <button id="rebuildUniverseBtn">Rebuild Universe</button>
+        <a class="button" href="/api/options-whales/export.csv">Export CSV</a>
+        <a class="button" href="/api/options-whales/export.json">Export JSON</a>
+      </div>
+    </section>
+
+    <section>
+      <h2>Filters</h2>
+      <div class="filters">
+        <div class="field"><label>Max DTE</label><input id="maxDte" type="number" min="0" /></div>
+        <div class="field"><label>Min score</label><input id="minScore" type="number" min="0" max="100" /></div>
+        <div class="field"><label>Min premium</label><input id="minPremium" type="number" min="0" /></div>
+        <div class="field"><label>Min volume</label><input id="minVolume" type="number" min="0" /></div>
+        <div class="field"><label>Min Vol/OI</label><input id="minVolOi" type="number" min="0" step="0.1" /></div>
+        <div class="field"><label>Max spread %</label><input id="maxSpread" type="number" min="0" step="0.1" /></div>
+        <div class="field"><label>Include 0DTE</label><select id="include0dte"><option value="true">Yes</option><option value="false">No</option></select></div>
+        <div class="field"><label>Include weeklies</label><select id="includeWeeklies"><option value="true">Yes</option><option value="false">No</option></select></div>
+        <div class="field"><label>Max results</label><input id="maxResults" type="number" min="1" /></div>
+        <div class="field"><label>Debug loose mode</label><select id="debugLoose"><option value="false">Off</option><option value="true">On</option></select></div>
+      </div>
+      <div class="controls" style="margin-top:10px"><button id="saveFiltersBtn">Save Filters</button><span class="muted" id="filterStatus"></span></div>
+    </section>
+
+    <section>
+      <div class="topbar">
+        <h2>Whale Flow Table</h2>
+        <span class="muted" id="rowCount">0 rows</span>
+      </div>
+      <div class="notice">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
+      <div id="modeNotice"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Last / Mid</th><th>Spread %</th><th>Premium</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="flowRows"><tr><td colspan="19" class="muted">Waiting for scan.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Detail</h2>
+      <div id="detailPanel" class="muted">Click a row to inspect contract details, score breakdown, aggression, sweep/block/multileg context, opening/closing estimate, warnings, and price context.</div>
+    </section>
+  </main>
+  <script>
+    const els = {
+      pollStatus: document.getElementById('pollStatus'),
+      lastUpdated: document.getElementById('lastUpdated'),
+      statusCards: document.getElementById('statusCards'),
+      warnings: document.getElementById('warnings'),
+      runScanBtn: document.getElementById('runScanBtn'),
+      pauseScanBtn: document.getElementById('pauseScanBtn'),
+      resumeScanBtn: document.getElementById('resumeScanBtn'),
+      rebuildUniverseBtn: document.getElementById('rebuildUniverseBtn'),
+      saveFiltersBtn: document.getElementById('saveFiltersBtn'),
+      filterStatus: document.getElementById('filterStatus'),
+      rowCount: document.getElementById('rowCount'),
+      modeNotice: document.getElementById('modeNotice'),
+      flowRows: document.getElementById('flowRows'),
+      detailPanel: document.getElementById('detailPanel'),
+      maxDte: document.getElementById('maxDte'),
+      minScore: document.getElementById('minScore'),
+      minPremium: document.getElementById('minPremium'),
+      minVolume: document.getElementById('minVolume'),
+      minVolOi: document.getElementById('minVolOi'),
+      maxSpread: document.getElementById('maxSpread'),
+      include0dte: document.getElementById('include0dte'),
+      includeWeeklies: document.getElementById('includeWeeklies'),
+      maxResults: document.getElementById('maxResults'),
+      debugLoose: document.getElementById('debugLoose'),
+    };
+    let latestRows = [];
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
+    }
+    function money(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toLocaleString(undefined, {style:'currency', currency:'USD', maximumFractionDigits:2}) : '';
+    }
+    function num(value, suffix = '') {
+      const n = Number(value);
+      return Number.isFinite(n) ? `${n.toLocaleString(undefined, {maximumFractionDigits:2})}${suffix}` : '';
+    }
+    function intFmt(value) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toLocaleString(undefined, {maximumFractionDigits:0}) : '';
+    }
+    function timeFmt(value) {
+      if (!value) return 'Never';
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+    }
+    async function api(path, options = {}) {
+      const res = await fetch(path, {headers:{'Content-Type':'application/json'}, ...options});
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+    function card(label, value, cls = '') {
+      return `<div class="card"><span class="label">${esc(label)}</span><div class="value ${cls}">${esc(value)}</div></div>`;
+    }
+    function renderStatus(status, latest, universe) {
+      const scan = latest.last_scan || {};
+      const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
+      const current = status.scan_running ? 'Running' : 'Idle';
+      els.lastUpdated.textContent = `${timeFmt(latest.timestamp || scan.timestamp)}${latest.stale ? ' | STALE' : ''}`;
+      els.statusCards.innerHTML = [
+        card('Alpaca connection', status.alpaca_connected ? 'Connected' : 'Unavailable', status.alpaca_connected ? 'good' : 'bad'),
+        card('Options data', status.options_snapshots_available ? 'Available' : 'Unavailable', status.options_snapshots_available ? 'good' : 'bad'),
+        card('Official feed', status.official_options_feed_available ? 'OPRA available' : 'Check OPRA', status.official_options_feed_available ? 'good' : 'warn'),
+        card('Universe size', universe.entry_count ?? status.universe?.entry_count ?? 0),
+        card('Auto scan', auto, auto === 'Running' ? 'good' : 'warn'),
+        card('Last scan time', timeFmt(latest.timestamp || scan.timestamp)),
+        card('Scan age', status.last_scan_age_seconds !== null && status.last_scan_age_seconds !== undefined ? num(status.last_scan_age_seconds, 's') : 'Unknown'),
+        card('Next scan ETA', status.next_scan_eta_seconds !== null && status.next_scan_eta_seconds !== undefined ? num(status.next_scan_eta_seconds, 's') : 'Unknown'),
+        card('Current scan', current, current === 'Running' ? 'warn' : 'good'),
+        card('Contracts scanned', scan.contracts_scanned ?? status.contracts_scanned ?? 0),
+        card('Candidates found', scan.candidates_found ?? status.candidates_found ?? 0),
+        card('Results', (latest.results || []).length),
+      ].join('');
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, latest.stale_warning].filter(Boolean);
+      els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
+      els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
+    }
+    function renderRows(latest) {
+      const official = latest.results || [];
+      const near = latest.near_misses || [];
+      const useNear = official.length === 0 && near.length > 0;
+      latestRows = official;
+      if (useNear) {
+        els.modeNotice.innerHTML = '<div class="notice warn">Near misses / debug visibility — not alert quality.</div>';
+        els.flowRows.innerHTML = near.map((item, idx) => `
+          <tr class="clickable" data-kind="near" data-index="${idx}">
+            <td></td><td>Near miss</td><td>${esc(item.underlying)}</td><td></td><td></td><td></td><td></td><td></td>
+            <td>${intFmt(item.volume)}</td><td>${intFmt(item.open_interest)}</td><td></td><td></td>
+            <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium)}</td><td><span class="score">${esc(item.score)}</span></td>
+            <td>Not alert quality</td><td>Watch only</td><td>Needs price confirmation</td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
+          </tr>
+        `).join('');
+        els.rowCount.textContent = `${near.length} near misses`;
+        return;
+      }
+      els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : '';
+      els.rowCount.textContent = `${official.length} rows`;
+      els.flowRows.innerHTML = official.length ? official.map((item, idx) => {
+        const c = item.candidate || {};
+        return `<tr class="clickable" data-kind="result" data-index="${idx}">
+          <td>${esc(c.time_detected || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(c.underlying_symbol || '')}</td><td>${esc(c.option_type || '')}</td>
+          <td>${money(c.strike)}</td><td>${esc(c.expiration || '')}</td><td>${esc(c.dte ?? '')}</td><td>${esc(c.moneyness || '')}</td>
+          <td>${intFmt(c.volume)}</td><td>${intFmt(c.open_interest)}</td><td>${esc(c.volume_oi_ratio ?? '')}</td><td>${money(c.last || c.midpoint)}</td>
+          <td>${num(c.spread_percent, '%')}</td><td>${money(c.estimated_premium)}</td><td><span class="score">${esc(item.whale_score || 0)}</span></td>
+          <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="19" class="muted">No whale-flow candidates or near-misses yet.</td></tr>';
+    }
+    function renderDetail(item) {
+      if (!item) return;
+      const c = item.candidate || {};
+      els.detailPanel.innerHTML = `
+        <div class="detail-grid">
+          <div class="card"><span class="label">Contract</span><div>${esc(c.option_symbol)} ${esc(c.option_type)} ${money(c.strike)} exp ${esc(c.expiration)}</div></div>
+          <div class="card"><span class="label">Score breakdown</span><pre>${esc(JSON.stringify(item.score_components || {}, null, 2))}</pre></div>
+          <div class="card"><span class="label">Aggression</span><div>${esc(item.aggression_side || 'unknown')} | ${esc(item.direction_label || '')} | ${esc(item.direction_confidence || '')}</div></div>
+          <div class="card"><span class="label">Sweep / Block</span><div>Sweep: ${esc(item.is_possible_sweep)} ${esc(item.sweep_reason || '')}<br>Block: ${esc(item.is_possible_block)} ${esc(item.block_reason || '')}</div></div>
+          <div class="card"><span class="label">Multi-leg</span><div>${esc(item.multileg_type || 'none')} | ${esc(item.multileg_warning || '')}</div></div>
+          <div class="card"><span class="label">Opening / closing estimate</span><div>${esc(item.opening_flow_estimate || 'unknown')} | ${esc(item.oi_warning || '')}</div></div>
+          <div class="card"><span class="label">Underlying price context</span><div>${esc(item.price_confirmation_label || '')}<br>${esc(item.price_warning || '')}</div></div>
+          <div class="card"><span class="label">Warnings</span><div>${esc((c.warnings || []).join(', ') || 'None')}</div></div>
+        </div>
+        <div class="notice">Possible whale flow — not a trade signal.</div>
+      `;
+    }
+    async function loadFilters() {
+      const f = await api('/api/options-whales/filters');
+      els.maxDte.value = f.max_dte ?? '';
+      els.minScore.value = f.min_score ?? '';
+      els.minPremium.value = f.min_premium ?? '';
+      els.minVolume.value = f.min_volume ?? '';
+      els.minVolOi.value = f.min_volume_oi_ratio ?? '';
+      els.maxSpread.value = f.max_spread_percent ?? '';
+      els.include0dte.value = String(Boolean(f.include_0dte));
+      els.includeWeeklies.value = String(Boolean(f.include_weeklies));
+      els.maxResults.value = f.max_results ?? '';
+      els.debugLoose.value = String(Boolean(f.debug_loose_mode));
+    }
+    async function refresh() {
+      try {
+        const [status, latest, universe] = await Promise.all([
+          api('/api/options-whales/status'),
+          api('/api/options-whales/latest'),
+          api('/api/options-whales/universe/status')
+        ]);
+        renderStatus(status, latest, universe);
+        renderRows(latest);
+      } catch (err) {
+        els.warnings.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
+      }
+    }
+    els.runScanBtn.addEventListener('click', async () => {
+      els.runScanBtn.disabled = true;
+      els.runScanBtn.textContent = 'Scanning...';
+      try { await api('/api/options-whales/scan'); }
+      finally { els.runScanBtn.disabled = false; els.runScanBtn.textContent = 'Run Whale Scan Now'; refresh(); }
+    });
+    els.pauseScanBtn.addEventListener('click', async () => { await api('/api/options-whales/auto-scan/pause', {method:'POST', body:'{}'}); refresh(); });
+    els.resumeScanBtn.addEventListener('click', async () => { await api('/api/options-whales/auto-scan/resume', {method:'POST', body:'{}'}); refresh(); });
+    els.rebuildUniverseBtn.addEventListener('click', async () => {
+      els.rebuildUniverseBtn.disabled = true;
+      try { await api('/api/options-whales/universe/rebuild', {method:'POST', body:'{}'}); }
+      finally { els.rebuildUniverseBtn.disabled = false; refresh(); }
+    });
+    els.saveFiltersBtn.addEventListener('click', async () => {
+      const payload = {
+        max_dte: Number(els.maxDte.value),
+        min_score: Number(els.minScore.value),
+        min_premium: Number(els.minPremium.value),
+        min_volume: Number(els.minVolume.value),
+        min_volume_oi_ratio: Number(els.minVolOi.value),
+        max_spread_percent: Number(els.maxSpread.value),
+        include_0dte: els.include0dte.value === 'true',
+        include_weeklies: els.includeWeeklies.value === 'true',
+        max_results: Number(els.maxResults.value),
+        debug_loose_mode: els.debugLoose.value === 'true'
+      };
+      await api('/api/options-whales/filters', {method:'POST', body:JSON.stringify(payload)});
+      els.filterStatus.textContent = 'Saved for this dashboard session';
+      refresh();
+    });
+    els.flowRows.addEventListener('click', (event) => {
+      const row = event.target.closest('tr[data-kind="result"]');
+      if (!row) return;
+      renderDetail(latestRows[Number(row.dataset.index)]);
+    });
+    loadFilters();
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
+"""
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "EliteScannerDashboard/1.0"
 
@@ -4006,7 +4318,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                self.send_html(INDEX_HTML)
+                self.send_html(WHALE_INDEX_HTML)
             elif parsed.path == "/api/status":
                 self.send_json(STATE.snapshot())
             elif parsed.path == "/api/alerts":

@@ -57,6 +57,36 @@ ENABLE_LEGACY_MOMENTUM_SCANNER=false
 
 Legacy paper-trading helper files remain in the repo only as deprecated historical tooling. They are not part of the Options Whale Scanner workflow.
 
+The main dashboard is now focused on the Options Whale Scanner only. Legacy
+momentum panels such as watchlist rows, discovery/hybrid mode, old alert brain,
+control center, RVOL, premarket movers, breakout tables, and A+/A/B/C stock
+setup views are removed from the active UI. The old backend routes may remain
+for compatibility, but the whale dashboard does not poll them.
+
+## Dashboard
+
+Run:
+
+```bash
+python scanner_dashboard.py --open
+```
+
+The dashboard shows only:
+- Alpaca/options data status
+- universe size and scan freshness
+- auto-scan state
+- whale scanner filters
+- the whale flow table
+- row-level detail for score breakdown, aggression, sweep/block/multileg
+  context, opening/closing estimate, warnings, and price context
+
+The dashboard polls only Options Whale Scanner endpoints such as:
+- `/api/options-whales/status`
+- `/api/options-whales/latest`
+- `/api/options-whales/universe/status`
+
+The scanner is read-only and does not place trades.
+
 ## Setup
 
 ### 1. Python
