@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List
 import elite_momentum_scanner as scanner_app
 from scanner.options_alert_outcomes import evaluate_alert_outcome, summarize_outcomes
 from scanner.options_data_client import OptionsDataClient
+from tools.summarize_options_outcomes import is_clean_completed
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -69,7 +70,7 @@ def load_finalized_keys(path: Path = OUTCOMES_PATH) -> set[str]:
     return {
         key
         for key, row in latest_by_key.items()
-        if str(row.get("outcome_status") or "") in FINAL_OUTCOME_STATUSES
+        if str(row.get("outcome_status") or "") in FINAL_OUTCOME_STATUSES and is_clean_completed(row)
     }
 
 
