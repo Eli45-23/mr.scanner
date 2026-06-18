@@ -83,6 +83,17 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Show Old Premium Prints", html)
         self.assertIn("Fresh premium print.", html)
 
+    def test_whale_dashboard_symbol_search_accepts_any_ticker_in_data(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        self.assertIn('id="symbolSearch"', html)
+        self.assertIn("function normalizedSymbolSearch()", html)
+        self.assertIn(".trim().toUpperCase()", html)
+        self.assertIn("function matchesSymbolSearch(item, search)", html)
+        self.assertIn("underlying === search || optionSymbol.includes(search)", html)
+        self.assertIn("No fresh ${esc(search)} whale alerts right now.", html)
+        self.assertNotIn("Invalid ticker", html)
+        self.assertNotIn("preset watchlist", html.lower())
+
     def test_whale_dashboard_detail_explains_real_alerts(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         for label in (

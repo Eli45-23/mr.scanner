@@ -4115,6 +4115,12 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="notice">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
       <div class="notice">Freshness: Fresh premium print | Old trade print | Stale / old premium print | Timing unavailable</div>
+      <div class="controls" style="margin-top:10px">
+        <div class="field" style="min-width:220px">
+          <label>Symbol search</label>
+          <input id="symbolSearch" type="search" placeholder="Any ticker" autocomplete="off" />
+        </div>
+      </div>
       <div id="modeNotice"></div>
       <div class="table-wrap">
         <table>
@@ -4159,6 +4165,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       includeWeeklies: document.getElementById('includeWeeklies'),
       maxResults: document.getElementById('maxResults'),
       debugLoose: document.getElementById('debugLoose'),
+      symbolSearch: document.getElementById('symbolSearch'),
     };
     let latestRows = [];
 
@@ -4218,6 +4225,15 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const age = Number(item.trade_print_age_seconds ?? candidateField(item, 'trade_print_age_seconds'));
       return Number.isFinite(age) && age > 120;
     }
+    function normalizedSymbolSearch() {
+      return String(els.symbolSearch?.value || '').trim().toUpperCase();
+    }
+    function matchesSymbolSearch(item, search) {
+      if (!search) return true;
+      const underlying = String(candidateField(item, 'underlying_symbol') || item.underlying || '').trim().toUpperCase();
+      const optionSymbol = String(candidateField(item, 'option_symbol') || item.option_symbol || '').trim().toUpperCase();
+      return underlying === search || optionSymbol.includes(search);
+    }
     function renderStatus(status, latest, universe) {
       const scan = latest.last_scan || {};
       const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
@@ -4244,8 +4260,11 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }
     function renderRows(latest) {
-      const official = latest.results || [];
-      const near = latest.near_misses || [];
+      const officialAll = latest.results || [];
+      const nearAll = latest.near_misses || [];
+      const search = normalizedSymbolSearch();
+      const official = officialAll.filter((item) => matchesSymbolSearch(item, search));
+      const near = nearAll.filter((item) => matchesSymbolSearch(item, search));
       const freshRows = official.filter((item) => !isStalePrint(item));
       const oldRows = official.filter(isStalePrint);
       latestRows = [...freshRows, ...oldRows];
@@ -4288,6 +4307,12 @@ WHALE_INDEX_HTML = r"""<!doctype html>
           els.rowCount.textContent = `0 fresh whale alerts | ${oldRows.length} old prints`;
           els.flowRows.innerHTML = oldRows.map((item, idx) => resultRow(item, idx)).join('');
         }
+        return;
+      }
+      if (search) {
+        els.rowCount.textContent = `0 ${search} whale alerts`;
+        els.modeNotice.innerHTML = '';
+        els.flowRows.innerHTML = `<tr><td colspan="20" class="muted">No fresh ${esc(search)} whale alerts right now.</td></tr>`;
         return;
       }
       els.rowCount.textContent = '0 real whale alerts';
@@ -4391,6 +4416,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.filterStatus.textContent = 'Saved for this dashboard session';
       refresh();
     });
+    els.symbolSearch.addEventListener('input', refresh);
     els.flowRows.addEventListener('click', (event) => {
       const row = event.target.closest('tr[data-kind="result"]');
       if (!row) return;
