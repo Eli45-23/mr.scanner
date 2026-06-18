@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from scanner.options_alert_outcomes import evaluate_alert_outcome, infer_flow_bias, infer_flow_bias_details, summarize_outcomes
+from scanner.options_alert_outcomes import _first_bar_at_or_after, _parse_time, evaluate_alert_outcome, infer_flow_bias, infer_flow_bias_details, summarize_outcomes
 
 
 class OptionsAlertOutcomeTests(unittest.TestCase):
@@ -72,6 +72,39 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertEqual(outcome["completed_window_count"], 0)
         self.assertEqual(outcome["pending_window_count"], 2)
         self.assertEqual(outcome["insufficient_window_count"], 0)
+
+    def test_alpaca_z_timestamps_parse_and_match_exact_target_bar(self):
+        target = datetime(2026, 6, 18, 16, 38, tzinfo=timezone.utc)
+        parsed = _parse_time("2026-06-18T16:38:00Z")
+        self.assertEqual(parsed, target)
+        bar = _first_bar_at_or_after([{"t": "2026-06-18T16:38:00Z", "c": 101.0}], target)
+        self.assertIsNotNone(bar)
+        self.assertEqual(bar["c"], 101.0)
+
+    def test_first_bar_at_or_after_uses_later_bar_when_exact_missing(self):
+        target = datetime(2026, 6, 18, 16, 38, tzinfo=timezone.utc)
+        bars = [
+            {"t": "2026-06-18T16:37:00Z", "c": 100.0},
+            {"t": "2026-06-18T16:39:00Z", "c": 101.0},
+        ]
+        bar = _first_bar_at_or_after(bars, target)
+        self.assertIsNotNone(bar)
+        self.assertEqual(bar["t"], "2026-06-18T16:39:00Z")
+
+    def test_alert_with_bars_through_later_time_completes_all_windows(self):
+        detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
+        alert = {
+            "timestamp": "2026-06-18T16:33:00Z",
+            "candidate": {"option_type": "CALL", "underlying_price": 100.0},
+        }
+        bars = [
+            {"t": (detected + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ"), "c": 100.0 + minutes / 10}
+            for minutes in range(0, 137)
+        ]
+        outcome = evaluate_alert_outcome(alert, bars, windows=(5, 15, 30, 60))
+        self.assertEqual(outcome["outcome_status"], "ok")
+        self.assertEqual(outcome["completed_window_count"], 4)
+        self.assertEqual(outcome["pending_window_count"], 0)
 
     def test_partial_when_some_windows_are_complete(self):
         start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)

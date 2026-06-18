@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
@@ -22,6 +22,7 @@ from tools.summarize_options_outcomes import is_clean_completed
 LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
 FINAL_OUTCOME_STATUSES = {"ok"}
+OUTCOME_WINDOWS = (5, 15, 30, 60)
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -36,7 +37,8 @@ def parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def read_latest(path: Path = LATEST_PATH) -> Dict[str, Any]:
+def read_latest(path: Optional[Path] = None) -> Dict[str, Any]:
+    path = path or LATEST_PATH
     if not path.exists():
         return {}
     try:
@@ -60,18 +62,8 @@ def alert_key(row: Dict[str, Any]) -> str:
     ))
 
 
-def load_finalized_keys(path: Path = OUTCOMES_PATH) -> set[str]:
-    if not path.exists():
-        return set()
-    latest_by_key: Dict[str, Dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        key = row.get("alert_key")
-        if key:
-            latest_by_key[str(key)] = row
+def load_finalized_keys(path: Optional[Path] = None) -> set[str]:
+    latest_by_key = load_latest_outcomes_by_key(path)
     return {
         key
         for key, row in latest_by_key.items()
@@ -79,7 +71,51 @@ def load_finalized_keys(path: Path = OUTCOMES_PATH) -> set[str]:
     }
 
 
-def append_outcomes(rows: Iterable[Dict[str, Any]], path: Path = OUTCOMES_PATH) -> None:
+def load_outcome_rows(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    path = path or OUTCOMES_PATH
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def load_latest_outcomes_by_key(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    latest_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in load_outcome_rows(path):
+        key = row.get("alert_key")
+        if key:
+            latest_by_key[str(key)] = row
+    return latest_by_key
+
+
+def completed_window_count(row: Dict[str, Any]) -> int:
+    try:
+        return int(row.get("completed_window_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def should_append_outcome(new_row: Dict[str, Any], previous: Optional[Dict[str, Any]], *, force: bool = False) -> bool:
+    if force or previous is None:
+        return True
+    if completed_window_count(new_row) > completed_window_count(previous):
+        return True
+    previous_status = str(previous.get("outcome_status") or "")
+    new_status = str(new_row.get("outcome_status") or "")
+    if previous_status == "pending" and new_status not in {"pending", ""}:
+        return True
+    return False
+
+
+def append_outcomes(rows: Iterable[Dict[str, Any]], path: Optional[Path] = None) -> None:
+    path = path or OUTCOMES_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for row in rows:
@@ -94,18 +130,93 @@ def build_client(config: Dict[str, Any]) -> OptionsDataClient:
     )
 
 
-def review_alerts(limit: int = 25, *, include_near_misses: bool = False, dry_run: bool = False) -> Dict[str, Any]:
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(APP_DIR))
+    except ValueError:
+        return str(path)
+
+
+def _bar_timestamp(bar: Dict[str, Any]) -> Optional[datetime]:
+    return parse_time(bar.get("t") or bar.get("timestamp") or bar.get("time"))
+
+
+def _window_targets(detected_at: datetime, windows: Iterable[int]) -> List[datetime]:
+    return [detected_at.replace(microsecond=0) + timedelta(minutes=int(minutes)) for minutes in windows]
+
+
+def outcome_debug_reason(
+    *,
+    bars: List[Dict[str, Any]],
+    detected_at: Optional[datetime],
+    outcome: Dict[str, Any],
+    windows: Iterable[int] = OUTCOME_WINDOWS,
+) -> str:
+    if detected_at is None:
+        return "alert timestamp could not be parsed"
+    if outcome.get("outcome_status") == "missing_start_context":
+        return "base price missing"
+    if not bars:
+        return "no bars returned"
+    if int(outcome.get("pending_window_count") or 0) <= 0:
+        return ""
+    bar_times = [stamp for stamp in (_bar_timestamp(bar) for bar in bars) if stamp is not None]
+    if not bar_times:
+        return "bars returned but timestamps could not be parsed"
+    latest_bar = max(bar_times)
+    targets = _window_targets(detected_at, windows)
+    if targets and all(target > latest_bar for target in targets):
+        return "all target windows are after latest returned bar"
+    return "bars returned but no bars at or after target windows"
+
+
+def build_outcome_diagnostics(
+    *,
+    bars: List[Dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    detected_at: Optional[datetime],
+    outcome: Dict[str, Any],
+    windows: Iterable[int] = OUTCOME_WINDOWS,
+) -> Dict[str, Any]:
+    bar_times = [stamp for stamp in (_bar_timestamp(bar) for bar in bars) if stamp is not None]
+    diagnostics = {
+        "bars_returned": len(bars),
+        "bars_start_requested": start.isoformat(),
+        "bars_end_requested": end.isoformat(),
+        "first_bar_time": min(bar_times).isoformat() if bar_times else None,
+        "last_bar_time": max(bar_times).isoformat() if bar_times else None,
+        "detected_at": detected_at.isoformat() if detected_at else None,
+        "outcome_window_minutes_requested": list(windows),
+    }
+    reason = outcome_debug_reason(bars=bars, detected_at=detected_at, outcome=outcome, windows=windows)
+    if reason:
+        diagnostics["outcome_debug_reason"] = reason
+    return diagnostics
+
+
+def review_alerts(
+    limit: int = 25,
+    *,
+    include_near_misses: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
+) -> Dict[str, Any]:
     scanner_app.load_dotenv()
     config = scanner_app.load_config(None)
     client = build_client(config)
+    now_utc = datetime.now(timezone.utc)
     latest = read_latest()
     results = list(latest.get("results") or [])
     if include_near_misses:
         results.extend(latest.get("near_misses") or [])
     results = results[: max(1, int(limit))]
     finalized = load_finalized_keys()
+    previous_by_key = load_latest_outcomes_by_key()
     reviewed: List[Dict[str, Any]] = []
+    appendable: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    unchanged_pending_count = 0
 
     for row in results:
         c = candidate(row)
@@ -118,15 +229,16 @@ def review_alerts(limit: int = 25, *, include_near_misses: bool = False, dry_run
         if not symbol or detected_at is None:
             skipped.append({"alert_key": key, "reason": "missing_symbol_or_time"})
             continue
-        start = detected_at - timedelta(minutes=1)
-        end = detected_at + timedelta(minutes=70)
+        start = detected_at - timedelta(minutes=10)
+        target_end = detected_at + timedelta(minutes=75)
+        end = now_utc if target_end > now_utc else max(now_utc, target_end)
         try:
             bars = client.get_stock_bars([symbol], start=start, end=end).get(symbol, [])
         except Exception as exc:
             skipped.append({"alert_key": key, "reason": f"bars_unavailable: {exc}"})
             continue
-        outcome = evaluate_alert_outcome(row, bars)
-        reviewed.append({
+        outcome = evaluate_alert_outcome(row, bars, windows=OUTCOME_WINDOWS)
+        reviewed_row = {
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "alert_key": key,
             "underlying_symbol": symbol,
@@ -139,16 +251,37 @@ def review_alerts(limit: int = 25, *, include_near_misses: bool = False, dry_run
             "alert_tier": row.get("alert_tier"),
             "score_components": row.get("score_components"),
             **outcome,
-        })
+            **build_outcome_diagnostics(
+                bars=bars,
+                start=start,
+                end=end,
+                detected_at=detected_at,
+                outcome=outcome,
+                windows=OUTCOME_WINDOWS,
+            ),
+        }
+        reviewed.append(reviewed_row)
+        if should_append_outcome(reviewed_row, previous_by_key.get(key), force=force):
+            appendable.append(reviewed_row)
+        elif str(reviewed_row.get("outcome_status") or "") == "pending":
+            unchanged_pending_count += 1
 
-    if reviewed and not dry_run:
-        append_outcomes(reviewed)
+    if appendable and not dry_run:
+        append_outcomes(appendable)
+    summary = summarize_outcomes(reviewed)
     return {
         "reviewed_count": len(reviewed),
         "skipped_count": len(skipped),
-        "output_path": str(OUTCOMES_PATH.relative_to(APP_DIR)),
+        "appended_count": len(appendable) if not dry_run else 0,
+        "appendable_count": len(appendable),
+        "unchanged_pending_count": unchanged_pending_count,
+        "completed_count": summary.get("completed", 0),
+        "pending_count": summary.get("pending", 0),
+        "insufficient_future_session_count": summary.get("insufficient_future_session", 0),
+        "output_path": display_path(OUTCOMES_PATH),
         "dry_run": dry_run,
-        "summary": summarize_outcomes(reviewed),
+        "force": force,
+        "summary": summary,
         "skipped": skipped[:10],
         "reviewed": reviewed[:10],
     }
@@ -160,6 +293,7 @@ def print_review_result(result: Dict[str, Any], *, compact: bool = False) -> Non
         print(
             f"{datetime.now().astimezone().isoformat(timespec='seconds')} | "
             f"reviewed={result.get('reviewed_count')} skipped={result.get('skipped_count')} "
+            f"appended={result.get('appended_count')} unchanged_pending={result.get('unchanged_pending_count')} "
             f"completed={summary.get('completed')} pending={summary.get('pending')} "
             f"favorable_rate={summary.get('favorable_rate')}"
         )
@@ -167,10 +301,10 @@ def print_review_result(result: Dict[str, Any], *, compact: bool = False) -> Non
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
 
 
-def run_loop(limit: int, *, include_near_misses: bool, dry_run: bool, interval_seconds: int, once: bool = False) -> int:
+def run_loop(limit: int, *, include_near_misses: bool, dry_run: bool, force: bool, interval_seconds: int, once: bool = False) -> int:
     interval = max(60, int(interval_seconds))
     while True:
-        result = review_alerts(limit, include_near_misses=include_near_misses, dry_run=dry_run)
+        result = review_alerts(limit, include_near_misses=include_near_misses, dry_run=dry_run, force=force)
         print_review_result(result, compact=True)
         if once:
             return 0
@@ -182,6 +316,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--include-near-misses", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Append unchanged rows, including duplicate pending reviews.")
     parser.add_argument("--loop", action="store_true", help="Keep reviewing pending outcomes on a timer.")
     parser.add_argument("--interval-seconds", type=int, default=300, help="Loop interval. Minimum is 60 seconds.")
     args = parser.parse_args()
@@ -190,9 +325,10 @@ def main() -> int:
             args.limit,
             include_near_misses=args.include_near_misses,
             dry_run=args.dry_run,
+            force=args.force,
             interval_seconds=args.interval_seconds,
         )
-    print_review_result(review_alerts(args.limit, include_near_misses=args.include_near_misses, dry_run=args.dry_run))
+    print_review_result(review_alerts(args.limit, include_near_misses=args.include_near_misses, dry_run=args.dry_run, force=args.force))
     return 0
 
 
