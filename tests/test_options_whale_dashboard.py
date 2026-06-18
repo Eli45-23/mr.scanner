@@ -59,6 +59,16 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("No real whale alerts passed the filters right now.", html)
         self.assertIn("No real whale alerts right now. Debug candidates are hidden.", html)
 
+    def test_whale_dashboard_formats_utc_timestamps_as_market_time(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        self.assertIn("function formatMarketTime(value)", html)
+        self.assertIn("timeZone:'America/New_York'", html)
+        self.assertIn("formatMarketTime(candidateField(item, 'time_detected')", html)
+        self.assertIn("Reported trade time ET", html)
+        self.assertIn("Quote time ET", html)
+        self.assertIn("Scanner detected ET", html)
+        self.assertIn("Reported trade time raw", html)
+
     def test_whale_dashboard_renders_freshness_labels_and_stale_warning(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         self.assertIn("Fresh premium print", html)
@@ -69,6 +79,9 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Fresh flow label", html)
         self.assertIn("Stale warning", html)
         self.assertIn("Old premium print — do not treat as fresh flow.", html)
+        self.assertIn("Old Premium Prints — Not Fresh Alerts", html)
+        self.assertIn("Show Old Premium Prints", html)
+        self.assertIn("Fresh premium print.", html)
 
     def test_whale_dashboard_detail_explains_real_alerts(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
@@ -113,6 +126,38 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
             self.assertTrue(latest["stale"])
             self.assertIn("Auto-scan may not be running", latest["stale_warning"])
             self.assertEqual(len(latest["near_misses"]), 1)
+
+    def test_latest_orders_fresh_rows_before_stale_rows_and_counts_freshness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH = Path(tmp) / "data" / "options_whale_latest.json"
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.write_text(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "deduped_results_count": 3,
+                "duplicate_results_count": 1,
+                "results": [
+                    {"whale_score": 99, "candidate": {"underlying_symbol": "OLD", "stale_trade_print": True, "trade_print_age_seconds": 901}},
+                    {"whale_score": 70, "candidate": {"underlying_symbol": "FRESH", "stale_trade_print": False, "trade_print_age_seconds": 30}},
+                    {"whale_score": 65, "candidate": {"underlying_symbol": "OLD2", "trade_print_age_seconds": 121}},
+                ],
+            }), encoding="utf-8")
+            latest = scanner_dashboard.options_whales_latest()
+        symbols = [row["candidate"]["underlying_symbol"] for row in latest["results"]]
+        self.assertEqual(symbols, ["FRESH", "OLD", "OLD2"])
+        self.assertEqual(latest["fresh_count"], 1)
+        self.assertEqual(latest["stale_count"], 2)
+        self.assertEqual(latest["deduped_count"], 3)
+        self.assertEqual(latest["diagnostics"]["duplicate_results_count"], 1)
+
+    def test_freshness_counts_do_not_count_stale_as_fresh_real_alerts(self):
+        rows = [
+            {"candidate": {"stale_trade_print": False, "trade_print_age_seconds": 45}},
+            {"candidate": {"stale_trade_print": True, "trade_print_age_seconds": 180}},
+            {"candidate": {"trade_print_age_seconds": 901}},
+        ]
+        counts = scanner_dashboard.options_whale_freshness_counts(rows)
+        self.assertEqual(counts["fresh_count"], 1)
+        self.assertEqual(counts["stale_count"], 2)
 
     def test_status_returns_scan_runtime_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

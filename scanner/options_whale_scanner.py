@@ -365,6 +365,20 @@ def dedupe_whale_prints(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [kept[key] for key in order]
 
 
+def is_stale_whale_print(row: Dict[str, Any]) -> bool:
+    candidate = _row_candidate(row)
+    if bool(row.get("stale_trade_print") or candidate.get("stale_trade_print")):
+        return True
+    label = str(row.get("fresh_flow_label") or candidate.get("fresh_flow_label") or "").strip().lower()
+    if label in {"old trade print", "stale / old premium print"}:
+        return True
+    age = row.get("trade_print_age_seconds", candidate.get("trade_print_age_seconds"))
+    try:
+        return float(age) > 120
+    except (TypeError, ValueError):
+        return False
+
+
 def _is_duplicate_whale_print(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     return build_whale_print_key(left) == build_whale_print_key(right)
 
@@ -931,12 +945,16 @@ class OptionsWhaleScanner:
         raw_results_count = len(results)
         results = dedupe_whale_prints(results)
         duplicate_results_count = raw_results_count - len(results)
+        fresh_results_count = sum(1 for item in results if not is_stale_whale_print(item))
+        stale_results_count = len(results) - fresh_results_count
         scan_record = {
             "timestamp": utc_now_iso(),
             "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
             "contracts_scanned": len(option_symbols),
             "candidates_found": len(raw_candidates),
             "results_count": len(results),
+            "fresh_count": fresh_results_count,
+            "stale_count": stale_results_count,
             "raw_results_count": raw_results_count,
             "deduped_results_count": len(results),
             "duplicate_results_count": duplicate_results_count,
@@ -974,12 +992,15 @@ class OptionsWhaleScanner:
     def history(self, limit: int = 100) -> Dict[str, Any]:
         raw_alerts = self.storage.latest_alerts(limit=limit)
         deduped_alerts = dedupe_whale_prints(raw_alerts)
+        stale_count = sum(1 for item in deduped_alerts if is_stale_whale_print(item))
         return {
             "alerts": deduped_alerts,
             "metadata": {
                 "raw_count": len(raw_alerts),
                 "deduped_count": len(deduped_alerts),
                 "duplicate_count": len(raw_alerts) - len(deduped_alerts),
+                "fresh_count": len(deduped_alerts) - stale_count,
+                "stale_count": stale_count,
             },
         }
 

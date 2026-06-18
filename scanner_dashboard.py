@@ -488,6 +488,43 @@ def scan_age_seconds(timestamp: Optional[str]) -> Optional[float]:
     return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
 
 
+def _options_whale_candidate(row: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = row.get("candidate")
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def options_whale_row_is_stale(row: Dict[str, Any]) -> bool:
+    candidate = _options_whale_candidate(row)
+    if bool(row.get("stale_trade_print") or candidate.get("stale_trade_print")):
+        return True
+    label = str(row.get("fresh_flow_label") or candidate.get("fresh_flow_label") or "").strip().lower()
+    if label in {"old trade print", "stale / old premium print"}:
+        return True
+    age = row.get("trade_print_age_seconds", candidate.get("trade_print_age_seconds"))
+    try:
+        return float(age) > 120
+    except (TypeError, ValueError):
+        return False
+
+
+def prioritize_fresh_options_whale_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            options_whale_row_is_stale(row),
+            -int(row.get("whale_score") or row.get("score") or 0),
+        ),
+    )
+
+
+def options_whale_freshness_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    stale_count = sum(1 for row in rows if options_whale_row_is_stale(row))
+    return {
+        "fresh_count": len(rows) - stale_count,
+        "stale_count": stale_count,
+    }
+
+
 def read_latest_options_whale_scan() -> Dict[str, Any]:
     if not OPTIONS_WHALE_LATEST_PATH.exists():
         return {}
@@ -672,12 +709,22 @@ def options_whales_latest() -> Dict[str, Any]:
             payload["results"] = options_whale_scanner().latest().get("results", [])
     runtime = options_whale_scan_runtime_status(payload)
     timestamp = payload.get("timestamp")
+    results = prioritize_fresh_options_whale_rows(payload.get("results", []) or [])
+    counts = options_whale_freshness_counts(results)
+    deduped_count = payload.get("deduped_results_count", len(results))
     return {
         "timestamp": timestamp,
         "scan_age_seconds": runtime["last_scan_age_seconds"],
-        "results": payload.get("results", []),
+        "results": results,
         "near_misses": payload.get("near_misses", []),
-        "diagnostics": {k: v for k, v in payload.items() if k not in {"results", "near_misses"}},
+        "fresh_count": counts["fresh_count"],
+        "stale_count": counts["stale_count"],
+        "deduped_count": deduped_count,
+        "diagnostics": {
+            **{k: v for k, v in payload.items() if k not in {"results", "near_misses"}},
+            **counts,
+            "deduped_count": deduped_count,
+        },
         "last_scan": {k: v for k, v in payload.items() if k != "results"},
         "stale": runtime["stale"],
         "stale_warning": runtime["stale_warning"],
@@ -698,7 +745,14 @@ def resume_options_whale_auto_scan() -> Dict[str, Any]:
 
 
 def options_whales_history(limit: int = 100) -> Dict[str, Any]:
-    return options_whale_scanner().history(limit=limit)
+    history = options_whale_scanner().history(limit=limit)
+    alerts = prioritize_fresh_options_whale_rows(history.get("alerts", []) or [])
+    counts = options_whale_freshness_counts(alerts)
+    metadata = dict(history.get("metadata") or {})
+    metadata.update(counts)
+    history["alerts"] = alerts
+    history["metadata"] = metadata
+    return history
 
 
 def options_whales_filters() -> Dict[str, Any]:
@@ -4128,6 +4182,16 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const d = new Date(value);
       return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
     }
+    function formatMarketTime(value) {
+      if (!value) return '—';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return '—';
+      try {
+        return `${d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit', second:'2-digit', timeZone:'America/New_York'})} ET`;
+      } catch (err) {
+        return d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit', second:'2-digit'});
+      }
+    }
     function freshnessText(value) {
       return {
         'fresh premium print':'Fresh premium print',
@@ -4143,6 +4207,16 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     function card(label, value, cls = '') {
       return `<div class="card"><span class="label">${esc(label)}</span><div class="value ${cls}">${esc(value)}</div></div>`;
+    }
+    function candidateField(item, field) {
+      const c = item.candidate || {};
+      const value = c[field];
+      return value !== undefined && value !== null && value !== '' ? value : item[field];
+    }
+    function isStalePrint(item) {
+      if (item.stale_trade_print || candidateField(item, 'stale_trade_print')) return true;
+      const age = Number(item.trade_print_age_seconds ?? candidateField(item, 'trade_print_age_seconds'));
+      return Number.isFinite(age) && age > 120;
     }
     function renderStatus(status, latest, universe) {
       const scan = latest.last_scan || {};
@@ -4162,6 +4236,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Contracts scanned', scan.contracts_scanned ?? status.contracts_scanned ?? 0),
         card('Candidates found', scan.candidates_found ?? status.candidates_found ?? 0),
         card('Results', (latest.results || []).length),
+        card('Fresh prints', latest.fresh_count ?? latest.diagnostics?.fresh_count ?? 0, 'good'),
+        card('Old prints', latest.stale_count ?? latest.diagnostics?.stale_count ?? 0, (latest.stale_count ?? latest.diagnostics?.stale_count ?? 0) ? 'warn' : ''),
       ].join('');
       const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, latest.stale_warning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
@@ -4170,19 +4246,17 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     function renderRows(latest) {
       const official = latest.results || [];
       const near = latest.near_misses || [];
-      latestRows = official;
-      const candidateField = (item, field) => {
-        const c = item.candidate || {};
-        const value = c[field];
-        return value !== undefined && value !== null && value !== '' ? value : item[field];
-      };
+      const freshRows = official.filter((item) => !isStalePrint(item));
+      const oldRows = official.filter(isStalePrint);
+      latestRows = [...freshRows, ...oldRows];
       const resultRow = (item, idx) => {
         const freshness = freshnessText(candidateField(item, 'fresh_flow_label'));
+        const freshnessNote = isStalePrint(item) ? '<br><span class="warn">Old premium print — do not treat as fresh flow.</span>' : '';
         return `<tr class="clickable" data-kind="result" data-index="${idx}">
-          <td>${esc(candidateField(item, 'time_detected') || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
+          <td>${esc(formatMarketTime(candidateField(item, 'time_detected') || candidateField(item, 'trade_time')))}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
           <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
           <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(item.contract_price_paid || candidateField(item, 'contract_price_paid') || candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
-          <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td>${esc(freshness)}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
+          <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td>${esc(freshness)}${freshnessNote}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
           <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
       };
@@ -4198,10 +4272,22 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         els.rowCount.textContent = `${near.length} debug candidates`;
         els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="20" class="muted">No debug candidates.</td></tr>';
       };
+      window.__showOldPremiumPrints = () => {
+        els.modeNotice.innerHTML = '<div class="notice warn">Old Premium Prints — Not Fresh Alerts. Old premium print — do not treat as fresh flow.</div>';
+        els.rowCount.textContent = `${oldRows.length} old premium prints`;
+        els.flowRows.innerHTML = oldRows.length ? oldRows.map((item, idx) => resultRow(item, freshRows.length + idx)).join('') : '<tr><td colspan="20" class="muted">No old premium prints.</td></tr>';
+      };
       if (official.length) {
-        els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : '<div class="notice good">Real whale-flow alerts. Watch only — not a trade signal.</div>';
-        els.rowCount.textContent = `${official.length} real whale alerts`;
-        els.flowRows.innerHTML = official.map(resultRow).join('');
+        const oldNotice = oldRows.length ? ` <button type="button" onclick="window.__showOldPremiumPrints()">Show Old Premium Prints</button>` : '';
+        if (freshRows.length) {
+          els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : `<div class="notice good">Real whale-flow alerts. Watch only — not a trade signal.${oldNotice}</div>`;
+          els.rowCount.textContent = `${freshRows.length} fresh whale alerts${oldRows.length ? ` | ${oldRows.length} old prints separated` : ''}`;
+          els.flowRows.innerHTML = freshRows.map((item, idx) => resultRow(item, idx)).join('');
+        } else {
+          els.modeNotice.innerHTML = `<div class="notice warn">Old Premium Prints — Not Fresh Alerts. Old premium print — do not treat as fresh flow.${oldNotice}</div>`;
+          els.rowCount.textContent = `0 fresh whale alerts | ${oldRows.length} old prints`;
+          els.flowRows.innerHTML = oldRows.map((item, idx) => resultRow(item, idx)).join('');
+        }
         return;
       }
       els.rowCount.textContent = '0 real whale alerts';
@@ -4226,12 +4312,12 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const age = item.trade_print_age_seconds ?? cf('trade_print_age_seconds');
       const ageText = age !== undefined && age !== null && age !== '' ? `${esc(age)} seconds (${esc(item.trade_print_age_minutes ?? cf('trade_print_age_minutes') ?? 'n/a')} minutes)` : 'unavailable';
       const staleWarning = item.trade_print_age_warning || cf('trade_print_age_warning') || '';
-      const staleCaution = (item.stale_trade_print || cf('stale_trade_print')) ? '<br><strong>Old premium print — do not treat as fresh flow.</strong>' : '';
+      const flowCaution = isStalePrint(item) ? 'Old premium print — do not treat as fresh flow.' : 'Fresh premium print.';
       els.detailPanel.innerHTML = `
         <div class="detail-grid">
           <div class="card"><span class="label">Important Flow Info</span><div>Contract: ${esc(item.display_contract || cf('display_contract') || cf('option_symbol'))}<br>Moneyness: ${esc(item.display_moneyness || cf('display_moneyness') || cf('moneyness'))}<br>Total premium: ${money(cf('estimated_premium'))}<br>Price paid: ${money(item.contract_price_paid || cf('contract_price_paid'))}<br>Watch only — not a trade signal</div></div>
           <div class="card"><span class="label">Contract</span><div>${esc(cf('option_symbol'))} ${esc(cf('option_type'))} ${money(cf('strike'))} exp ${esc(cf('expiration'))}</div></div>
-          <div class="card"><span class="label">Premium Time</span><div>Reported trade time: ${esc(item.reported_trade_time || cf('reported_trade_time') || 'unavailable')}<br>Quote time: ${esc(item.reported_quote_time || cf('reported_quote_time') || 'unavailable')}<br>Scanner detected: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>Trade print age: ${ageText}<br>Fresh flow label: ${esc(freshLabel)}<br>Stale warning: ${esc(staleWarning || item.premium_timing_warning || cf('premium_timing_warning') || 'None')}${staleCaution}</div></div>
+          <div class="card"><span class="label">Premium Time</span><div>${esc(flowCaution)}<br>Reported trade time ET: ${esc(formatMarketTime(cf('trade_time')))}<br>Quote time ET: ${esc(formatMarketTime(cf('quote_time')))}<br>Scanner detected ET: ${esc(formatMarketTime(cf('time_detected')))}<br>Reported trade time raw: ${esc(item.reported_trade_time || cf('reported_trade_time') || cf('trade_time') || 'unavailable')}<br>Quote time raw: ${esc(item.reported_quote_time || cf('reported_quote_time') || cf('quote_time') || 'unavailable')}<br>Scanner detected raw: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || cf('time_detected') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>Trade print age: ${ageText}<br>Fresh flow label: ${esc(freshLabel)}<br>Stale warning: ${esc(staleWarning || item.premium_timing_warning || cf('premium_timing_warning') || 'None')}</div></div>
           <div class="card"><span class="label">Pressure</span><div>${esc(item.premium_pressure_label || cf('premium_pressure_label') || 'unknown')} | ${esc(item.premium_pressure_confidence || cf('premium_pressure_confidence') || '')}<br>${esc(item.premium_pressure_reason || cf('premium_pressure_reason') || '')}</div></div>
           <div class="card"><span class="label">Follow-through</span><div>${esc(item.follow_through_status || 'no_follow_up_yet')}<br>Follow-up premium: ${money(item.follow_up_premium)}<br>Follow-up count: ${esc(item.follow_up_count ?? 0)}<br>Last follow-up time: ${esc(item.last_follow_up_time || 'none yet')}<br>${esc(item.follow_through_reason || '')}</div></div>
           <div class="card"><span class="label">Why unusual</span><div>${esc(item.reason_summary || 'No unusualness explanation available yet.')}<br>${esc(reasons.join(' '))}</div></div>
