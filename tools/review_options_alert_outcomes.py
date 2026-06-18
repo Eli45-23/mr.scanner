@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+
+APP_DIR = Path(__file__).resolve().parents[1]
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 
 import elite_momentum_scanner as scanner_app
 from scanner.options_alert_outcomes import evaluate_alert_outcome, summarize_outcomes
@@ -14,7 +19,6 @@ from scanner.options_data_client import OptionsDataClient
 from tools.summarize_options_outcomes import is_clean_completed
 
 
-APP_DIR = Path(__file__).resolve().parents[1]
 LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
 FINAL_OUTCOME_STATUSES = {"ok"}
