@@ -4,7 +4,15 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from scanner.options_whale_scanner import OptionsWhaleScanner, apply_index_0dte_noise_filter, format_whale_alert
+from scanner.options_whale_scanner import (
+    OptionsWhaleScanner,
+    apply_index_0dte_noise_filter,
+    attach_simple_follow_through,
+    build_premium_display_fields,
+    build_premium_pressure_fields,
+    build_premium_timing_fields,
+    format_whale_alert,
+)
 from scanner.options_whale_storage import OptionsWhaleStorage
 
 
@@ -215,6 +223,49 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             "price_confirmation_score": 0,
         }, {})
         self.assertFalse(non_0dte["index_0dte_noise_flag"])
+
+    def test_price_paid_uses_last_and_falls_back_to_midpoint(self):
+        last = build_premium_display_fields({
+            "underlying_symbol": "AAPL",
+            "option_type": "CALL",
+            "strike": 200,
+            "expiration": "2026-06-19",
+            "moneyness": "ATM",
+            "last": 2.5,
+            "midpoint": 2.4,
+            "estimated_premium": 250000,
+        })
+        self.assertEqual(last["contract_price_paid"], 2.5)
+        self.assertEqual(last["premium_per_contract"], 250)
+        fallback = build_premium_display_fields({"last": None, "midpoint": 1.25})
+        self.assertEqual(fallback["contract_price_paid"], 1.25)
+
+    def test_timing_delay_handles_missing_trade_time(self):
+        timing = build_premium_timing_fields({
+            "trade_time": "2026-06-17T14:00:00Z",
+            "quote_time": "2026-06-17T14:00:01Z",
+            "time_detected": "2026-06-17T14:00:30Z",
+        })
+        self.assertEqual(timing["premium_trade_delay_seconds"], 30)
+        missing = build_premium_timing_fields({"time_detected": "2026-06-17T14:00:30Z"})
+        self.assertIsNone(missing["premium_trade_delay_seconds"])
+        self.assertIn("unavailable", missing["premium_timing_warning"])
+
+    def test_pressure_aliases_map_from_existing_aggression(self):
+        self.assertEqual(build_premium_pressure_fields({"aggression_side": "near_ask"})["premium_pressure_label"], "ask-side pressure")
+        self.assertEqual(build_premium_pressure_fields({"aggression_side": "near_bid"})["premium_pressure_label"], "bid-side pressure")
+        self.assertEqual(build_premium_pressure_fields({"aggression_side": "midpoint"})["premium_pressure_label"], "midpoint / unclear")
+        self.assertEqual(build_premium_pressure_fields({"aggression_side": "unknown"})["premium_pressure_label"], "unknown")
+
+    def test_simple_follow_through_marks_same_contract_later(self):
+        rows = [
+            {"candidate": {"option_symbol": "AAPLX", "estimated_premium": 100000, "time_detected": "2026-06-17T14:00:00Z"}},
+            {"candidate": {"option_symbol": "AAPLX", "estimated_premium": 150000, "time_detected": "2026-06-17T14:02:00Z"}},
+        ]
+        result = attach_simple_follow_through(rows)
+        self.assertEqual(result[0]["follow_through_status"], "no_follow_up_yet")
+        self.assertEqual(result[1]["follow_through_status"], "more_premium_added")
+        self.assertEqual(result[1]["follow_up_premium"], 150000)
 
 
 if __name__ == "__main__":

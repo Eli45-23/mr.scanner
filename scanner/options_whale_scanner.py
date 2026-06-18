@@ -152,6 +152,18 @@ def _quote_age_seconds(timestamp: Optional[str], now: datetime) -> Optional[floa
         return None
 
 
+def _parse_iso_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _moneyness(option_type: str, strike: float, underlying_price: Optional[float]) -> tuple[str, Optional[float], Optional[float]]:
     if not underlying_price or underlying_price <= 0 or strike <= 0:
         return "UNKNOWN", None, None
@@ -164,6 +176,124 @@ def _moneyness(option_type: str, strike: float, underlying_price: Optional[float
     else:
         label = "OTM"
     return label, round(distance, 4), round(pct, 2)
+
+
+def build_premium_timing_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    trade_time = candidate.get("trade_time")
+    quote_time = candidate.get("quote_time")
+    detected_time = candidate.get("time_detected")
+    trade_dt = _parse_iso_time(trade_time)
+    detected_dt = _parse_iso_time(detected_time)
+    delay = None
+    warning = ""
+    if trade_dt and detected_dt:
+        delay = max(0.0, round((detected_dt - trade_dt).total_seconds(), 2))
+        if delay > 120:
+            warning = "Premium timing is delayed; verify the print before relying on it."
+    elif not trade_dt:
+        warning = "Reported trade time unavailable."
+    summary_parts = []
+    if trade_time:
+        summary_parts.append(f"trade {trade_time}")
+    if quote_time:
+        summary_parts.append(f"quote {quote_time}")
+    if delay is not None:
+        summary_parts.append(f"detected {delay:g}s later")
+    return {
+        "reported_trade_time": trade_time,
+        "reported_quote_time": quote_time,
+        "scanner_detected_time": detected_time,
+        "premium_trade_delay_seconds": delay,
+        "premium_timing_summary": " | ".join(summary_parts) if summary_parts else "premium timing unavailable",
+        "premium_timing_warning": warning,
+    }
+
+
+def build_premium_display_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    price_paid = safe_float(candidate.get("last"))
+    if price_paid <= 0:
+        price_paid = safe_float(candidate.get("midpoint"))
+    price_paid = price_paid if price_paid > 0 else None
+    premium_per_contract = round(price_paid * 100, 2) if price_paid is not None else None
+    total_premium = safe_float(candidate.get("estimated_premium"))
+    option_type = str(candidate.get("option_type") or "").upper()
+    display_contract = " ".join(str(part) for part in (
+        candidate.get("underlying_symbol"),
+        option_type,
+        candidate.get("strike"),
+        candidate.get("expiration"),
+    ) if part not in {None, ""})
+    moneyness = str(candidate.get("moneyness") or "UNKNOWN")
+    distance = candidate.get("distance_percent")
+    display_moneyness = moneyness if distance is None else f"{moneyness} ({safe_float(distance):+.2f}%)"
+    summary = "premium unavailable"
+    if price_paid is not None and total_premium > 0:
+        summary = f"${price_paid:.2f} per contract; approx ${total_premium:,.0f} total premium"
+    elif price_paid is not None:
+        summary = f"${price_paid:.2f} per contract"
+    return {
+        "display_contract": display_contract,
+        "display_moneyness": display_moneyness,
+        "contract_price_paid": price_paid,
+        "premium_per_contract": premium_per_contract,
+        "premium_summary": summary,
+    }
+
+
+def build_premium_pressure_fields(result_or_candidate: Dict[str, Any]) -> Dict[str, Any]:
+    side = str(result_or_candidate.get("aggression_side") or "").lower()
+    confidence = result_or_candidate.get("aggression_confidence") or result_or_candidate.get("direction_confidence") or "LOW"
+    reason = result_or_candidate.get("bid_ask_reason") or result_or_candidate.get("direction_warning") or ""
+    if side == "near_ask":
+        label = "ask-side pressure"
+    elif side == "near_bid":
+        label = "bid-side pressure"
+    elif side == "midpoint":
+        label = "midpoint / unclear"
+    else:
+        label = "unknown"
+        reason = reason or "Bid/ask pressure could not be classified from available quote data."
+    return {
+        "premium_pressure_label": label,
+        "premium_pressure_confidence": confidence,
+        "premium_pressure_reason": reason,
+    }
+
+
+def attach_simple_follow_through(rows: List[Dict[str, Any]], history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    history = history or []
+    seen: Dict[str, Dict[str, Any]] = {}
+    for row in history:
+        candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else row
+        symbol = str(candidate.get("option_symbol") or "")
+        if symbol:
+            seen[symbol] = row
+    for row in rows:
+        candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else row
+        symbol = str(candidate.get("option_symbol") or "")
+        premium = safe_float(candidate.get("estimated_premium") or row.get("estimated_premium"))
+        if symbol and symbol in seen:
+            prior = seen[symbol]
+            prior_candidate = prior.get("candidate") if isinstance(prior.get("candidate"), dict) else prior
+            row.update({
+                "follow_through_status": "more_premium_added",
+                "follow_up_premium": premium,
+                "follow_up_count": int(prior.get("follow_up_count") or 0) + 1,
+                "last_follow_up_time": candidate.get("time_detected") or row.get("timestamp"),
+                "follow_through_reason": "Same option contract appeared again in available scan or alert history.",
+            })
+            prior_candidate["last_follow_up_time"] = candidate.get("time_detected") or row.get("timestamp")
+        else:
+            row.update({
+                "follow_through_status": "no_follow_up_yet" if symbol else "waiting",
+                "follow_up_premium": None,
+                "follow_up_count": 0,
+                "last_follow_up_time": None,
+                "follow_through_reason": "No later same-contract flow is available yet.",
+            })
+        if symbol:
+            seen[symbol] = row
+    return rows
 
 
 def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, bool, str]:
@@ -550,8 +680,11 @@ class OptionsWhaleScanner:
                 skipped_reasons["missing_snapshot"] = skipped_reasons.get("missing_snapshot", 0) + 1
                 continue
             candidate = self._candidate_from_contract(contract, snapshots[symbol], prices, end).to_dict()
+            candidate.update(build_premium_timing_fields(candidate))
+            candidate.update(build_premium_display_fields(candidate))
             context = classify_price_context(candidate["underlying_symbol"], candidate["option_type"], candidate.get("underlying_price"), stock_bars.get(candidate["underlying_symbol"], [])) if self.whale.get("enable_price_action_context", True) else {}
             candidate.update(classify_aggression(candidate))
+            candidate.update(build_premium_pressure_fields(candidate))
             candidate.update(estimate_opening_flow(candidate))
             candidate.update(context)
             unusualness = self.baseline.evaluate_candidate(candidate, baseline_records)
@@ -594,6 +727,7 @@ class OptionsWhaleScanner:
             trades = trade_map.get(candidate["option_symbol"], [])
             aggression = classify_aggression(candidate)
             candidate.update(aggression)
+            candidate.update(build_premium_pressure_fields(candidate))
             sweep = detect_sweep_activity(trades) if trades else approximate_sweep_from_snapshot(candidate)
             block = detect_block_print(candidate, trades, {"min_premium": self.whale.get("min_premium", 100000)}) if self.whale.get("enable_block_detection", True) else {}
             multileg = multileg_map.get(candidate["option_symbol"], default_multileg_result())
@@ -619,6 +753,9 @@ class OptionsWhaleScanner:
                 **multileg,
                 **opening,
                 **context,
+                **build_premium_timing_fields(candidate),
+                **build_premium_display_fields(candidate),
+                **build_premium_pressure_fields({**candidate, **flow}),
                 "next_day_oi_status": "pending",
                 "next_day_oi_reason": "awaiting next trading day OI",
                 "learned_quality_score": None,
@@ -636,6 +773,7 @@ class OptionsWhaleScanner:
             results.append(result)
         results.sort(key=lambda item: int(item.get("whale_score") or 0), reverse=True)
         results = results[: int(effective_cfg.get("max_results", 100))]
+        results = attach_simple_follow_through(results, self.storage.latest_alerts(limit=500))
         near_misses = sorted(
             evaluated,
             key=lambda item: (int(item.get("whale_score") or 0), safe_float((item.get("candidate") or {}).get("estimated_premium"))),

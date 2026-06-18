@@ -62,6 +62,11 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
     def test_whale_dashboard_detail_explains_real_alerts(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         for label in (
+            "Important Flow Info",
+            "Price Paid",
+            "Premium Time",
+            "Pressure",
+            "Follow-through",
             "Why unusual",
             "Bid/ask aggression",
             "Opening / closing estimate",

@@ -4061,7 +4061,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         <table>
           <thead>
             <tr>
-              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Last / Mid</th><th>Spread %</th><th>Premium</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Price Paid</th><th>Spread %</th><th>Premium</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
             </tr>
           </thead>
           <tbody id="flowRows"><tr><td colspan="19" class="muted">Waiting for scan.</td></tr></tbody>
@@ -4167,7 +4167,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         return `<tr class="clickable" data-kind="result" data-index="${idx}">
           <td>${esc(candidateField(item, 'time_detected') || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
           <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
-          <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
+          <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(item.contract_price_paid || candidateField(item, 'contract_price_paid') || candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
           <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
           <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
@@ -4210,7 +4210,11 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const warnings = [...(c.warnings || []), ...(item.score_warnings || [])].filter(Boolean);
       els.detailPanel.innerHTML = `
         <div class="detail-grid">
+          <div class="card"><span class="label">Important Flow Info</span><div>Contract: ${esc(item.display_contract || cf('display_contract') || cf('option_symbol'))}<br>Moneyness: ${esc(item.display_moneyness || cf('display_moneyness') || cf('moneyness'))}<br>Total premium: ${money(cf('estimated_premium'))}<br>Price paid: ${money(item.contract_price_paid || cf('contract_price_paid'))}<br>Watch only — not a trade signal</div></div>
           <div class="card"><span class="label">Contract</span><div>${esc(cf('option_symbol'))} ${esc(cf('option_type'))} ${money(cf('strike'))} exp ${esc(cf('expiration'))}</div></div>
+          <div class="card"><span class="label">Premium Time</span><div>Reported trade time: ${esc(item.reported_trade_time || cf('reported_trade_time') || 'unavailable')}<br>Quote time: ${esc(item.reported_quote_time || cf('reported_quote_time') || 'unavailable')}<br>Scanner detected: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>${esc(item.premium_timing_warning || cf('premium_timing_warning') || '')}</div></div>
+          <div class="card"><span class="label">Pressure</span><div>${esc(item.premium_pressure_label || cf('premium_pressure_label') || 'unknown')} | ${esc(item.premium_pressure_confidence || cf('premium_pressure_confidence') || '')}<br>${esc(item.premium_pressure_reason || cf('premium_pressure_reason') || '')}</div></div>
+          <div class="card"><span class="label">Follow-through</span><div>${esc(item.follow_through_status || 'no_follow_up_yet')}<br>Follow-up premium: ${money(item.follow_up_premium)}<br>Follow-up count: ${esc(item.follow_up_count ?? 0)}<br>Last follow-up time: ${esc(item.last_follow_up_time || 'none yet')}<br>${esc(item.follow_through_reason || '')}</div></div>
           <div class="card"><span class="label">Why unusual</span><div>${esc(item.reason_summary || 'No unusualness explanation available yet.')}<br>${esc(reasons.join(' '))}</div></div>
           <div class="card"><span class="label">Historical baseline</span><div>Volume baseline: ${esc(cf('baseline_volume') ?? 'not enough history')}<br>Premium baseline: ${money(cf('baseline_premium')) || 'not enough history'}<br>Multiple: ${esc(cf('unusualness_multiple') ?? 'n/a')} | Sample: ${esc(cf('baseline_sample_size') ?? 0)}${cf('low_sample_warning') ? '<br><span class="warn">Low sample warning</span>' : ''}</div></div>
           <div class="card"><span class="label">Score breakdown</span><pre>${esc(JSON.stringify(item.score_components || {}, null, 2))}</pre></div>
