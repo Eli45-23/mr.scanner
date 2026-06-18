@@ -11,6 +11,8 @@ from scanner.options_whale_scanner import (
     build_premium_display_fields,
     build_premium_pressure_fields,
     build_premium_timing_fields,
+    build_whale_print_key,
+    dedupe_whale_prints,
     format_whale_alert,
 )
 from scanner.options_whale_storage import OptionsWhaleStorage
@@ -247,9 +249,75 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             "time_detected": "2026-06-17T14:00:30Z",
         })
         self.assertEqual(timing["premium_trade_delay_seconds"], 30)
+        self.assertFalse(timing["stale_trade_print"])
+        self.assertEqual(timing["fresh_flow_label"], "fresh premium print")
         missing = build_premium_timing_fields({"time_detected": "2026-06-17T14:00:30Z"})
         self.assertIsNone(missing["premium_trade_delay_seconds"])
         self.assertIn("unavailable", missing["premium_timing_warning"])
+        self.assertEqual(missing["fresh_flow_label"], "timing unavailable")
+        missing_detected = build_premium_timing_fields({"trade_time": "2026-06-17T14:00:00Z"})
+        self.assertFalse(missing_detected["stale_trade_print"])
+        self.assertEqual(missing_detected["fresh_flow_label"], "timing unavailable")
+        self.assertIn("Scanner detection time unavailable", missing_detected["trade_print_age_warning"])
+
+    def test_stale_trade_print_marks_old_premium_timing(self):
+        timing = build_premium_timing_fields({
+            "trade_time": "2026-06-17T14:00:00Z",
+            "time_detected": "2026-06-17T14:03:00Z",
+        })
+        self.assertTrue(timing["stale_trade_print"])
+        self.assertEqual(timing["trade_print_age_seconds"], 180)
+        self.assertEqual(timing["trade_print_age_minutes"], 3)
+        self.assertEqual(timing["fresh_flow_label"], "old trade print")
+        self.assertIn("more than 2 minutes", timing["trade_print_age_warning"])
+
+    def test_very_stale_trade_print_gets_stronger_label(self):
+        timing = build_premium_timing_fields({
+            "trade_time": "2026-06-16T14:00:00Z",
+            "time_detected": "2026-06-17T14:03:00Z",
+        })
+        self.assertTrue(timing["stale_trade_print"])
+        self.assertEqual(timing["fresh_flow_label"], "stale / old premium print")
+        self.assertIn("more than 15 minutes", timing["trade_print_age_warning"])
+
+    def test_whale_print_key_and_dedupe_keep_best_duplicate(self):
+        base = {
+            "candidate": {
+                "option_symbol": "AAPL260619C00200000",
+                "trade_time": "2026-06-17T14:00:00Z",
+                "last": 2.5,
+                "volume": 1000,
+                "estimated_premium": 250000,
+                "open_interest": 100,
+                "time_detected": "2026-06-17T14:00:10Z",
+            },
+            "whale_score": 80,
+        }
+        better = {
+            "candidate": {**base["candidate"], "time_detected": "2026-06-17T14:00:20Z"},
+            "whale_score": 90,
+            "reason_summary": "more complete",
+        }
+        rows = dedupe_whale_prints([base, better])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["whale_score"], 90)
+        self.assertEqual(build_whale_print_key(base), build_whale_print_key(better))
+
+    def test_dedupe_keeps_later_trade_time_and_changed_premium(self):
+        base = {
+            "candidate": {
+                "option_symbol": "AAPL260619C00200000",
+                "trade_time": "2026-06-17T14:00:00Z",
+                "last": 2.5,
+                "volume": 1000,
+                "estimated_premium": 250000,
+                "open_interest": 100,
+            },
+            "whale_score": 85,
+        }
+        later = {"candidate": {**base["candidate"], "trade_time": "2026-06-17T14:01:00Z"}, "whale_score": 85}
+        changed = {"candidate": {**base["candidate"], "estimated_premium": 300000, "volume": 1200}, "whale_score": 85}
+        self.assertEqual(len(dedupe_whale_prints([base, later, changed])), 3)
 
     def test_pressure_aliases_map_from_existing_aggression(self):
         self.assertEqual(build_premium_pressure_fields({"aggression_side": "near_ask"})["premium_pressure_label"], "ask-side pressure")
@@ -259,13 +327,22 @@ class OptionsWhaleScannerTests(unittest.TestCase):
 
     def test_simple_follow_through_marks_same_contract_later(self):
         rows = [
-            {"candidate": {"option_symbol": "AAPLX", "estimated_premium": 100000, "time_detected": "2026-06-17T14:00:00Z"}},
-            {"candidate": {"option_symbol": "AAPLX", "estimated_premium": 150000, "time_detected": "2026-06-17T14:02:00Z"}},
+            {"candidate": {"option_symbol": "AAPLX", "trade_time": "2026-06-17T14:00:00Z", "last": 1.0, "volume": 100, "estimated_premium": 100000, "time_detected": "2026-06-17T14:00:00Z"}},
+            {"candidate": {"option_symbol": "AAPLX", "trade_time": "2026-06-17T14:02:00Z", "last": 1.5, "volume": 100, "estimated_premium": 150000, "time_detected": "2026-06-17T14:02:00Z"}},
         ]
         result = attach_simple_follow_through(rows)
         self.assertEqual(result[0]["follow_through_status"], "no_follow_up_yet")
         self.assertEqual(result[1]["follow_through_status"], "more_premium_added")
         self.assertEqual(result[1]["follow_up_premium"], 150000)
+
+    def test_simple_follow_through_does_not_count_duplicate_print(self):
+        rows = [
+            {"candidate": {"option_symbol": "AAPLX", "trade_time": "2026-06-17T14:00:00Z", "last": 1.0, "volume": 100, "estimated_premium": 100000, "open_interest": 10, "time_detected": "2026-06-17T14:00:10Z"}},
+            {"candidate": {"option_symbol": "AAPLX", "trade_time": "2026-06-17T14:00:00Z", "last": 1.0, "volume": 100, "estimated_premium": 100000, "open_interest": 10, "time_detected": "2026-06-17T14:00:20Z"}},
+        ]
+        result = attach_simple_follow_through(rows)
+        self.assertEqual(result[1]["follow_through_status"], "no_follow_up_yet")
+        self.assertIsNone(result[1]["follow_up_premium"])
 
 
 if __name__ == "__main__":

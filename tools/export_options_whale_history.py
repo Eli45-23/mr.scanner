@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -18,16 +19,19 @@ def main() -> int:
     parser.add_argument("--output", default="")
     args = parser.parse_args()
     scanner = build_scanner()
-    records = scanner.storage.latest_alerts(limit=10000)
     if args.output:
         path = Path(args.output)
     else:
         path = Path("exports") / f"options_whale_history.{args.format}"
+    history = scanner.history(limit=10000)
+    records = history.get("alerts", [])
+    metadata = history.get("metadata", {})
     if args.format == "json":
-        scanner.storage.export_json(path, records)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"metadata": metadata, "alerts": records}, indent=2, sort_keys=True, default=str), encoding="utf-8")
     else:
         scanner.storage.export_csv(path, records)
-    print_json({"export_path": str(path), "record_count": len(records)})
+    print_json({"export_path": str(path), "record_count": len(records), **metadata})
     return 0
 
 

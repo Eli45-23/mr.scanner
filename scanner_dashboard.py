@@ -3441,6 +3441,8 @@ INDEX_HTML = r"""<!doctype html>
       const scanState = status.scan_running ? 'Running' : 'Idle';
       const topRows = rows.slice(0, 50).map((item) => {
         const c = item.candidate || {};
+        const freshness = c.fresh_flow_label || item.fresh_flow_label || 'timing unavailable';
+        const freshnessText = {'fresh premium print':'Fresh premium print','old trade print':'Old trade print','stale / old premium print':'Stale / old premium print','timing unavailable':'Timing unavailable'}[freshness] || freshness;
         return `
           <tr>
             <td>${esc(c.time_detected || '')}</td>
@@ -3457,6 +3459,7 @@ INDEX_HTML = r"""<!doctype html>
             <td>${fmtMoney(c.last || c.midpoint)}</td>
             <td>${fmtNum(c.spread_percent, '%')}</td>
             <td>${fmtMoney(c.estimated_premium)}</td>
+            <td>${esc(freshnessText)}</td>
             <td><span class="score ${scoreClass(item.whale_score || 0)}">${item.whale_score || 0}</span></td>
             <td>${esc(item.classification || '')}</td>
             <td>${esc(item.direction_label || '')}</td>
@@ -3484,11 +3487,12 @@ INDEX_HTML = r"""<!doctype html>
         ${staleWarning ? `<div class="empty">${esc(staleWarning)}</div>` : ''}
         ${status.last_scan_error ? `<div class="empty">Last scan error: ${esc(status.last_scan_error)}</div>` : ''}
         <div class="copy-block">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
+        <div class="copy-block">Freshness: Fresh premium print | Old trade print | Stale / old premium print | Timing unavailable</div>
         <table>
           <thead><tr>
-            <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Vol</th><th>OI</th><th>Vol/OI</th><th>Last/Mid</th><th>Spread</th><th>Premium</th><th>Score</th><th>Class</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+            <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Vol</th><th>OI</th><th>Vol/OI</th><th>Last/Mid</th><th>Spread</th><th>Premium</th><th>Freshness</th><th>Score</th><th>Class</th><th>Direction</th><th>Price Context</th><th>Reason</th>
           </tr></thead>
-          <tbody>${topRows || '<tr><td colspan="19" class="muted">No whale-flow candidates yet.</td></tr>'}</tbody>
+          <tbody>${topRows || '<tr><td colspan="20" class="muted">No whale-flow candidates yet.</td></tr>'}</tbody>
         </table>
       `;
     }
@@ -4056,15 +4060,16 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         <span class="muted" id="rowCount">0 rows</span>
       </div>
       <div class="notice">Possible whale flow — not a trade signal. Watch only. Needs price confirmation.</div>
+      <div class="notice">Freshness: Fresh premium print | Old trade print | Stale / old premium print | Timing unavailable</div>
       <div id="modeNotice"></div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Price Paid</th><th>Spread %</th><th>Premium</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Price Paid</th><th>Spread %</th><th>Premium</th><th>Freshness</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
             </tr>
           </thead>
-          <tbody id="flowRows"><tr><td colspan="19" class="muted">Waiting for scan.</td></tr></tbody>
+          <tbody id="flowRows"><tr><td colspan="20" class="muted">Waiting for scan.</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -4123,6 +4128,14 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const d = new Date(value);
       return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
     }
+    function freshnessText(value) {
+      return {
+        'fresh premium print':'Fresh premium print',
+        'old trade print':'Old trade print',
+        'stale / old premium print':'Stale / old premium print',
+        'timing unavailable':'Timing unavailable'
+      }[value] || value || 'Timing unavailable';
+    }
     async function api(path, options = {}) {
       const res = await fetch(path, {headers:{'Content-Type':'application/json'}, ...options});
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -4164,11 +4177,12 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         return value !== undefined && value !== null && value !== '' ? value : item[field];
       };
       const resultRow = (item, idx) => {
+        const freshness = freshnessText(candidateField(item, 'fresh_flow_label'));
         return `<tr class="clickable" data-kind="result" data-index="${idx}">
           <td>${esc(candidateField(item, 'time_detected') || '')}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
           <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
           <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(item.contract_price_paid || candidateField(item, 'contract_price_paid') || candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
-          <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
+          <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td>${esc(freshness)}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
           <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
       };
@@ -4176,13 +4190,13 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         <tr class="clickable" data-kind="debug" data-index="${idx}">
           <td></td><td>Debug only</td><td>${esc(item.underlying || item.underlying_symbol || '')}</td><td colspan="5" class="muted">Debug candidate — not alert quality</td>
           <td>${intFmt(item.volume)}</td><td>${intFmt(item.open_interest)}</td><td></td><td></td>
-          <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium || item.estimated_premium)}</td><td><span class="score">${esc(item.score)}</span></td>
+          <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium || item.estimated_premium)}</td><td>${esc(freshnessText(item.fresh_flow_label))}</td><td><span class="score">${esc(item.score)}</span></td>
           <td>Not alert quality</td><td>Watch only</td><td>Needs confirmation</td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
         </tr>`;
       window.__showDebugCandidates = () => {
         els.modeNotice.innerHTML = '<div class="notice warn">Debug Candidates — Not Alerts. Use this only to tune filters, not as whale-flow signals.</div>';
         els.rowCount.textContent = `${near.length} debug candidates`;
-        els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="19" class="muted">No debug candidates.</td></tr>';
+        els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="20" class="muted">No debug candidates.</td></tr>';
       };
       if (official.length) {
         els.modeNotice.innerHTML = latest.diagnostics?.debug_loose_mode ? '<div class="notice warn">DEBUG LOOSE MODE — not alert quality.</div>' : '<div class="notice good">Real whale-flow alerts. Watch only — not a trade signal.</div>';
@@ -4193,10 +4207,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.rowCount.textContent = '0 real whale alerts';
       if (near.length) {
         els.modeNotice.innerHTML = `<div class="notice warn">No real whale alerts passed the filters right now. ${near.length} debug candidates are hidden because they are not alert quality. <button type="button" onclick="window.__showDebugCandidates()">Show Debug Candidates</button></div>`;
-        els.flowRows.innerHTML = '<tr><td colspan="19" class="muted">No real whale alerts right now. Debug candidates are hidden.</td></tr>';
+        els.flowRows.innerHTML = '<tr><td colspan="20" class="muted">No real whale alerts right now. Debug candidates are hidden.</td></tr>';
       } else {
         els.modeNotice.innerHTML = '';
-        els.flowRows.innerHTML = '<tr><td colspan="19" class="muted">No real whale alerts yet.</td></tr>';
+        els.flowRows.innerHTML = '<tr><td colspan="20" class="muted">No real whale alerts yet.</td></tr>';
       }
     }
     function renderDetail(item) {
@@ -4208,11 +4222,16 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       };
       const reasons = item.detailed_reasons || [];
       const warnings = [...(c.warnings || []), ...(item.score_warnings || [])].filter(Boolean);
+      const freshLabel = freshnessText(item.fresh_flow_label || cf('fresh_flow_label'));
+      const age = item.trade_print_age_seconds ?? cf('trade_print_age_seconds');
+      const ageText = age !== undefined && age !== null && age !== '' ? `${esc(age)} seconds (${esc(item.trade_print_age_minutes ?? cf('trade_print_age_minutes') ?? 'n/a')} minutes)` : 'unavailable';
+      const staleWarning = item.trade_print_age_warning || cf('trade_print_age_warning') || '';
+      const staleCaution = (item.stale_trade_print || cf('stale_trade_print')) ? '<br><strong>Old premium print — do not treat as fresh flow.</strong>' : '';
       els.detailPanel.innerHTML = `
         <div class="detail-grid">
           <div class="card"><span class="label">Important Flow Info</span><div>Contract: ${esc(item.display_contract || cf('display_contract') || cf('option_symbol'))}<br>Moneyness: ${esc(item.display_moneyness || cf('display_moneyness') || cf('moneyness'))}<br>Total premium: ${money(cf('estimated_premium'))}<br>Price paid: ${money(item.contract_price_paid || cf('contract_price_paid'))}<br>Watch only — not a trade signal</div></div>
           <div class="card"><span class="label">Contract</span><div>${esc(cf('option_symbol'))} ${esc(cf('option_type'))} ${money(cf('strike'))} exp ${esc(cf('expiration'))}</div></div>
-          <div class="card"><span class="label">Premium Time</span><div>Reported trade time: ${esc(item.reported_trade_time || cf('reported_trade_time') || 'unavailable')}<br>Quote time: ${esc(item.reported_quote_time || cf('reported_quote_time') || 'unavailable')}<br>Scanner detected: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>${esc(item.premium_timing_warning || cf('premium_timing_warning') || '')}</div></div>
+          <div class="card"><span class="label">Premium Time</span><div>Reported trade time: ${esc(item.reported_trade_time || cf('reported_trade_time') || 'unavailable')}<br>Quote time: ${esc(item.reported_quote_time || cf('reported_quote_time') || 'unavailable')}<br>Scanner detected: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>Trade print age: ${ageText}<br>Fresh flow label: ${esc(freshLabel)}<br>Stale warning: ${esc(staleWarning || item.premium_timing_warning || cf('premium_timing_warning') || 'None')}${staleCaution}</div></div>
           <div class="card"><span class="label">Pressure</span><div>${esc(item.premium_pressure_label || cf('premium_pressure_label') || 'unknown')} | ${esc(item.premium_pressure_confidence || cf('premium_pressure_confidence') || '')}<br>${esc(item.premium_pressure_reason || cf('premium_pressure_reason') || '')}</div></div>
           <div class="card"><span class="label">Follow-through</span><div>${esc(item.follow_through_status || 'no_follow_up_yet')}<br>Follow-up premium: ${money(item.follow_up_premium)}<br>Follow-up count: ${esc(item.follow_up_count ?? 0)}<br>Last follow-up time: ${esc(item.last_follow_up_time || 'none yet')}<br>${esc(item.follow_through_reason || '')}</div></div>
           <div class="card"><span class="label">Why unusual</span><div>${esc(item.reason_summary || 'No unusualness explanation available yet.')}<br>${esc(reasons.join(' '))}</div></div>

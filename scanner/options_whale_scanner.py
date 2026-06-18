@@ -186,12 +186,27 @@ def build_premium_timing_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
     detected_dt = _parse_iso_time(detected_time)
     delay = None
     warning = ""
+    stale_trade_print = False
+    fresh_flow_label = "timing unavailable"
+    trade_print_age_warning = ""
     if trade_dt and detected_dt:
         delay = max(0.0, round((detected_dt - trade_dt).total_seconds(), 2))
         if delay > 120:
             warning = "Premium timing is delayed; verify the print before relying on it."
+            stale_trade_print = True
+            fresh_flow_label = "old trade print"
+            trade_print_age_warning = "Reported trade printed more than 2 minutes before scanner detection."
+        else:
+            fresh_flow_label = "fresh premium print"
+        if delay > 900:
+            fresh_flow_label = "stale / old premium print"
+            trade_print_age_warning = "Reported trade printed more than 15 minutes before scanner detection; do not treat this as fresh flow."
     elif not trade_dt:
         warning = "Reported trade time unavailable."
+        trade_print_age_warning = "Trade timestamp unavailable."
+    elif not detected_dt:
+        warning = "Scanner detection time unavailable."
+        trade_print_age_warning = "Scanner detection time unavailable."
     summary_parts = []
     if trade_time:
         summary_parts.append(f"trade {trade_time}")
@@ -204,6 +219,11 @@ def build_premium_timing_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "reported_quote_time": quote_time,
         "scanner_detected_time": detected_time,
         "premium_trade_delay_seconds": delay,
+        "stale_trade_print": stale_trade_print,
+        "trade_print_age_seconds": delay,
+        "trade_print_age_minutes": round(delay / 60, 2) if delay is not None else None,
+        "trade_print_age_warning": trade_print_age_warning,
+        "fresh_flow_label": fresh_flow_label,
         "premium_timing_summary": " | ".join(summary_parts) if summary_parts else "premium timing unavailable",
         "premium_timing_warning": warning,
     }
@@ -260,27 +280,117 @@ def build_premium_pressure_fields(result_or_candidate: Dict[str, Any]) -> Dict[s
     }
 
 
+def _row_candidate(row: Dict[str, Any]) -> Dict[str, Any]:
+    return row.get("candidate") if isinstance(row.get("candidate"), dict) else row
+
+
+def _key_value(row: Dict[str, Any], field: str) -> Any:
+    candidate = _row_candidate(row)
+    value = candidate.get(field)
+    return value if value is not None and value != "" else row.get(field)
+
+
+def _key_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    return round(safe_float(value), 4)
+
+
+def _key_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    return int(round(safe_float(value)))
+
+
+def build_whale_print_key(row: Dict[str, Any]) -> tuple[Any, ...]:
+    price = _key_value(row, "last")
+    if price is None or price == "":
+        price = _key_value(row, "contract_price_paid")
+    if price is None or price == "":
+        price = _key_value(row, "midpoint")
+    return (
+        str(_key_value(row, "option_symbol") or "").upper(),
+        str(_key_value(row, "trade_time") or _key_value(row, "reported_trade_time") or ""),
+        _key_float(price),
+        _key_int(_key_value(row, "volume")),
+        _key_float(_key_value(row, "estimated_premium")),
+        _key_int(_key_value(row, "open_interest")),
+    )
+
+
+def _row_completeness(row: Dict[str, Any]) -> int:
+    candidate = _row_candidate(row)
+    values = list(row.values()) + list(candidate.values())
+    return sum(1 for value in values if value not in (None, "", [], {}))
+
+
+def _prefer_whale_print(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    existing_score = int(existing.get("whale_score") or existing.get("score") or 0)
+    incoming_score = int(incoming.get("whale_score") or incoming.get("score") or 0)
+    if incoming_score != existing_score:
+        return incoming if incoming_score > existing_score else existing
+    existing_dt = _parse_iso_time(_key_value(existing, "time_detected") or existing.get("timestamp"))
+    incoming_dt = _parse_iso_time(_key_value(incoming, "time_detected") or incoming.get("timestamp"))
+    if incoming_dt != existing_dt:
+        return incoming if incoming_dt and (not existing_dt or incoming_dt > existing_dt) else existing
+    return incoming if _row_completeness(incoming) > _row_completeness(existing) else existing
+
+
+def dedupe_whale_prints(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    kept: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+    order: List[tuple[Any, ...]] = []
+    for row in rows:
+        key = build_whale_print_key(row)
+        if key not in kept:
+            kept[key] = row
+            order.append(key)
+        else:
+            kept[key] = _prefer_whale_print(kept[key], row)
+    return [kept[key] for key in order]
+
+
+def _is_duplicate_whale_print(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    return build_whale_print_key(left) == build_whale_print_key(right)
+
+
+def _is_true_follow_up(prior: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    if _is_duplicate_whale_print(prior, current):
+        return False
+    prior_trade = _parse_iso_time(_key_value(prior, "trade_time") or _key_value(prior, "reported_trade_time"))
+    current_trade = _parse_iso_time(_key_value(current, "trade_time") or _key_value(current, "reported_trade_time"))
+    if prior_trade and current_trade:
+        return current_trade > prior_trade
+    prior_detected = _parse_iso_time(_key_value(prior, "time_detected") or prior.get("timestamp"))
+    current_detected = _parse_iso_time(_key_value(current, "time_detected") or current.get("timestamp"))
+    if prior_detected and current_detected and current_detected <= prior_detected:
+        return False
+    premium_changed = _key_float(_key_value(prior, "estimated_premium")) != _key_float(_key_value(current, "estimated_premium"))
+    volume_changed = _key_int(_key_value(prior, "volume")) != _key_int(_key_value(current, "volume"))
+    return premium_changed or volume_changed
+
+
 def attach_simple_follow_through(rows: List[Dict[str, Any]], history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     history = history or []
-    seen: Dict[str, Dict[str, Any]] = {}
+    seen: Dict[str, List[Dict[str, Any]]] = {}
     for row in history:
-        candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else row
-        symbol = str(candidate.get("option_symbol") or "")
+        candidate = _row_candidate(row)
+        symbol = str(candidate.get("option_symbol") or "").upper()
         if symbol:
-            seen[symbol] = row
+            seen.setdefault(symbol, []).append(row)
     for row in rows:
-        candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else row
-        symbol = str(candidate.get("option_symbol") or "")
+        candidate = _row_candidate(row)
+        symbol = str(candidate.get("option_symbol") or "").upper()
         premium = safe_float(candidate.get("estimated_premium") or row.get("estimated_premium"))
-        if symbol and symbol in seen:
-            prior = seen[symbol]
-            prior_candidate = prior.get("candidate") if isinstance(prior.get("candidate"), dict) else prior
+        prior_matches = [prior for prior in seen.get(symbol, []) if _is_true_follow_up(prior, row)]
+        if symbol and prior_matches:
+            prior = prior_matches[-1]
+            prior_candidate = _row_candidate(prior)
             row.update({
                 "follow_through_status": "more_premium_added",
                 "follow_up_premium": premium,
                 "follow_up_count": int(prior.get("follow_up_count") or 0) + 1,
                 "last_follow_up_time": candidate.get("time_detected") or row.get("timestamp"),
-                "follow_through_reason": "Same option contract appeared again in available scan or alert history.",
+                "follow_through_reason": "Same option contract showed later trade timing or changed premium/volume in available scan or alert history.",
             })
             prior_candidate["last_follow_up_time"] = candidate.get("time_detected") or row.get("timestamp")
         else:
@@ -292,7 +402,7 @@ def attach_simple_follow_through(rows: List[Dict[str, Any]], history: Optional[L
                 "follow_through_reason": "No later same-contract flow is available yet.",
             })
         if symbol:
-            seen[symbol] = row
+            seen.setdefault(symbol, []).append(row)
     return rows
 
 
@@ -681,6 +791,8 @@ class OptionsWhaleScanner:
                 continue
             candidate = self._candidate_from_contract(contract, snapshots[symbol], prices, end).to_dict()
             candidate.update(build_premium_timing_fields(candidate))
+            if candidate.get("stale_trade_print"):
+                candidate["warnings"] = list(candidate.get("warnings") or []) + ["old premium print — do not treat as fresh flow"]
             candidate.update(build_premium_display_fields(candidate))
             context = classify_price_context(candidate["underlying_symbol"], candidate["option_type"], candidate.get("underlying_price"), stock_bars.get(candidate["underlying_symbol"], [])) if self.whale.get("enable_price_action_context", True) else {}
             candidate.update(classify_aggression(candidate))
@@ -785,6 +897,13 @@ class OptionsWhaleScanner:
             near_misses_out.append({
                 "option_symbol": candidate.get("option_symbol"),
                 "underlying": candidate.get("underlying_symbol"),
+                "trade_time": candidate.get("trade_time"),
+                "time_detected": candidate.get("time_detected"),
+                "fresh_flow_label": candidate.get("fresh_flow_label"),
+                "stale_trade_print": candidate.get("stale_trade_print"),
+                "trade_print_age_seconds": candidate.get("trade_print_age_seconds"),
+                "trade_print_age_minutes": candidate.get("trade_print_age_minutes"),
+                "trade_print_age_warning": candidate.get("trade_print_age_warning"),
                 "volume": candidate.get("volume"),
                 "open_interest": candidate.get("open_interest"),
                 "premium": candidate.get("estimated_premium"),
@@ -793,12 +912,18 @@ class OptionsWhaleScanner:
                 "reason_rejected": item.get("reason_rejected"),
                 "thresholds_failed": item.get("filter_rejection_reasons", []),
             })
+        raw_results_count = len(results)
+        results = dedupe_whale_prints(results)
+        duplicate_results_count = raw_results_count - len(results)
         scan_record = {
             "timestamp": utc_now_iso(),
             "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
             "contracts_scanned": len(option_symbols),
             "candidates_found": len(raw_candidates),
             "results_count": len(results),
+            "raw_results_count": raw_results_count,
+            "deduped_results_count": len(results),
+            "duplicate_results_count": duplicate_results_count,
             "partial_scan": len(option_symbols) >= max_contracts,
             "partial_scan_warning": "Rate limited or contract cap reached — showing partial scan results." if len(option_symbols) >= max_contracts else "",
             "debug_loose_mode": debug_loose,
@@ -831,7 +956,16 @@ class OptionsWhaleScanner:
         return scan_record
 
     def history(self, limit: int = 100) -> Dict[str, Any]:
-        return {"alerts": self.storage.latest_alerts(limit=limit)}
+        raw_alerts = self.storage.latest_alerts(limit=limit)
+        deduped_alerts = dedupe_whale_prints(raw_alerts)
+        return {
+            "alerts": deduped_alerts,
+            "metadata": {
+                "raw_count": len(raw_alerts),
+                "deduped_count": len(deduped_alerts),
+                "duplicate_count": len(raw_alerts) - len(deduped_alerts),
+            },
+        }
 
     def latest(self) -> Dict[str, Any]:
         if not self.last_scan and self.latest_path.exists():

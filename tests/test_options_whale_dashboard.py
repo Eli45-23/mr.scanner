@@ -59,6 +59,17 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("No real whale alerts passed the filters right now.", html)
         self.assertIn("No real whale alerts right now. Debug candidates are hidden.", html)
 
+    def test_whale_dashboard_renders_freshness_labels_and_stale_warning(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        self.assertIn("Fresh premium print", html)
+        self.assertIn("Old trade print", html)
+        self.assertIn("Stale / old premium print", html)
+        self.assertIn("Timing unavailable", html)
+        self.assertIn("Trade print age", html)
+        self.assertIn("Fresh flow label", html)
+        self.assertIn("Stale warning", html)
+        self.assertIn("Old premium print — do not treat as fresh flow.", html)
+
     def test_whale_dashboard_detail_explains_real_alerts(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         for label in (
