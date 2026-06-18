@@ -140,11 +140,26 @@ def _timestamp(raw: Dict[str, Any]) -> Optional[str]:
     return str(value) if value else None
 
 
+def _normalize_iso_timestamp(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.match(r"^(?P<prefix>.+?\.)(?P<fraction>\d{7,})(?P<suffix>Z|[+-]\d{2}:?\d{2})?$", text)
+    if match:
+        text = f"{match.group('prefix')}{match.group('fraction')[:6]}{match.group('suffix') or ''}"
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    return text
+
+
 def _quote_age_seconds(timestamp: Optional[str], now: datetime) -> Optional[float]:
-    if not timestamp:
+    normalized = _normalize_iso_timestamp(timestamp)
+    if not normalized:
         return None
     try:
-        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds())
@@ -153,10 +168,11 @@ def _quote_age_seconds(timestamp: Optional[str], now: datetime) -> Optional[floa
 
 
 def _parse_iso_time(value: Any) -> Optional[datetime]:
-    if not value:
+    normalized = _normalize_iso_timestamp(value)
+    if not normalized:
         return None
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
     if parsed.tzinfo is None:

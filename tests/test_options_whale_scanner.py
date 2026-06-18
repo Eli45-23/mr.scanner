@@ -14,6 +14,8 @@ from scanner.options_whale_scanner import (
     build_whale_print_key,
     dedupe_whale_prints,
     format_whale_alert,
+    _parse_iso_time,
+    _quote_age_seconds,
 )
 from scanner.options_whale_storage import OptionsWhaleStorage
 
@@ -259,6 +261,25 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         self.assertFalse(missing_detected["stale_trade_print"])
         self.assertEqual(missing_detected["fresh_flow_label"], "timing unavailable")
         self.assertIn("Scanner detection time unavailable", missing_detected["trade_print_age_warning"])
+
+    def test_alpaca_nanosecond_timestamp_parses_for_timing(self):
+        parsed = _parse_iso_time("2026-06-17T19:27:31.347282742Z")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.microsecond, 347282)
+        timing = build_premium_timing_fields({
+            "trade_time": "2026-06-17T19:27:31.347282742Z",
+            "time_detected": "2026-06-18T15:46:37Z",
+        })
+        self.assertTrue(timing["stale_trade_print"])
+        self.assertEqual(timing["fresh_flow_label"], "stale / old premium print")
+        self.assertIsNotNone(timing["trade_print_age_seconds"])
+        self.assertNotIn("unavailable", timing["premium_timing_warning"].lower())
+
+    def test_alpaca_nanosecond_quote_age_parses(self):
+        now = datetime(2026, 6, 17, 19, 27, 35, tzinfo=timezone.utc)
+        age = _quote_age_seconds("2026-06-17T19:27:31.347282742Z", now)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 3.652718, places=6)
 
     def test_stale_trade_print_marks_old_premium_timing(self):
         timing = build_premium_timing_fields({
