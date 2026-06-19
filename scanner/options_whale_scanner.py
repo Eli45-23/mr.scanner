@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 import json
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from scanner.options_block_detector import detect_block_print
 from scanner.options_data_client import OptionsDataClient
@@ -28,6 +29,9 @@ DEFAULT_PRIORITY_SEEDS = [
 ]
 
 INDEX_0DTE_SYMBOLS = {"SPY", "QQQ", "IWM", "DIA"}
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+OPTIONS_MARKET_OPEN = datetime_time(9, 30)
+OPTIONS_MARKET_CLOSE = datetime_time(16, 0)
 
 FORBIDDEN_ALERT_PHRASES = (
     "b" + "uy this",
@@ -80,6 +84,17 @@ def whale_config(config: Dict[str, Any]) -> Dict[str, Any]:
     merged = default_options_whale_config()
     merged.update(config.get("options_whale_scanner", {}))
     return merged
+
+
+def options_market_session_state(now: Optional[datetime] = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(MARKET_TIMEZONE)
+    if local.weekday() >= 5:
+        return "closed"
+    local_time = local.time()
+    return "regular" if OPTIONS_MARKET_OPEN <= local_time < OPTIONS_MARKET_CLOSE else "closed"
 
 
 def _contract_symbol(row: Dict[str, Any]) -> str:
@@ -796,6 +811,7 @@ class OptionsWhaleScanner:
 
     def scan(self) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
+        scan_session_state = options_market_session_state(start)
         if not self.whale.get("enabled", True):
             return {"enabled": False, "results": [], "message": "Options Whale Scanner disabled."}
         effective_cfg = self._effective_whale_config()
@@ -947,21 +963,30 @@ class OptionsWhaleScanner:
         duplicate_results_count = raw_results_count - len(results)
         fresh_results_count = sum(1 for item in results if not is_stale_whale_print(item))
         stale_results_count = len(results) - fresh_results_count
+        stale_quote_rejection_count = int(rejection_summary.get("stale_quote") or 0)
+        contracts_evaluated = len(evaluated)
+        passed_filter_count = len(raw_candidates)
         scan_record = {
             "timestamp": utc_now_iso(),
             "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
             "contracts_scanned": len(option_symbols),
-            "candidates_found": len(raw_candidates),
+            "contracts_evaluated": contracts_evaluated,
+            "passed_filter_count": passed_filter_count,
+            "candidates_found": passed_filter_count,
             "results_count": len(results),
             "fresh_count": fresh_results_count,
             "stale_count": stale_results_count,
+            "stale_quote_rejection_count": stale_quote_rejection_count,
             "raw_results_count": raw_results_count,
             "deduped_results_count": len(results),
             "duplicate_results_count": duplicate_results_count,
             "partial_scan": len(option_symbols) >= max_contracts,
             "partial_scan_warning": "Rate limited or contract cap reached — showing partial scan results." if len(option_symbols) >= max_contracts else "",
+            "scan_session_state": scan_session_state,
+            "scan_session_warning": "Options market is closed; treat this scan as after-hours/stale context." if scan_session_state != "regular" else "",
             "debug_loose_mode": debug_loose,
             "debug_label": "DEBUG LOOSE MODE — not alert quality" if debug_loose else "",
+            "debug_loose_mode_warning": "DEBUG LOOSE MODE — results are not alert quality and notifications are disabled." if debug_loose else "",
             **self.last_scan_order,
             "skipped_contracts_count": sum(skipped_reasons.values()),
             "skipped_reasons_summary": skipped_reasons,

@@ -14,6 +14,7 @@ from scanner.options_whale_scanner import (
     build_whale_print_key,
     dedupe_whale_prints,
     format_whale_alert,
+    options_market_session_state,
     _parse_iso_time,
     _quote_age_seconds,
 )
@@ -141,6 +142,10 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             }, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
             result = scanner.scan()
             self.assertEqual(result["results_count"], 0)
+            self.assertIn("contracts_evaluated", result)
+            self.assertEqual(result["passed_filter_count"], result["candidates_found"])
+            self.assertIn("stale_quote_rejection_count", result)
+            self.assertIn(result["scan_session_state"], {"regular", "closed"})
             self.assertGreater(result["near_miss_count"], 0)
             self.assertIn("premium_below_threshold", result["candidate_filter_rejection_summary"])
             self.assertIn("thresholds_failed", result["near_misses"][0])
@@ -176,8 +181,14 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             result = scanner.scan()
             self.assertTrue(result["debug_loose_mode"])
             self.assertIn("not alert quality", result["debug_label"])
+            self.assertIn("notifications are disabled", result["debug_loose_mode_warning"])
             self.assertGreaterEqual(result["results_count"], 1)
             self.assertFalse(result["results"][0]["should_notify"])
+
+    def test_options_market_session_state_uses_new_york_regular_hours(self):
+        self.assertEqual(options_market_session_state(datetime(2026, 6, 18, 15, 0, tzinfo=timezone.utc)), "regular")
+        self.assertEqual(options_market_session_state(datetime(2026, 6, 18, 20, 1, tzinfo=timezone.utc)), "closed")
+        self.assertEqual(options_market_session_state(datetime(2026, 6, 20, 15, 0, tzinfo=timezone.utc)), "closed")
 
     def test_alert_message_has_required_disclaimer(self):
         message = format_whale_alert({

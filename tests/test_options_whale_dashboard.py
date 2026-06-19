@@ -82,6 +82,8 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Old Premium Prints — Not Fresh Alerts", html)
         self.assertIn("Show Old Premium Prints", html)
         self.assertIn("Fresh premium print.", html)
+        self.assertIn("Passed filters", html)
+        self.assertIn("Stale quote rejects", html)
 
     def test_whale_dashboard_symbol_search_accepts_any_ticker_in_data(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
@@ -213,6 +215,55 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
                     result = scanner_dashboard.run_options_whale_scan_locked("manual")
             self.assertEqual(result["contracts_scanned"], 5)
             self.assertTrue(scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.exists())
+
+    def test_auto_scan_after_close_preserves_latest_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH = root / "data" / "options_whale_latest.json"
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            original = {
+                "timestamp": "2026-06-18T19:55:00Z",
+                "scan_session_state": "regular",
+                "results": [{"candidate": {"underlying_symbol": "AAPL"}}],
+                "near_misses": [],
+            }
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.write_text(json.dumps(original), encoding="utf-8")
+            fake_scanner = mock.Mock()
+            with mock.patch.object(scanner_dashboard, "options_market_session_state", return_value="closed"):
+                with mock.patch.object(scanner_dashboard, "options_whale_scanner", return_value=fake_scanner):
+                    result = scanner_dashboard.run_options_whale_scan_locked("auto")
+            self.assertTrue(result["preserved_regular_session_scan"])
+            self.assertIn("preserving last regular-session scan", result["message"])
+            fake_scanner.scan.assert_not_called()
+            stored = json.loads(scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.read_text(encoding="utf-8"))
+            self.assertEqual(stored, original)
+
+    def test_manual_after_close_scan_writes_labeled_after_hours_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scanner_dashboard.OPTIONS_WHALE_LATEST_PATH = Path(tmp) / "data" / "options_whale_latest.json"
+
+            class FakeScanner:
+                def scan(self):
+                    return {
+                        "timestamp": "2026-06-18T20:05:00Z",
+                        "scan_session_state": "closed",
+                        "scan_session_warning": "Options market is closed; treat this scan as after-hours/stale context.",
+                        "contracts_scanned": 5,
+                        "contracts_evaluated": 5,
+                        "passed_filter_count": 0,
+                        "candidates_found": 0,
+                        "near_misses": [],
+                        "results": [],
+                    }
+
+            with mock.patch.object(scanner_dashboard, "options_market_session_state", return_value="closed"):
+                with mock.patch.object(scanner_dashboard, "options_whale_scanner", return_value=FakeScanner()):
+                    with mock.patch.object(scanner_dashboard, "send_options_whale_notifications", return_value=None) as notify:
+                        result = scanner_dashboard.run_options_whale_scan_locked("manual")
+            self.assertEqual(result["scan_session_state"], "closed")
+            self.assertIn("after-hours", result["scan_session_warning"])
+            self.assertTrue(scanner_dashboard.OPTIONS_WHALE_LATEST_PATH.exists())
+            notify.assert_not_called()
 
     def test_auto_scan_start_is_idempotent(self):
         with mock.patch.object(scanner_dashboard, "options_whale_auto_scan_enabled", return_value=True):

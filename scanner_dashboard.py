@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 import elite_momentum_scanner as scanner_app
 import requests
 from scanner.options_data_client import OptionsDataClient
-from scanner.options_whale_scanner import OptionsWhaleScanner
+from scanner.options_whale_scanner import OptionsWhaleScanner, options_market_session_state
 from scanner.options_whale_storage import OptionsWhaleStorage
 from tools import dashboard_snapshot_exporter as snapshot_exporter
 from tools.preview_liquidity_sweeps import (
@@ -551,6 +551,20 @@ def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
         latest["message"] = "scan already running"
         return latest
     try:
+        session_state = options_market_session_state()
+        if reason == "auto" and session_state != "regular":
+            latest = options_whales_latest()
+            latest["scan_trigger"] = reason
+            latest["scan_session_state"] = session_state
+            latest["preserved_regular_session_scan"] = True
+            latest["message"] = "Options market closed; preserving last regular-session scan."
+            latest.setdefault("diagnostics", {})["preserved_regular_session_scan"] = True
+            latest["diagnostics"]["scan_session_state"] = session_state
+            latest["diagnostics"]["scan_session_warning"] = "Options market closed; preserving last regular-session scan."
+            with STATE.lock:
+                STATE.options_whale_last_scan_finished_at = iso_now()
+                STATE.options_whale_last_scan_error = ""
+            return latest
         with STATE.lock:
             STATE.options_whale_scan_running = True
             STATE.options_whale_last_scan_started_at = iso_now()
@@ -559,7 +573,8 @@ def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
         result = scanner.scan()
         result["scan_trigger"] = reason
         write_latest_options_whale_scan(result)
-        send_options_whale_notifications(result)
+        if result.get("scan_session_state") == "regular":
+            send_options_whale_notifications(result)
         with STATE.lock:
             STATE.last_scan_at = result.get("timestamp") or iso_now()
             STATE.options_whale_last_scan_finished_at = iso_now()
@@ -633,7 +648,13 @@ def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -
         "latest_result_count": len(latest.get("results") or []),
         "latest_near_miss_count": len(latest.get("near_misses") or []),
         "contracts_scanned": latest.get("contracts_scanned", 0),
+        "contracts_evaluated": latest.get("contracts_evaluated", latest.get("contracts_scanned", 0)),
+        "passed_filter_count": latest.get("passed_filter_count", latest.get("candidates_found", 0)),
         "candidates_found": latest.get("candidates_found", 0),
+        "stale_quote_rejection_count": latest.get("stale_quote_rejection_count", 0),
+        "scan_session_state": latest.get("scan_session_state") or options_market_session_state(),
+        "scan_session_warning": latest.get("scan_session_warning", ""),
+        "preserved_regular_session_scan": bool(latest.get("preserved_regular_session_scan")),
         "stale": stale,
         "stale_warning": "Scan results are stale. Latest scan is stale. Auto-scan may not be running." if stale else "",
     }
@@ -717,6 +738,8 @@ def options_whales_latest() -> Dict[str, Any]:
         "scan_age_seconds": runtime["last_scan_age_seconds"],
         "results": results,
         "near_misses": payload.get("near_misses", []),
+        "preserved_regular_session_scan": bool(payload.get("preserved_regular_session_scan")),
+        "message": payload.get("message", ""),
         "fresh_count": counts["fresh_count"],
         "stale_count": counts["stale_count"],
         "deduped_count": deduped_count,
@@ -727,7 +750,7 @@ def options_whales_latest() -> Dict[str, Any]:
         },
         "last_scan": {k: v for k, v in payload.items() if k != "results"},
         "stale": runtime["stale"],
-        "stale_warning": runtime["stale_warning"],
+        "stale_warning": payload.get("message") or runtime["scan_session_warning"] or runtime["stale_warning"],
     }
 
 
@@ -4250,12 +4273,14 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Next scan ETA', status.next_scan_eta_seconds !== null && status.next_scan_eta_seconds !== undefined ? num(status.next_scan_eta_seconds, 's') : 'Unknown'),
         card('Current scan', current, current === 'Running' ? 'warn' : 'good'),
         card('Contracts scanned', scan.contracts_scanned ?? status.contracts_scanned ?? 0),
-        card('Candidates found', scan.candidates_found ?? status.candidates_found ?? 0),
+        card('Contracts evaluated', scan.contracts_evaluated ?? status.contracts_evaluated ?? scan.contracts_scanned ?? status.contracts_scanned ?? 0),
+        card('Passed filters', scan.passed_filter_count ?? status.passed_filter_count ?? scan.candidates_found ?? status.candidates_found ?? 0),
+        card('Stale quote rejects', scan.stale_quote_rejection_count ?? status.stale_quote_rejection_count ?? 0, (scan.stale_quote_rejection_count ?? status.stale_quote_rejection_count ?? 0) ? 'warn' : ''),
         card('Results', (latest.results || []).length),
         card('Fresh prints', latest.fresh_count ?? latest.diagnostics?.fresh_count ?? 0, 'good'),
         card('Old prints', latest.stale_count ?? latest.diagnostics?.stale_count ?? 0, (latest.stale_count ?? latest.diagnostics?.stale_count ?? 0) ? 'warn' : ''),
       ].join('');
-      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, latest.stale_warning].filter(Boolean);
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }
