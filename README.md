@@ -6,18 +6,23 @@ A private, read-only options-flow scanner and dashboard for spotting unusual opt
 
 ## Current status
 
-This repo is now focused on the Options Whale Scanner workflow.
+This repo is focused on the Options Whale Scanner workflow.
 
 | Area | Status |
 |---|---|
 | Historical unusualness baseline | Wired into scan scoring/output |
 | Bid/ask aggression classification | Implemented with quote-staleness safeguards |
+| Premium timing and freshness | Implemented; stale/old prints are clearly labeled |
+| Symbol search | Implemented on the main dashboard; accepts any ticker present in scanner data |
 | Multi-leg/spread/roll detection | Implemented as conservative “possible” labels |
 | SPY/QQQ/IWM/DIA 0DTE noise handling | Implemented with stricter 0DTE index thresholds |
 | Opening vs closing estimate | Implemented as current-day estimate only |
 | Price-action confirmation | Implemented when underlying bars/price context are available |
 | Alert outcome tracking | Implemented for 5m/15m/30m/60m windows |
-| Next-day OI confirmation | Scaffolded/pending; requires next trading-day OI |
+| Outcome diagnostics | Implemented; records returned bars, requested windows, and pending reasons |
+| Outcome compaction | Implemented as a safe dry-run-first cleanup tool |
+| Next-day OI confirmation | Implemented as a review tool; useful only after next trading-day OI exists |
+| Last good regular-session scan | Implemented; stale after-close scans do not wipe useful in-session dashboard data |
 | Learning/ranking from what mattered | Scaffolded/pending; requires accumulated outcome history |
 | Dashboard explanation clarity | Implemented on the main dashboard |
 
@@ -56,11 +61,15 @@ The dashboard provides:
 - option universe status
 - scan controls
 - filter controls
+- a free-form ticker search box
 - real whale-flow alerts first
+- stale/old premium prints separated and labeled
 - debug candidates hidden by default
 - row-level explanations
 - score breakdowns
-- aggression, multi-leg, opening/closing, price-context, and warning fields
+- premium timing, pressure, follow-through, next-day OI, price context, and warning fields
+- clearer scan metrics such as contracts evaluated, passed filters, near misses, and stale quote rejects
+- last-good regular-session scan display after market close when fresh quotes are stale
 
 Use the outcome dashboard separately:
 
@@ -89,6 +98,8 @@ The scanner analyzes options contracts for:
 - opening vs closing clues
 - underlying price-action confirmation
 - historical unusualness versus local baseline data
+- premium timing and quote freshness
+- same-contract follow-through
 
 All signals are probabilistic. Large options prints can be opening flow, closing flow, hedges, spreads, rolls, dealer positioning, or noisy index/ETF activity.
 
@@ -112,9 +123,63 @@ Examples of why a debug candidate may fail:
 - noisy SPY/QQQ/IWM/DIA 0DTE flow
 - missing bid/ask context
 
+### Debug loose mode
+
+Debug loose mode is for scanner tuning and discovery only. When enabled, the dashboard should make it obvious with:
+
+```text
+DEBUG LOOSE MODE — discovery only, not alert quality.
+```
+
+Normal use should keep debug loose mode off unless explicitly enabled in config or environment variables.
+
+### Stale or old premium print
+
+A stale row means the option trade/quote data is old relative to the scan time. These rows can still be useful for historical context, but they should not be treated as fresh flow.
+
+### Last good regular-session scan
+
+After regular options-market hours, quotes can go stale and scans may return no fresh results. The scanner preserves the last useful regular-session payload in:
+
+```text
+data/options_whale_last_good_regular_session.json
+```
+
+The dashboard can keep showing that preserved scan with a market-closed notice instead of being wiped by an empty stale after-close scan.
+
 ### Awaiting next-day OI confirmation
 
-The scanner can estimate whether flow looks opening or closing using same-day data, but true confirmation requires next trading-day open interest. The dashboard should not mark next-day OI as confirmed until that data exists.
+The scanner can estimate whether flow looks opening or closing using same-day data, but true confirmation requires next trading-day open interest. Do not treat same-day next-day OI review results as final.
+
+## Symbol search
+
+The main dashboard search box accepts any ticker text. It is not limited to a preset list.
+
+Examples:
+
+```text
+AAPL
+MSFT
+META
+GOOGL
+AMZN
+IWM
+DIA
+GLD
+SMH
+AMD
+NFLX
+```
+
+Search behavior:
+
+- trims spaces
+- converts the input to uppercase internally
+- matches `underlying_symbol` exactly first
+- falls back to `option_symbol` contains search text
+- does not reject ETFs or stocks
+- shows `No fresh [TICKER] whale alerts right now.` if no current rows match
+- preserves normal dashboard behavior when search is cleared
 
 ## Main commands
 
@@ -182,6 +247,13 @@ python3 tools/run_options_whale_scan.py
 python3 scanner_dashboard.py --open
 ```
 
+### Restart dashboard cleanly
+
+```bash
+lsof -ti :8765 | xargs kill -9
+python3 scanner_dashboard.py --open
+```
+
 ### Run outcome dashboard
 
 ```bash
@@ -191,19 +263,44 @@ python3 -m tools.options_outcome_dashboard --open
 ### Review outcomes once
 
 ```bash
-python3 tools/review_options_alert_outcomes.py --limit 25
+python3 tools/review_options_alert_outcomes.py --limit 100
 ```
 
 ### Review outcomes in a loop
 
 ```bash
-python3 tools/review_options_alert_outcomes.py --loop --interval-seconds 300 --limit 25
+python3 tools/review_options_alert_outcomes.py --loop --interval-seconds 300 --limit 100
 ```
 
 ### Summarize outcomes
 
 ```bash
 python3 tools/summarize_options_outcomes.py
+```
+
+### Compact outcome history safely
+
+Dry-run first:
+
+```bash
+python3 tools/compact_options_outcomes.py --dry-run
+```
+
+Apply only after reviewing the dry-run output:
+
+```bash
+python3 tools/compact_options_outcomes.py --apply
+```
+
+The apply mode creates a backup before replacing the runtime outcome file.
+
+### Review next-day OI
+
+Run this only after next trading-day OI should be available:
+
+```bash
+python3 tools/review_next_day_oi.py --limit 100 --dry-run
+python3 tools/review_next_day_oi.py --limit 100
 ```
 
 ### Export whale-flow history
@@ -215,15 +312,20 @@ python3 tools/export_options_whale_history.py --format csv
 
 ## Recommended daily workflow
 
-1. Start the main dashboard.
+1. Start the main dashboard during regular market hours.
 2. Check that Alpaca/options data is connected.
 3. Confirm filters are set.
 4. Run or wait for a whale scan.
-5. Focus on real whale alerts only.
-6. Ignore debug candidates unless tuning filters.
-7. Use your chart for confirmation.
-8. Let outcome tracking review alert performance after enough bars exist.
-9. Review outcome dashboard after the market session or later in the day.
+5. Use symbol search if focusing on one ticker such as AAPL, QQQ, SPY, or any other symbol.
+6. Focus on real whale alerts first.
+7. Treat debug candidates as tuning/discovery only.
+8. Treat stale/old premium prints as context only, not fresh flow.
+9. Use your chart for confirmation.
+10. Let outcome tracking review alert performance after enough bars exist.
+11. Review the outcome dashboard after the market session or later in the day.
+12. Run next-day OI review only on the next trading day after OI updates.
+
+After market close, the dashboard may show the last good regular-session scan instead of an empty stale after-close scan.
 
 ## Default scanner filters
 
@@ -271,6 +373,27 @@ GET  /api/options-whales/export.json
 GET  /api/options-whales/export.csv
 ```
 
+## Scan metrics
+
+Latest scan payloads include clearer metric names:
+
+```text
+underlyings_considered
+underlyings_scanned
+contracts_evaluated
+passed_filter_count
+near_miss_count
+final_result_count
+stale_quote_rejection_count
+max_contracts_per_scan
+contract_cap_reached
+scan_session_state
+```
+
+`candidates_found` is preserved for backward compatibility, but dashboard copy should prefer `Passed filters` because that is what the number represents.
+
+If `contract_cap_reached` is true, later symbols may not have been scanned in that run.
+
 ## Repo map
 
 ### Dashboards
@@ -299,7 +422,7 @@ Outcome proof dashboard.
 scanner/options_whale_scanner.py
 ```
 
-Main options scanner. Builds candidates, scores flow, applies unusualness, aggression, multi-leg, 0DTE noise, opening/closing, price context, alert tiers, storage, and latest-scan payloads.
+Main options scanner. Builds candidates, scores flow, applies unusualness, aggression, multi-leg, 0DTE noise, opening/closing, price context, alert tiers, storage, latest-scan payloads, stale after-close preservation, and clearer scan metrics.
 
 ```text
 scanner/options_data_client.py
@@ -362,7 +485,7 @@ Possible sweep/block heuristics.
 scanner/options_oi_review.py
 ```
 
-Next-day OI review support/scaffolding.
+Next-day OI review support.
 
 ### Outcome tracking
 
@@ -376,13 +499,19 @@ Evaluates 5m/15m/30m/60m follow-through using underlying stock bars. Handles pen
 tools/review_options_alert_outcomes.py
 ```
 
-Reads latest alerts and appends outcome-review rows.
+Reads latest alerts and appends outcome-review rows with diagnostics.
 
 ```text
 tools/summarize_options_outcomes.py
 ```
 
 Summarizes outcome rows and excludes dirty completed rows from clean stats.
+
+```text
+tools/compact_options_outcomes.py
+```
+
+Safe dry-run-first compaction utility for duplicate/dirty outcome history. It writes a compacted latest-by-alert-key file and can back up and replace the runtime outcome file when `--apply` is used.
 
 ### Setup and operations
 
@@ -419,7 +548,9 @@ logs/options_whale_scans.jsonl
 logs/options_oi_reviews.jsonl
 data/options_universe.json
 data/options_whale_latest.json
+data/options_whale_last_good_regular_session.json
 data/options_whale_outcomes.jsonl
+data/options_whale_outcomes_compacted.jsonl
 data/options_unusualness_baseline.jsonl
 exports/
 state/
@@ -437,7 +568,9 @@ state/
 exports/
 data/options_universe.json
 data/options_whale_latest.json
+data/options_whale_last_good_regular_session.json
 data/options_whale_outcomes.jsonl
+data/options_whale_outcomes_compacted.jsonl
 data/options_unusualness_baseline.jsonl
 ```
 
@@ -446,7 +579,7 @@ data/options_unusualness_baseline.jsonl
 Run the full validation suite:
 
 ```bash
-python3 -m py_compile scanner_dashboard.py scanner/options_whale_scanner.py scanner/options_alert_outcomes.py tools/review_options_alert_outcomes.py tools/summarize_options_outcomes.py
+python3 -m py_compile scanner_dashboard.py scanner/options_whale_scanner.py scanner/options_alert_outcomes.py tools/review_options_alert_outcomes.py tools/summarize_options_outcomes.py tools/compact_options_outcomes.py
 python3 -m unittest discover -s tests -v
 git diff --check
 python3 tools/check_config_consistency.py
@@ -485,6 +618,14 @@ No real whale alerts passed the filters right now.
 
 Debug candidates may exist, but they are hidden by default because they are not alert quality.
 
+### Search shows no results
+
+The symbol search only searches the current scanner payload. If you type `AAPL` and see no fresh AAPL whale alerts, that means the scanner has no current fresh AAPL rows in the latest payload. Clear the search to return to the full scanner view.
+
+### Market is closed and dashboard still shows old rows
+
+This may be intentional. After regular options hours, the scanner can preserve the last useful regular-session scan so a stale empty after-close scan does not wipe the dashboard. The dashboard should label this state clearly.
+
 ### Options data unavailable
 
 Check:
@@ -517,9 +658,25 @@ scan_interval_seconds
 priority_batch_size
 ```
 
+If the contract cap is reached, the dashboard should warn that later symbols may not have been scanned in that run.
+
 ### Outcome stats look incomplete
 
 Outcome tracking needs future bars after an alert. Alerts late in the session may become `insufficient_future_session` because there is not enough regular-session time left for 5m/15m/30m/60m windows.
+
+### Outcome history has duplicate or dirty rows
+
+Run a dry-run compaction first:
+
+```bash
+python3 tools/compact_options_outcomes.py --dry-run
+```
+
+Apply only after checking the dry-run output:
+
+```bash
+python3 tools/compact_options_outcomes.py --apply
+```
 
 ## Development rules
 
@@ -539,10 +696,12 @@ Do not add order execution. Any future code that interacts with trading endpoint
 
 Near-term:
 
+- confirm exporter reads the intended scanner history source after storage changes
+- richer pending-outcome re-review workflow after bars become available
 - true next-day OI confirmation after future OI data is available
-- automatic review tool for next-day OI changes
 - learned quality scoring after enough outcome history is collected
 - cleaner dashboard group stats for which flow types worked best
+- scan rotation or sharding if contract-cap starvation becomes a practical issue
 
 Longer-term:
 
