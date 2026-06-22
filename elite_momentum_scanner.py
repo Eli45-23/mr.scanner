@@ -7703,6 +7703,10 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
         int(whale.get("max_contracts_per_scan", 10000)),
     )
     whale["max_results"] = env_int("OPTIONS_WHALE_MAX_RESULTS", int(whale.get("max_results", 100)))
+    whale["stale_trade_penalty"] = env_int("OPTIONS_WHALE_STALE_TRADE_PENALTY", int(whale.get("stale_trade_penalty", 15)))
+    whale["closing_flow_penalty"] = env_int("OPTIONS_WHALE_CLOSING_FLOW_PENALTY", int(whale.get("closing_flow_penalty", 8)))
+    whale["notification_dedupe_minutes"] = env_int("OPTIONS_WHALE_NOTIFICATION_DEDUPE_MINUTES", int(whale.get("notification_dedupe_minutes", 15)))
+    whale["max_notifications_per_symbol"] = env_int("OPTIONS_WHALE_MAX_NOTIFICATIONS_PER_SYMBOL", int(whale.get("max_notifications_per_symbol", 2)))
     whale["enable_sweep_detection"] = env_bool(
         "OPTIONS_WHALE_ENABLE_SWEEP_DETECTION",
         bool(whale.get("enable_sweep_detection", True)),

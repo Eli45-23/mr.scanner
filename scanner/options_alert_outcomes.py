@@ -39,6 +39,14 @@ def _bar_close(bar: Dict[str, Any]) -> Optional[float]:
     return _safe_float(bar.get("c") if bar.get("c") is not None else bar.get("close"))
 
 
+def _bar_high(bar: Dict[str, Any]) -> Optional[float]:
+    return _safe_float(bar.get("h") if bar.get("h") is not None else bar.get("high") if bar.get("high") is not None else bar.get("c") if bar.get("c") is not None else bar.get("close"))
+
+
+def _bar_low(bar: Dict[str, Any]) -> Optional[float]:
+    return _safe_float(bar.get("l") if bar.get("l") is not None else bar.get("low") if bar.get("low") is not None else bar.get("c") if bar.get("c") is not None else bar.get("close"))
+
+
 def _candidate(alert: Dict[str, Any]) -> Dict[str, Any]:
     return alert.get("candidate") if isinstance(alert.get("candidate"), dict) else alert
 
@@ -178,18 +186,19 @@ def evaluate_alert_outcome(
     else:
         outcome_status = "pending"
 
+    max_window = max((item.minutes for item in completed_windows), default=0)
+    horizon = detected_at + timedelta(minutes=max_window)
+    observed = [bar for bar in bars if (timestamp := _bar_time(bar)) and detected_at <= timestamp <= horizon]
     favorable_moves: List[float] = []
     adverse_moves: List[float] = []
-    for item in completed_windows:
-        move = item.move_pct
-        if move is None:
-            continue
+    for bar in observed:
+        high, low = _bar_high(bar), _bar_low(bar)
         if bias == "BULLISH":
-            favorable_moves.append(move)
-            adverse_moves.append(move)
+            if high is not None: favorable_moves.append((high - base_price) / base_price * 100.0)
+            if low is not None: adverse_moves.append((low - base_price) / base_price * 100.0)
         elif bias == "BEARISH":
-            favorable_moves.append(-move)
-            adverse_moves.append(-move)
+            if low is not None: favorable_moves.append((base_price - low) / base_price * 100.0)
+            if high is not None: adverse_moves.append((base_price - high) / base_price * 100.0)
     return {
         "outcome_status": outcome_status,
         **bias_details,

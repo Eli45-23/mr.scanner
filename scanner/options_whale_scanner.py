@@ -349,6 +349,15 @@ def build_whale_print_key(row: Dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def build_notification_event_key(row: Dict[str, Any]) -> tuple[str, str, str]:
+    """Stable identity for one observed option trade across repeated scans."""
+    return (
+        str(_key_value(row, "option_symbol") or "").upper(),
+        str(_key_value(row, "trade_time") or _key_value(row, "reported_trade_time") or ""),
+        str(_key_value(row, "direction_label") or "").upper(),
+    )
+
+
 def _row_completeness(row: Dict[str, Any]) -> int:
     candidate = _row_candidate(row)
     values = list(row.values()) + list(candidate.values())
@@ -456,6 +465,10 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     candidate = result.get("candidate") or {}
     spread = candidate.get("spread_percent")
     warnings = candidate.get("warnings") or []
+    if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
+        return "Tier 2", False, "Delayed or stale flow is dashboard-only until fresh evidence arrives."
+    if candidate.get("possible_multileg"):
+        return "Tier 2", False, "Possible multi-leg flow is dashboard-only until direction is clearer."
     if score >= 90 and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= 6:
         return "Tier 1", True, "Extreme score, aggressive flow, acceptable spread, and price context."
     if score >= 80 and not any("wide spread" in str(w).lower() or "stale" in str(w).lower() for w in warnings):
@@ -756,6 +769,10 @@ class OptionsWhaleScanner:
 
     def _effective_whale_config(self) -> Dict[str, Any]:
         cfg = dict(self.whale)
+        cfg.setdefault("stale_trade_penalty", 15)
+        cfg.setdefault("closing_flow_penalty", 8)
+        cfg.setdefault("notification_dedupe_minutes", 15)
+        cfg.setdefault("max_notifications_per_symbol", 2)
         if cfg.get("debug_loose_mode", False):
             cfg.update({
                 "min_score": min(int(cfg.get("min_score", 75)), 40),
@@ -1005,8 +1022,23 @@ class OptionsWhaleScanner:
             self.latest_path.write_text(json.dumps(scan_record, indent=2, sort_keys=True, default=str), encoding="utf-8")
         except OSError:
             pass
+        prior_events = {build_notification_event_key(row): row for row in self.storage.latest_alerts(limit=5000)}
+        per_symbol: Dict[str, int] = {}
         for result in results:
+            symbol = str((result.get("candidate") or {}).get("underlying_symbol") or "").upper()
+            event_key = build_notification_event_key(result)
+            prior = prior_events.get(event_key)
+            prior_premium = safe_float(_key_value(prior or {}, "estimated_premium"))
+            current_premium = safe_float(_key_value(result, "estimated_premium"))
+            material_update = prior and prior_premium > 0 and current_premium >= prior_premium * 1.25
+            if prior and not material_update:
+                result.update({"should_notify": False, "notify_reason": "Duplicate option-flow event already logged; dashboard update only."})
+            elif material_update:
+                result.update({"update_type": "material_premium_follow_through", "notify_reason": "Material premium follow-through update."})
+            elif per_symbol.get(symbol, 0) >= int(effective_cfg.get("max_notifications_per_symbol", 2)):
+                result.update({"should_notify": False, "notify_reason": "Per-symbol notification budget reached; dashboard update only."})
             if result.get("should_notify"):
+                per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
                 self.storage.append_alert(result)
         try:
             self.baseline.append_observations(evaluated)

@@ -159,6 +159,13 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     if candidate.get("possible_multileg"):
         warnings.append("Possible multi-leg structure reduces directional clarity.")
         total = max(0, total - 5)
+    if candidate.get("stale_trade_print"):
+        penalty = int(config.get("stale_trade_penalty", 15))
+        total = max(0, total - penalty)
+        warnings.append(f"Delayed trade print reduces score by {penalty} points.")
+    if candidate.get("open_close_estimate") in {"likely_closing", "possible_closing"}:
+        total = max(0, total - int(config.get("closing_flow_penalty", 8)))
+        warnings.append("Possible closing flow reduces directional confidence.")
     if not reasons:
         reasons.append("Flow is measurable but lacks strong confirming evidence.")
 
