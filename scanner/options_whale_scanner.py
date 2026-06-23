@@ -1022,7 +1022,17 @@ class OptionsWhaleScanner:
             self.latest_path.write_text(json.dumps(scan_record, indent=2, sort_keys=True, default=str), encoding="utf-8")
         except OSError:
             pass
-        prior_events = {build_notification_event_key(row): row for row in self.storage.latest_alerts(limit=5000)}
+        prior_alerts = self.storage.latest_alerts(limit=5000)
+        prior_events = {build_notification_event_key(row): row for row in prior_alerts}
+        notification_window = timedelta(minutes=int(effective_cfg.get("notification_dedupe_minutes", 15)))
+        now = datetime.now(timezone.utc)
+        recent_symbol_counts: Dict[str, int] = {}
+        for prior_row in prior_alerts:
+            candidate = prior_row.get("candidate") or {}
+            prior_symbol = str(candidate.get("underlying_symbol") or "").upper()
+            prior_time = _parse_iso_time(prior_row.get("scanner_detected_time") or candidate.get("time_detected"))
+            if prior_symbol and prior_time and now - prior_time <= notification_window:
+                recent_symbol_counts[prior_symbol] = recent_symbol_counts.get(prior_symbol, 0) + 1
         per_symbol: Dict[str, int] = {}
         for result in results:
             symbol = str((result.get("candidate") or {}).get("underlying_symbol") or "").upper()
@@ -1035,8 +1045,8 @@ class OptionsWhaleScanner:
                 result.update({"should_notify": False, "notify_reason": "Duplicate option-flow event already logged; dashboard update only."})
             elif material_update:
                 result.update({"update_type": "material_premium_follow_through", "notify_reason": "Material premium follow-through update."})
-            elif per_symbol.get(symbol, 0) >= int(effective_cfg.get("max_notifications_per_symbol", 2)):
-                result.update({"should_notify": False, "notify_reason": "Per-symbol notification budget reached; dashboard update only."})
+            elif recent_symbol_counts.get(symbol, 0) + per_symbol.get(symbol, 0) >= int(effective_cfg.get("max_notifications_per_symbol", 2)):
+                result.update({"should_notify": False, "notify_reason": "Per-symbol notification budget reached in the recent window; grouped dashboard update only."})
             if result.get("should_notify"):
                 per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
                 self.storage.append_alert(result)
