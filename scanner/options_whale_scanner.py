@@ -465,11 +465,16 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     candidate = result.get("candidate") or {}
     spread = candidate.get("spread_percent")
     warnings = candidate.get("warnings") or []
+    confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    required_confidence = str(cfg.get("tier1_min_direction_confidence", "MEDIUM")).upper()
+    observed_confidence = str(result.get("direction_confidence") or candidate.get("direction_confidence") or "LOW").upper()
     if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
         return "Tier 2", False, "Delayed or stale flow is dashboard-only until fresh evidence arrives."
     if candidate.get("possible_multileg"):
         return "Tier 2", False, "Possible multi-leg flow is dashboard-only until direction is clearer."
-    if score >= 90 and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= 6:
+    if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
+        return "Tier 2", False, "Direction confidence is below the Tier 1 requirement."
+    if score >= int(cfg.get("tier1_min_score", 95)) and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= int(cfg.get("tier1_min_price_context", 8)):
         return "Tier 1", True, "Extreme score, aggressive flow, acceptable spread, and price context."
     if score >= 80 and not any("wide spread" in str(w).lower() or "stale" in str(w).lower() for w in warnings):
         return "Tier 2", bool(cfg.get("notify_tier_2", False)), "High score with minor or no quality warnings."
@@ -771,8 +776,12 @@ class OptionsWhaleScanner:
         cfg = dict(self.whale)
         cfg.setdefault("stale_trade_penalty", 15)
         cfg.setdefault("closing_flow_penalty", 8)
+        cfg.setdefault("low_direction_confidence_penalty", 10)
         cfg.setdefault("notification_dedupe_minutes", 15)
         cfg.setdefault("max_notifications_per_symbol", 2)
+        cfg.setdefault("tier1_min_score", 95)
+        cfg.setdefault("tier1_min_price_context", 8)
+        cfg.setdefault("tier1_min_direction_confidence", "MEDIUM")
         if cfg.get("debug_loose_mode", False):
             cfg.update({
                 "min_score": min(int(cfg.get("min_score", 75)), 40),

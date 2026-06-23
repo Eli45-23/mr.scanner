@@ -166,6 +166,9 @@ def score_options_whale_flow(candidate: Dict[str, Any], context: Dict[str, Any] 
     if candidate.get("open_close_estimate") in {"likely_closing", "possible_closing"}:
         total = max(0, total - int(config.get("closing_flow_penalty", 8)))
         warnings.append("Possible closing flow reduces directional confidence.")
+    if str(candidate.get("direction_confidence") or "LOW").upper() == "LOW":
+        total = max(0, total - int(config.get("low_direction_confidence_penalty", 10)))
+        warnings.append("Low direction confidence reduces score.")
     if not reasons:
         reasons.append("Flow is measurable but lacks strong confirming evidence.")
 
