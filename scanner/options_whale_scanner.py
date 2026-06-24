@@ -779,7 +779,7 @@ class OptionsWhaleScanner:
         cfg.setdefault("low_direction_confidence_penalty", 10)
         cfg.setdefault("notification_dedupe_minutes", 15)
         cfg.setdefault("max_notifications_per_symbol", 2)
-        cfg.setdefault("tier1_min_score", 95)
+        cfg.setdefault("tier1_min_score", 90)
         cfg.setdefault("tier1_min_price_context", 8)
         cfg.setdefault("tier1_min_direction_confidence", "MEDIUM")
         if cfg.get("debug_loose_mode", False):
@@ -958,6 +958,7 @@ class OptionsWhaleScanner:
         results.sort(key=lambda item: int(item.get("whale_score") or 0), reverse=True)
         results = results[: int(effective_cfg.get("max_results", 100))]
         results = attach_simple_follow_through(results, self.storage.latest_alerts(limit=500))
+        final_by_key = {build_whale_print_key(item): item for item in results}
         near_misses = sorted(
             evaluated,
             key=lambda item: (int(item.get("whale_score") or 0), safe_float((item.get("candidate") or {}).get("estimated_premium"))),
@@ -966,6 +967,7 @@ class OptionsWhaleScanner:
         near_misses_out = []
         for item in near_misses:
             candidate = item.get("candidate") or {}
+            final = final_by_key.get(build_whale_print_key(item))
             near_misses_out.append({
                 "option_symbol": candidate.get("option_symbol"),
                 "underlying": candidate.get("underlying_symbol"),
@@ -980,7 +982,7 @@ class OptionsWhaleScanner:
                 "open_interest": candidate.get("open_interest"),
                 "premium": candidate.get("estimated_premium"),
                 "spread_percent": candidate.get("spread_percent"),
-                "score": item.get("whale_score"),
+                "score": (final or item).get("whale_score"),
                 "reason_rejected": item.get("reason_rejected"),
                 "thresholds_failed": item.get("filter_rejection_reasons", []),
             })
@@ -1059,6 +1061,8 @@ class OptionsWhaleScanner:
             if result.get("should_notify"):
                 per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
                 self.storage.append_alert(result)
+            if result.get("alert_tier") in {"Tier 1", "Tier 2"}:
+                self.storage.append_qualified_event(result)
         try:
             self.baseline.append_observations(evaluated)
         except Exception:

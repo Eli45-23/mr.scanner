@@ -17,6 +17,7 @@ import elite_momentum_scanner as scanner_app
 from scanner.options_alert_outcomes import evaluate_alert_outcome, summarize_outcomes
 from scanner.options_data_client import OptionsDataClient
 from tools.summarize_options_outcomes import is_clean_completed
+from scanner.options_whale_storage import OptionsWhaleStorage
 
 
 LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
@@ -207,7 +208,8 @@ def review_alerts(
     client = build_client(config)
     now_utc = datetime.now(timezone.utc)
     latest = read_latest()
-    results = list(latest.get("results") or [])
+    storage = OptionsWhaleStorage(APP_DIR)
+    results = storage.latest_qualified_events(limit=max(1, int(limit))) or list(latest.get("results") or [])
     if include_near_misses:
         results.extend(latest.get("near_misses") or [])
     results = results[: max(1, int(limit))]

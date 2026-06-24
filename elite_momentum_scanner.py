@@ -7708,7 +7708,7 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
     whale["low_direction_confidence_penalty"] = env_int("OPTIONS_WHALE_LOW_DIRECTION_CONFIDENCE_PENALTY", int(whale.get("low_direction_confidence_penalty", 10)))
     whale["notification_dedupe_minutes"] = env_int("OPTIONS_WHALE_NOTIFICATION_DEDUPE_MINUTES", int(whale.get("notification_dedupe_minutes", 15)))
     whale["max_notifications_per_symbol"] = env_int("OPTIONS_WHALE_MAX_NOTIFICATIONS_PER_SYMBOL", int(whale.get("max_notifications_per_symbol", 2)))
-    whale["tier1_min_score"] = env_int("OPTIONS_WHALE_TIER1_MIN_SCORE", int(whale.get("tier1_min_score", 95)))
+    whale["tier1_min_score"] = env_int("OPTIONS_WHALE_TIER1_MIN_SCORE", int(whale.get("tier1_min_score", 90)))
     whale["tier1_min_price_context"] = env_int("OPTIONS_WHALE_TIER1_MIN_PRICE_CONTEXT", int(whale.get("tier1_min_price_context", 8)))
     whale["tier1_min_direction_confidence"] = os.getenv("OPTIONS_WHALE_TIER1_MIN_DIRECTION_CONFIDENCE", str(whale.get("tier1_min_direction_confidence", "MEDIUM"))).upper()
     whale["enable_sweep_detection"] = env_bool(
