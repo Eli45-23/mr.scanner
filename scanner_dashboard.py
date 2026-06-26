@@ -4109,6 +4109,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         <button id="pauseScanBtn">Pause Auto Scan</button>
         <button id="resumeScanBtn">Resume Auto Scan</button>
         <button id="rebuildUniverseBtn">Rebuild Universe</button>
+        <button id="soundToggleBtn">Enable Sound</button>
+        <span class="muted" id="soundStatus">Sound off</span>
         <a class="button" href="/api/options-whales/export.csv">Export CSV</a>
         <a class="button" href="/api/options-whales/export.json">Export JSON</a>
       </div>
@@ -4172,6 +4174,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       pauseScanBtn: document.getElementById('pauseScanBtn'),
       resumeScanBtn: document.getElementById('resumeScanBtn'),
       rebuildUniverseBtn: document.getElementById('rebuildUniverseBtn'),
+      soundToggleBtn: document.getElementById('soundToggleBtn'),
+      soundStatus: document.getElementById('soundStatus'),
       saveFiltersBtn: document.getElementById('saveFiltersBtn'),
       filterStatus: document.getElementById('filterStatus'),
       rowCount: document.getElementById('rowCount'),
@@ -4191,6 +4195,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       symbolSearch: document.getElementById('symbolSearch'),
     };
     let latestRows = [];
+    let soundEnabled = localStorage.getItem('optionsWhaleSoundEnabled') === 'true';
+    let soundContext = null;
+    let lastUpdateSoundSignature = null;
+    let soundBaselineReady = false;
 
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
@@ -4237,6 +4245,73 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     function card(label, value, cls = '') {
       return `<div class="card"><span class="label">${esc(label)}</span><div class="value ${cls}">${esc(value)}</div></div>`;
+    }
+    function updateSoundUi(message = '') {
+      els.soundToggleBtn.textContent = soundEnabled ? 'Disable Sound' : 'Enable Sound';
+      els.soundStatus.textContent = message || (soundEnabled ? 'Sound on — beeps on new scanner updates' : 'Sound off');
+      els.soundStatus.className = soundEnabled ? 'good' : 'muted';
+    }
+    function makeUpdateSoundSignature(status, latest) {
+      const scan = latest.last_scan || {};
+      const results = latest.results || [];
+      const nearMisses = latest.near_misses || [];
+      const topResults = results.slice(0, 5).map((item) => [
+        candidateField(item, 'option_symbol') || item.option_symbol || '',
+        item.alert_tier || '',
+        item.whale_score || item.score || '',
+        candidateField(item, 'estimated_premium') || ''
+      ].join(':')).join('|');
+      return [
+        latest.timestamp || scan.timestamp || status.last_scan_finished_at || '',
+        status.last_scan_finished_at || '',
+        status.scan_running ? 'running' : 'idle',
+        results.length,
+        nearMisses.length,
+        latest.fresh_count ?? latest.diagnostics?.fresh_count ?? '',
+        latest.stale_count ?? latest.diagnostics?.stale_count ?? '',
+        scan.passed_filter_count ?? scan.candidates_found ?? '',
+        topResults
+      ].join('||');
+    }
+    async function unlockSound() {
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) {
+        updateSoundUi('Sound unavailable in this browser');
+        return false;
+      }
+      soundContext = soundContext || new AudioContextCtor();
+      if (soundContext.state === 'suspended') {
+        await soundContext.resume();
+      }
+      return soundContext.state === 'running';
+    }
+    function playUpdateSound() {
+      if (!soundEnabled || !soundContext || soundContext.state !== 'running') return;
+      const now = soundContext.currentTime;
+      const osc = soundContext.createOscillator();
+      const gain = soundContext.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.exponentialRampToValueAtTime(1175, now + 0.08);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.12, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+      osc.connect(gain);
+      gain.connect(soundContext.destination);
+      osc.start(now);
+      osc.stop(now + 0.2);
+    }
+    function maybePlayUpdateSound(status, latest) {
+      const signature = makeUpdateSoundSignature(status, latest);
+      if (!soundBaselineReady) {
+        lastUpdateSoundSignature = signature;
+        soundBaselineReady = true;
+        return;
+      }
+      if (signature && signature !== lastUpdateSoundSignature) {
+        lastUpdateSoundSignature = signature;
+        playUpdateSound();
+      }
     }
     function candidateField(item, field) {
       const c = item.candidate || {};
@@ -4407,6 +4482,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         ]);
         renderStatus(status, latest, universe);
         renderRows(latest);
+        maybePlayUpdateSound(status, latest);
       } catch (err) {
         els.warnings.innerHTML = `<div class="notice bad">${esc(err.message)}</div>`;
       }
@@ -4423,6 +4499,23 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.rebuildUniverseBtn.disabled = true;
       try { await api('/api/options-whales/universe/rebuild', {method:'POST', body:'{}'}); }
       finally { els.rebuildUniverseBtn.disabled = false; refresh(); }
+    });
+    els.soundToggleBtn.addEventListener('click', async () => {
+      if (!soundEnabled) {
+        soundEnabled = await unlockSound();
+        if (!soundEnabled) {
+          localStorage.setItem('optionsWhaleSoundEnabled', 'false');
+          updateSoundUi('Click blocked — sound could not start');
+          return;
+        }
+        localStorage.setItem('optionsWhaleSoundEnabled', 'true');
+        updateSoundUi('Sound on — beeps on new scanner updates');
+        playUpdateSound();
+      } else {
+        soundEnabled = false;
+        localStorage.setItem('optionsWhaleSoundEnabled', 'false');
+        updateSoundUi('Sound off');
+      }
     });
     els.saveFiltersBtn.addEventListener('click', async () => {
       const payload = {
@@ -4448,6 +4541,20 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       renderDetail(latestRows[Number(row.dataset.index)]);
     });
     loadFilters();
+    updateSoundUi();
+    if (soundEnabled) {
+      unlockSound().then((ok) => {
+        if (!ok) {
+          soundEnabled = false;
+          localStorage.setItem('optionsWhaleSoundEnabled', 'false');
+          updateSoundUi('Click Enable Sound to turn alerts on');
+        }
+      }).catch(() => {
+        soundEnabled = false;
+        localStorage.setItem('optionsWhaleSoundEnabled', 'false');
+        updateSoundUi('Click Enable Sound to turn alerts on');
+      });
+    }
     refresh();
     setInterval(refresh, 5000);
   </script>
