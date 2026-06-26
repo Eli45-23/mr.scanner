@@ -4248,25 +4248,23 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     function updateSoundUi(message = '') {
       els.soundToggleBtn.textContent = soundEnabled ? 'Disable Sound' : 'Enable Sound';
-      els.soundStatus.textContent = message || (soundEnabled ? 'Sound on — beeps on new scanner updates' : 'Sound off');
+      els.soundStatus.textContent = message || (soundEnabled ? 'Sound on — beeps when scanner data appears' : 'Sound off');
       els.soundStatus.className = soundEnabled ? 'good' : 'muted';
     }
     function makeUpdateSoundSignature(status, latest) {
       const scan = latest.last_scan || {};
       const results = latest.results || [];
-      const nearMisses = latest.near_misses || [];
+      if (!results.length) return '';
       const topResults = results.slice(0, 5).map((item) => [
         candidateField(item, 'option_symbol') || item.option_symbol || '',
         item.alert_tier || '',
         item.whale_score || item.score || '',
-        candidateField(item, 'estimated_premium') || ''
+        candidateField(item, 'estimated_premium') || '',
+        candidateField(item, 'time_detected') || candidateField(item, 'trade_time') || ''
       ].join(':')).join('|');
       return [
         latest.timestamp || scan.timestamp || status.last_scan_finished_at || '',
-        status.last_scan_finished_at || '',
-        status.scan_running ? 'running' : 'idle',
         results.length,
-        nearMisses.length,
         latest.fresh_count ?? latest.diagnostics?.fresh_count ?? '',
         latest.stale_count ?? latest.diagnostics?.stale_count ?? '',
         scan.passed_filter_count ?? scan.candidates_found ?? '',
@@ -4509,7 +4507,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
           return;
         }
         localStorage.setItem('optionsWhaleSoundEnabled', 'true');
-        updateSoundUi('Sound on — beeps on new scanner updates');
+        updateSoundUi('Sound on — beeps when scanner data appears');
         playUpdateSound();
       } else {
         soundEnabled = false;
