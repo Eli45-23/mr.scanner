@@ -7,7 +7,12 @@ from pathlib import Path
 from scanner.options_whale_scanner import (
     OptionsWhaleScanner,
     apply_index_0dte_noise_filter,
+    apply_symbol_bias_memory,
+    attach_flow_episode_context,
+    attach_outcome_completeness,
     attach_simple_follow_through,
+    build_flow_episode_key,
+    build_symbol_bias_memory,
     build_premium_display_fields,
     build_premium_pressure_fields,
     build_premium_timing_fields,
@@ -375,6 +380,78 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         result = attach_simple_follow_through(rows)
         self.assertEqual(result[1]["follow_through_status"], "no_follow_up_yet")
         self.assertIsNone(result[1]["follow_up_premium"])
+
+    def test_flow_episode_groups_related_same_symbol_bias_contracts(self):
+        rows = [
+            {
+                "candidate": {"underlying_symbol": "AAPL", "option_symbol": "AAPL1", "time_detected": "2026-06-26T14:01:10Z", "estimated_premium": 100000, "strike": 200, "expiration": "2026-06-26"},
+                "direction_label": "Possible bullish call flow",
+                "whale_score": 90,
+            },
+            {
+                "candidate": {"underlying_symbol": "AAPL", "option_symbol": "AAPL2", "time_detected": "2026-06-26T14:04:50Z", "estimated_premium": 150000, "strike": 205, "expiration": "2026-06-26"},
+                "direction_label": "Possible bullish call flow",
+                "whale_score": 85,
+            },
+            {
+                "candidate": {"underlying_symbol": "AAPL", "option_symbol": "AAPL3", "time_detected": "2026-06-26T14:04:50Z", "estimated_premium": 200000, "strike": 210, "expiration": "2026-06-26"},
+                "direction_label": "Possible bearish put flow",
+                "whale_score": 92,
+            },
+        ]
+        grouped = attach_flow_episode_context(rows, bucket_minutes=5)
+        self.assertEqual(build_flow_episode_key(rows[0], 5), build_flow_episode_key(rows[1], 5))
+        self.assertNotEqual(build_flow_episode_key(rows[0], 5), build_flow_episode_key(rows[2], 5))
+        self.assertEqual(grouped[0]["flow_episode_size"], 2)
+        self.assertEqual(grouped[1]["flow_episode_size"], 2)
+        self.assertTrue(grouped[0]["flow_episode_leader"])
+        self.assertFalse(grouped[1]["flow_episode_leader"])
+        self.assertEqual(grouped[0]["flow_episode_total_premium"], 250000)
+
+    def test_symbol_bias_memory_penalizes_weak_follow_through(self):
+        outcomes = []
+        for idx in range(20):
+            outcomes.append({
+                "alert_key": f"a{idx}",
+                "underlying_symbol": "AMZN",
+                "flow_bias": "BULLISH",
+                "reviewed_at": f"2026-06-26T15:{idx:02d}:00Z",
+                "windows": [{"minutes": 15, "status": "ok", "favorable": idx < 6}],
+            })
+        memory = build_symbol_bias_memory(outcomes, window_minutes=15, min_completed=20, weak_rate=0.45)
+        result = {
+            "candidate": {"underlying_symbol": "AMZN", "option_type": "CALL"},
+            "direction_label": "Possible bullish call flow",
+            "whale_score": 80,
+            "classification": "HIGH WHALE FLOW",
+        }
+        adjusted = apply_symbol_bias_memory(result, memory, {"symbol_bias_memory_penalty": 5})
+        self.assertEqual(adjusted["whale_score"], 75)
+        self.assertEqual(adjusted["pre_memory_whale_score"], 80)
+        self.assertIn("weak", adjusted["symbol_bias_memory_label"])
+        self.assertIn("score reduced", adjusted["learned_quality_reason"])
+
+    def test_attach_outcome_completeness_adds_badge_fields(self):
+        row = {
+            "candidate": {"underlying_symbol": "AAPL", "option_symbol": "AAPL1", "time_detected": "2026-06-26T14:00:00Z"},
+            "whale_score": 90,
+        }
+        outcomes = [{
+            "alert_key": "2026-06-26T14:00:00Z|AAPL|AAPL1|90",
+            "reviewed_at": "2026-06-26T15:00:00Z",
+            "outcome_status": "partial",
+            "windows": [
+                {"minutes": 5, "status": "ok", "favorable": True},
+                {"minutes": 15, "status": "ok", "favorable": False},
+                {"minutes": 30, "status": "missing_bar", "favorable": None},
+                {"minutes": 60, "status": "insufficient_future_session", "favorable": None},
+            ],
+        }]
+        attached = attach_outcome_completeness([row], outcomes)[0]
+        self.assertEqual(attached["outcome_completed_windows"], 2)
+        self.assertEqual(attached["outcome_missing_windows"], 2)
+        self.assertEqual(attached["outcome_favorable_windows"], 1)
+        self.assertIn("2/4", attached["outcome_completeness_label"])
 
 
 if __name__ == "__main__":

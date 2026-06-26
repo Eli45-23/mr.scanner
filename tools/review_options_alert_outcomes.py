@@ -208,7 +208,8 @@ def review_alerts(
     client = build_client(config)
     now_utc = datetime.now(timezone.utc)
     latest = read_latest()
-    storage = OptionsWhaleStorage(APP_DIR)
+    storage_root = LATEST_PATH.parent.parent if LATEST_PATH.parent.name == "data" else LATEST_PATH.parent
+    storage = OptionsWhaleStorage(storage_root)
     results = storage.latest_qualified_events(limit=max(1, int(limit))) or list(latest.get("results") or [])
     if include_near_misses:
         results.extend(latest.get("near_misses") or [])

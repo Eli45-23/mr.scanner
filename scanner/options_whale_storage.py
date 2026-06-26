@@ -36,6 +36,7 @@ class OptionsWhaleStorage:
         self.qualified_events_path = self.log_dir / "options_whale_qualified_events.jsonl"
         self.scans_path = self.log_dir / "options_whale_scans.jsonl"
         self.oi_reviews_path = self.log_dir / "options_oi_reviews.jsonl"
+        self.outcomes_path = root / "data" / "options_whale_outcomes.jsonl"
 
     def append_alert(self, record: Dict[str, Any]) -> None:
         append_jsonl(self.alerts_path, record)
@@ -45,6 +46,9 @@ class OptionsWhaleStorage:
 
     def latest_qualified_events(self, limit: int = 1000) -> List[Dict[str, Any]]:
         return read_jsonl(self.qualified_events_path, limit=limit)
+
+    def latest_outcomes(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        return read_jsonl(self.outcomes_path, limit=limit)
 
     def append_scan(self, record: Dict[str, Any]) -> None:
         append_jsonl(self.scans_path, record)

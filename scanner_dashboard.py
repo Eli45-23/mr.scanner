@@ -4151,10 +4151,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         <table>
           <thead>
             <tr>
-              <th>Time</th><th>Tier</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Price Paid</th><th>Spread %</th><th>Premium</th><th>Freshness</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Reason</th>
+              <th>Time</th><th>Tier</th><th>Episode</th><th>Symbol</th><th>Type</th><th>Strike</th><th>Exp</th><th>DTE</th><th>Moneyness</th><th>Volume</th><th>OI</th><th>Vol/OI</th><th>Price Paid</th><th>Spread %</th><th>Premium</th><th>Freshness</th><th>Score</th><th>Classification</th><th>Direction</th><th>Price Context</th><th>Memory</th><th>Outcome</th><th>Option Follow</th><th>Reason</th>
             </tr>
           </thead>
-          <tbody id="flowRows"><tr><td colspan="20" class="muted">Waiting for scan.</td></tr></tbody>
+          <tbody id="flowRows"><tr><td colspan="24" class="muted">Waiting for scan.</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -4330,6 +4330,26 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       const optionSymbol = String(candidateField(item, 'option_symbol') || item.option_symbol || '').trim().toUpperCase();
       return underlying === search || optionSymbol.includes(search);
     }
+    function episodeText(item) {
+      const size = Number(item.flow_episode_size || 0);
+      if (!Number.isFinite(size) || size <= 1) return 'Single';
+      return `${size} legs${item.flow_episode_leader ? ' | Lead' : ' | Grouped'}`;
+    }
+    function memoryText(item) {
+      const label = String(item.symbol_bias_memory_label || 'no_history').replaceAll('_', ' ');
+      const rate = Number(item.symbol_bias_memory_rate);
+      const completed = Number(item.symbol_bias_memory_completed);
+      if (Number.isFinite(rate) && Number.isFinite(completed) && completed > 0) {
+        return `${label} ${Math.round(rate * 100)}%/${completed}`;
+      }
+      return label;
+    }
+    function outcomeText(item) {
+      return item.outcome_completeness_label || 'Outcome not reviewed yet';
+    }
+    function optionFollowText(item) {
+      return String(item.option_price_follow_through_status || item.follow_through_status || 'pending').replaceAll('_', ' ');
+    }
     function renderStatus(status, latest, universe) {
       const scan = latest.last_scan || {};
       const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
@@ -4370,29 +4390,29 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         const freshness = freshnessText(candidateField(item, 'fresh_flow_label'));
         const freshnessNote = isStalePrint(item) ? '<br><span class="warn">Old premium print — do not treat as fresh flow.</span>' : '';
         return `<tr class="clickable" data-kind="result" data-index="${idx}">
-          <td>${esc(formatMarketTime(candidateField(item, 'time_detected') || candidateField(item, 'trade_time')))}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
+          <td>${esc(formatMarketTime(candidateField(item, 'time_detected') || candidateField(item, 'trade_time')))}</td><td>${esc(item.alert_tier || '')}</td><td>${esc(episodeText(item))}</td><td>${esc(candidateField(item, 'underlying_symbol') || '')}</td><td>${esc(candidateField(item, 'option_type') || '')}</td>
           <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
           <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(item.contract_price_paid || candidateField(item, 'contract_price_paid') || candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
           <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td>${esc(freshness)}${freshnessNote}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
-          <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(item.reason_summary || '')}</td>
+          <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(memoryText(item))}</td><td>${esc(outcomeText(item))}</td><td>${esc(optionFollowText(item))}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
       };
       const debugRow = (item, idx) => `
         <tr class="clickable" data-kind="debug" data-index="${idx}">
-          <td></td><td>Debug only</td><td>${esc(item.underlying || item.underlying_symbol || '')}</td><td colspan="5" class="muted">Debug candidate — not alert quality</td>
+          <td></td><td>Debug only</td><td></td><td>${esc(item.underlying || item.underlying_symbol || '')}</td><td colspan="5" class="muted">Debug candidate — not alert quality</td>
           <td>${intFmt(item.volume)}</td><td>${intFmt(item.open_interest)}</td><td></td><td></td>
           <td>${num(item.spread_percent, '%')}</td><td>${money(item.premium || item.estimated_premium)}</td><td>${esc(freshnessText(item.fresh_flow_label))}</td><td><span class="score">${esc(item.score)}</span></td>
-          <td>Not alert quality</td><td>Watch only</td><td>Needs confirmation</td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
+          <td>Not alert quality</td><td>Watch only</td><td>Needs confirmation</td><td></td><td></td><td></td><td>${esc(item.reason_rejected || (item.thresholds_failed || []).join(', '))}</td>
         </tr>`;
       window.__showDebugCandidates = () => {
         els.modeNotice.innerHTML = '<div class="notice warn">Debug Candidates — Not Alerts. Use this only to tune filters, not as whale-flow signals.</div>';
         els.rowCount.textContent = `${near.length} debug candidates`;
-        els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="20" class="muted">No debug candidates.</td></tr>';
+        els.flowRows.innerHTML = near.length ? near.map(debugRow).join('') : '<tr><td colspan="24" class="muted">No debug candidates.</td></tr>';
       };
       window.__showOldPremiumPrints = () => {
         els.modeNotice.innerHTML = '<div class="notice warn">Old Premium Prints — Not Fresh Alerts. Old premium print — do not treat as fresh flow.</div>';
         els.rowCount.textContent = `${oldRows.length} old premium prints`;
-        els.flowRows.innerHTML = oldRows.length ? oldRows.map((item, idx) => resultRow(item, freshRows.length + idx)).join('') : '<tr><td colspan="20" class="muted">No old premium prints.</td></tr>';
+        els.flowRows.innerHTML = oldRows.length ? oldRows.map((item, idx) => resultRow(item, freshRows.length + idx)).join('') : '<tr><td colspan="24" class="muted">No old premium prints.</td></tr>';
       };
       if (official.length) {
         const oldNotice = oldRows.length ? ` <button type="button" onclick="window.__showOldPremiumPrints()">Show Old Premium Prints</button>` : '';
@@ -4410,16 +4430,16 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       if (search) {
         els.rowCount.textContent = `0 ${search} whale alerts`;
         els.modeNotice.innerHTML = '';
-        els.flowRows.innerHTML = `<tr><td colspan="20" class="muted">No fresh ${esc(search)} whale alerts right now.</td></tr>`;
+        els.flowRows.innerHTML = `<tr><td colspan="24" class="muted">No fresh ${esc(search)} whale alerts right now.</td></tr>`;
         return;
       }
       els.rowCount.textContent = '0 real whale alerts';
       if (near.length) {
         els.modeNotice.innerHTML = `<div class="notice warn">No real whale alerts passed the filters right now. ${near.length} debug candidates are hidden because they are not alert quality. <button type="button" onclick="window.__showDebugCandidates()">Show Debug Candidates</button></div>`;
-        els.flowRows.innerHTML = '<tr><td colspan="20" class="muted">No real whale alerts right now. Debug candidates are hidden.</td></tr>';
+        els.flowRows.innerHTML = '<tr><td colspan="24" class="muted">No real whale alerts right now. Debug candidates are hidden.</td></tr>';
       } else {
         els.modeNotice.innerHTML = '';
-        els.flowRows.innerHTML = '<tr><td colspan="20" class="muted">No real whale alerts yet.</td></tr>';
+        els.flowRows.innerHTML = '<tr><td colspan="24" class="muted">No real whale alerts yet.</td></tr>';
       }
     }
     function renderDetail(item) {
@@ -4443,6 +4463,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
           <div class="card"><span class="label">Premium Time</span><div>${esc(flowCaution)}<br>Reported trade time ET: ${esc(formatMarketTime(cf('trade_time')))}<br>Quote time ET: ${esc(formatMarketTime(cf('quote_time')))}<br>Scanner detected ET: ${esc(formatMarketTime(cf('time_detected')))}<br>Reported trade time raw: ${esc(item.reported_trade_time || cf('reported_trade_time') || cf('trade_time') || 'unavailable')}<br>Quote time raw: ${esc(item.reported_quote_time || cf('reported_quote_time') || cf('quote_time') || 'unavailable')}<br>Scanner detected raw: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || cf('time_detected') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>Trade print age: ${ageText}<br>Fresh flow label: ${esc(freshLabel)}<br>Stale warning: ${esc(staleWarning || item.premium_timing_warning || cf('premium_timing_warning') || 'None')}</div></div>
           <div class="card"><span class="label">Pressure</span><div>${esc(item.premium_pressure_label || cf('premium_pressure_label') || 'unknown')} | ${esc(item.premium_pressure_confidence || cf('premium_pressure_confidence') || '')}<br>${esc(item.premium_pressure_reason || cf('premium_pressure_reason') || '')}</div></div>
           <div class="card"><span class="label">Follow-through</span><div>${esc(item.follow_through_status || 'no_follow_up_yet')}<br>Follow-up premium: ${money(item.follow_up_premium)}<br>Follow-up count: ${esc(item.follow_up_count ?? 0)}<br>Last follow-up time: ${esc(item.last_follow_up_time || 'none yet')}<br>${esc(item.follow_through_reason || '')}</div></div>
+          <div class="card"><span class="label">Flow episode</span><div>${esc(episodeText(item))}<br>Episode bias: ${esc(item.flow_episode_bias || 'unknown')}<br>Total episode premium: ${money(item.flow_episode_total_premium)}<br>Lead contract: ${esc(item.flow_episode_leader_option || 'n/a')}<br>${esc(item.flow_episode_reason || '')}</div></div>
+          <div class="card"><span class="label">Symbol / bias memory</span><div>${esc(memoryText(item))}<br>${esc(item.learned_quality_reason || 'not enough outcome history yet')}<br>${item.pre_memory_whale_score !== undefined ? `Pre-memory score: ${esc(item.pre_memory_whale_score)}` : ''}</div></div>
+          <div class="card"><span class="label">Outcome completeness</span><div>${esc(outcomeText(item))}<br>Status: ${esc(item.outcome_completeness_status || 'pending_review')}<br>Favorable windows: ${esc(item.outcome_favorable_windows ?? 0)} / ${esc(item.outcome_completed_windows ?? 0)}<br>Reviewed: ${esc(item.outcome_reviewed_at || 'not reviewed yet')}</div></div>
+          <div class="card"><span class="label">Option-price follow-through</span><div>${esc(optionFollowText(item))}<br>${esc(item.option_price_follow_through_note || 'Same-contract premium follow-up will appear after later scans when available.')}</div></div>
           <div class="card"><span class="label">Why unusual</span><div>${esc(item.reason_summary || 'No unusualness explanation available yet.')}<br>${esc(reasons.join(' '))}</div></div>
           <div class="card"><span class="label">Historical baseline</span><div>Volume baseline: ${esc(cf('baseline_volume') ?? 'not enough history')}<br>Premium baseline: ${money(cf('baseline_premium')) || 'not enough history'}<br>Multiple: ${esc(cf('unusualness_multiple') ?? 'n/a')} | Sample: ${esc(cf('baseline_sample_size') ?? 0)}${cf('low_sample_warning') ? '<br><span class="warn">Low sample warning</span>' : ''}</div></div>
           <div class="card"><span class="label">Score breakdown</span><pre>${esc(JSON.stringify(item.score_components || {}, null, 2))}</pre></div>

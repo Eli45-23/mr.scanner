@@ -22,6 +22,7 @@ class OptionsWhaleScoringTests(unittest.TestCase):
             "dte": 0,
             "moneyness": "ATM",
             "price_context_score": 8,
+            "direction_confidence": "HIGH",
         })
         self.assertGreaterEqual(result["whale_score"], 75)
         self.assertIn("score_components", result)

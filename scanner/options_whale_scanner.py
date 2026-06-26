@@ -77,6 +77,13 @@ def default_options_whale_config() -> Dict[str, Any]:
         "index_0dte_min_premium": 250000,
         "index_0dte_max_spread_percent": 8,
         "index_0dte_min_price_confirmation_score": 6,
+        "flow_episode_bucket_minutes": 5,
+        "symbol_bias_memory_enabled": True,
+        "symbol_bias_memory_window_minutes": 15,
+        "symbol_bias_memory_min_completed": 20,
+        "symbol_bias_memory_weak_rate": 0.45,
+        "symbol_bias_memory_strong_rate": 0.55,
+        "symbol_bias_memory_penalty": 5,
     }
 
 
@@ -356,6 +363,225 @@ def build_notification_event_key(row: Dict[str, Any]) -> tuple[str, str, str]:
         str(_key_value(row, "trade_time") or _key_value(row, "reported_trade_time") or ""),
         str(_key_value(row, "direction_label") or "").upper(),
     )
+
+
+def infer_direction_bias_label(row: Dict[str, Any]) -> str:
+    label = str(_key_value(row, "direction_label") or row.get("direction_label") or "").lower()
+    option_type = str(_key_value(row, "option_type") or "").upper()
+    if "bearish" in label:
+        return "BEARISH"
+    if "bullish" in label:
+        return "BULLISH"
+    if option_type == "CALL":
+        return "BULLISH"
+    if option_type == "PUT":
+        return "BEARISH"
+    return "UNKNOWN"
+
+
+def _time_bucket(value: Any, bucket_minutes: int) -> str:
+    timestamp = _parse_iso_time(value)
+    if not timestamp:
+        return ""
+    bucket_minutes = max(1, int(bucket_minutes or 5))
+    minute = (timestamp.minute // bucket_minutes) * bucket_minutes
+    bucketed = timestamp.replace(minute=minute, second=0, microsecond=0)
+    return bucketed.isoformat().replace("+00:00", "Z")
+
+
+def build_flow_episode_key(row: Dict[str, Any], bucket_minutes: int = 5) -> tuple[str, str, str]:
+    """Group related strikes/expirations into one same-symbol, same-bias time episode."""
+    return (
+        str(_key_value(row, "underlying_symbol") or _key_value(row, "underlying") or "").upper(),
+        infer_direction_bias_label(row),
+        _time_bucket(_key_value(row, "time_detected") or row.get("scanner_detected_time") or row.get("timestamp"), bucket_minutes),
+    )
+
+
+def attach_flow_episode_context(rows: List[Dict[str, Any]], bucket_minutes: int = 5) -> List[Dict[str, Any]]:
+    grouped: Dict[tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = build_flow_episode_key(row, bucket_minutes)
+        if all(key):
+            grouped.setdefault(key, []).append(row)
+    for key, group in grouped.items():
+        if not group:
+            continue
+        sorted_group = sorted(
+            group,
+            key=lambda item: (
+                int(item.get("whale_score") or item.get("score") or 0),
+                safe_float(_key_value(item, "estimated_premium")),
+            ),
+            reverse=True,
+        )
+        leader = sorted_group[0]
+        leader_symbol = str(_key_value(leader, "option_symbol") or "")
+        total_premium = sum(safe_float(_key_value(item, "estimated_premium")) for item in group)
+        strikes = sorted({_key_value(item, "strike") for item in group if _key_value(item, "strike") not in (None, "")}, key=lambda value: safe_float(value))
+        expirations = sorted({str(_key_value(item, "expiration")) for item in group if _key_value(item, "expiration")})
+        episode_id = "|".join(key)
+        for item in group:
+            is_leader = item is leader
+            item.update({
+                "flow_episode_id": episode_id,
+                "flow_episode_symbol": key[0],
+                "flow_episode_bias": key[1],
+                "flow_episode_bucket": key[2],
+                "flow_episode_size": len(group),
+                "flow_episode_total_premium": round(total_premium, 2),
+                "flow_episode_leader": is_leader,
+                "flow_episode_leader_option": leader_symbol,
+                "flow_episode_strikes": strikes,
+                "flow_episode_expirations": expirations,
+                "flow_episode_reason": (
+                    f"{len(group)} related same-symbol/same-bias contracts detected in a {bucket_minutes}-minute bucket."
+                    if len(group) > 1 else "Single-contract flow episode."
+                ),
+            })
+    return rows
+
+
+def build_outcome_alert_key(row: Dict[str, Any]) -> str:
+    candidate = _row_candidate(row)
+    return "|".join(str(part or "") for part in (
+        row.get("timestamp") or row.get("time_detected") or candidate.get("time_detected"),
+        candidate.get("underlying_symbol"),
+        candidate.get("option_symbol"),
+        row.get("whale_score") or row.get("score"),
+    ))
+
+
+def latest_outcomes_by_key(outcomes: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in outcomes:
+        key = str(row.get("alert_key") or "")
+        if not key:
+            continue
+        if key not in latest or str(row.get("reviewed_at") or "") >= str(latest[key].get("reviewed_at") or ""):
+            latest[key] = row
+    return latest
+
+
+def outcome_completion_fields(outcome: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not outcome:
+        return {
+            "outcome_completeness_label": "Outcome not reviewed yet",
+            "outcome_completeness_status": "pending_review",
+            "outcome_completed_windows": 0,
+            "outcome_total_windows": 4,
+            "outcome_missing_windows": 4,
+            "outcome_favorable_windows": 0,
+        }
+    windows = outcome.get("windows") if isinstance(outcome.get("windows"), list) else []
+    total = len(windows) or len(outcome.get("outcome_window_minutes_requested") or []) or 4
+    completed = sum(1 for item in windows if item.get("status") == "ok")
+    favorable = sum(1 for item in windows if item.get("status") == "ok" and item.get("favorable") is True)
+    missing = max(0, total - completed)
+    status = "complete" if completed >= total and total else "partial" if completed else str(outcome.get("outcome_status") or "pending")
+    label = f"{completed}/{total} outcome windows complete"
+    if missing:
+        label += f" ({missing} incomplete)"
+    return {
+        "outcome_reviewed_at": outcome.get("reviewed_at"),
+        "outcome_status": outcome.get("outcome_status"),
+        "outcome_completeness_label": label,
+        "outcome_completeness_status": status,
+        "outcome_completed_windows": completed,
+        "outcome_total_windows": total,
+        "outcome_missing_windows": missing,
+        "outcome_favorable_windows": favorable,
+        "outcome_favorable_rate": round(favorable / completed, 4) if completed else None,
+    }
+
+
+def attach_outcome_completeness(rows: List[Dict[str, Any]], outcomes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_key = latest_outcomes_by_key(outcomes)
+    for row in rows:
+        row.update(outcome_completion_fields(by_key.get(build_outcome_alert_key(row))))
+    return rows
+
+
+def build_symbol_bias_memory(outcomes: List[Dict[str, Any]], *, window_minutes: int = 15, min_completed: int = 20, weak_rate: float = 0.45, strong_rate: float = 0.55) -> Dict[tuple[str, str], Dict[str, Any]]:
+    buckets: Dict[tuple[str, str], Dict[str, int]] = {}
+    for row in latest_outcomes_by_key(outcomes).values():
+        symbol = str(row.get("underlying_symbol") or "").upper()
+        bias = str(row.get("flow_bias") or "UNKNOWN").upper()
+        if not symbol or bias == "UNKNOWN":
+            continue
+        target = None
+        for window in row.get("windows") or []:
+            if int(window.get("minutes") or 0) == int(window_minutes) and window.get("status") == "ok":
+                target = window
+                break
+        if not target or target.get("favorable") is None:
+            continue
+        bucket = buckets.setdefault((symbol, bias), {"completed": 0, "favorable": 0})
+        bucket["completed"] += 1
+        if target.get("favorable") is True:
+            bucket["favorable"] += 1
+    memory: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for key, bucket in buckets.items():
+        completed = bucket["completed"]
+        favorable = bucket["favorable"]
+        rate = favorable / completed if completed else 0.0
+        if completed < int(min_completed):
+            label = "insufficient_history"
+        elif rate < float(weak_rate):
+            label = "weak_recent_follow_through"
+        elif rate > float(strong_rate):
+            label = "strong_recent_follow_through"
+        else:
+            label = "mixed_recent_follow_through"
+        memory[key] = {
+            "symbol_bias_memory_label": label,
+            "symbol_bias_memory_window": int(window_minutes),
+            "symbol_bias_memory_completed": completed,
+            "symbol_bias_memory_favorable": favorable,
+            "symbol_bias_memory_rate": round(rate, 4),
+        }
+    return memory
+
+
+def apply_symbol_bias_memory(result: Dict[str, Any], memory: Dict[tuple[str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = result.get("candidate") or {}
+    symbol = str(candidate.get("underlying_symbol") or "").upper()
+    bias = infer_direction_bias_label(result)
+    learned = memory.get((symbol, bias))
+    if not learned:
+        result.update({
+            "learned_quality_score": None,
+            "learned_quality_reason": "not enough outcome history yet",
+            "symbol_bias_memory_label": "no_history",
+        })
+        return result
+    result.update(learned)
+    rate = learned.get("symbol_bias_memory_rate")
+    completed = learned.get("symbol_bias_memory_completed")
+    window = learned.get("symbol_bias_memory_window")
+    label = learned.get("symbol_bias_memory_label")
+    if label == "weak_recent_follow_through":
+        penalty = int(cfg.get("symbol_bias_memory_penalty", 5))
+        original_score = int(result.get("whale_score") or 0)
+        result["pre_memory_whale_score"] = original_score
+        result["whale_score"] = max(0, original_score - penalty)
+        result["noise_adjusted_score"] = result["whale_score"]
+        result["classification"] = classify_score(result["whale_score"])
+        result["learned_quality_score"] = round(float(rate), 4)
+        result["learned_quality_reason"] = f"Recent {symbol} {bias.lower()} flow has weak {window}m follow-through ({rate:.0%} over {completed} completed windows); score reduced by {penalty}."
+        warnings = list(result.get("score_warnings") or [])
+        warnings.append("weak symbol/bias follow-through memory")
+        result["score_warnings"] = warnings
+    elif label == "strong_recent_follow_through":
+        result["learned_quality_score"] = round(float(rate), 4)
+        result["learned_quality_reason"] = f"Recent {symbol} {bias.lower()} flow has strong {window}m follow-through ({rate:.0%} over {completed} completed windows)."
+    elif label == "mixed_recent_follow_through":
+        result["learned_quality_score"] = round(float(rate), 4)
+        result["learned_quality_reason"] = f"Recent {symbol} {bias.lower()} flow is mixed at {window}m ({rate:.0%} over {completed} completed windows)."
+    else:
+        result["learned_quality_score"] = round(float(rate), 4)
+        result["learned_quality_reason"] = f"Only {completed} completed {window}m windows for recent {symbol} {bias.lower()} flow; not enough history to adjust confidence."
+    return result
 
 
 def _row_completeness(row: Dict[str, Any]) -> int:
@@ -851,6 +1077,14 @@ class OptionsWhaleScanner:
         end = datetime.now(timezone.utc)
         stock_bars = self.client.get_stock_bars(underlyings[:50], start=end - timedelta(minutes=90), end=end) if self.whale.get("enable_price_action_context", True) else {}
         baseline_records = self.baseline.load_records()
+        recent_outcomes = self.storage.latest_outcomes(limit=5000)
+        symbol_bias_memory = build_symbol_bias_memory(
+            recent_outcomes,
+            window_minutes=int(effective_cfg.get("symbol_bias_memory_window_minutes", 15)),
+            min_completed=int(effective_cfg.get("symbol_bias_memory_min_completed", 20)),
+            weak_rate=float(effective_cfg.get("symbol_bias_memory_weak_rate", 0.45)),
+            strong_rate=float(effective_cfg.get("symbol_bias_memory_strong_rate", 0.55)),
+        ) if bool(effective_cfg.get("symbol_bias_memory_enabled", True)) else {}
         raw_candidates: List[Dict[str, Any]] = []
         evaluated: List[Dict[str, Any]] = []
         skipped_reasons: Dict[str, int] = {}
@@ -942,9 +1176,21 @@ class OptionsWhaleScanner:
                 **build_premium_pressure_fields({**candidate, **flow}),
                 "next_day_oi_status": "pending",
                 "next_day_oi_reason": "awaiting next trading day OI",
-                "learned_quality_score": None,
-                "learned_quality_reason": "not enough outcome history yet",
             }
+            if symbol_bias_memory:
+                result = apply_symbol_bias_memory(result, symbol_bias_memory, effective_cfg)
+            else:
+                result.update({
+                    "learned_quality_score": None,
+                    "learned_quality_reason": "not enough outcome history yet",
+                    "symbol_bias_memory_label": "disabled_or_no_history",
+                })
+            if int(result.get("whale_score") or 0) < int(effective_cfg.get("min_score", 75)):
+                continue
+            result.update({
+                "option_price_follow_through_status": result.get("follow_through_status", "pending_same_contract_follow_up"),
+                "option_price_follow_through_note": "Uses same-contract premium/volume follow-up from later scans when available; not full option P&L yet.",
+            })
             tier, should_notify, notify_reason = result_alert_tier(result, effective_cfg)
             if debug_loose:
                 should_notify = False
@@ -958,6 +1204,11 @@ class OptionsWhaleScanner:
         results.sort(key=lambda item: int(item.get("whale_score") or 0), reverse=True)
         results = results[: int(effective_cfg.get("max_results", 100))]
         results = attach_simple_follow_through(results, self.storage.latest_alerts(limit=500))
+        for result in results:
+            result.update({
+                "option_price_follow_through_status": result.get("follow_through_status", "no_follow_up_yet"),
+                "option_price_follow_through_note": "Uses same-contract premium/volume follow-up from later scans when available; not full option P&L yet.",
+            })
         final_by_key = {build_whale_print_key(item): item for item in results}
         near_misses = sorted(
             evaluated,
@@ -988,6 +1239,8 @@ class OptionsWhaleScanner:
             })
         raw_results_count = len(results)
         results = dedupe_whale_prints(results)
+        results = attach_flow_episode_context(results, int(effective_cfg.get("flow_episode_bucket_minutes", 5)))
+        results = attach_outcome_completeness(results, recent_outcomes)
         duplicate_results_count = raw_results_count - len(results)
         fresh_results_count = sum(1 for item in results if not is_stale_whale_print(item))
         stale_results_count = len(results) - fresh_results_count
@@ -1045,8 +1298,10 @@ class OptionsWhaleScanner:
             if prior_symbol and prior_time and now - prior_time <= notification_window:
                 recent_symbol_counts[prior_symbol] = recent_symbol_counts.get(prior_symbol, 0) + 1
         per_symbol: Dict[str, int] = {}
+        notified_episodes: set[str] = set()
         for result in results:
             symbol = str((result.get("candidate") or {}).get("underlying_symbol") or "").upper()
+            episode_id = str(result.get("flow_episode_id") or "")
             event_key = build_notification_event_key(result)
             prior = prior_events.get(event_key)
             prior_premium = safe_float(_key_value(prior or {}, "estimated_premium"))
@@ -1056,9 +1311,15 @@ class OptionsWhaleScanner:
                 result.update({"should_notify": False, "notify_reason": "Duplicate option-flow event already logged; dashboard update only."})
             elif material_update:
                 result.update({"update_type": "material_premium_follow_through", "notify_reason": "Material premium follow-through update."})
+            elif episode_id and episode_id in notified_episodes:
+                result.update({"should_notify": False, "notify_reason": "Related strike grouped into an existing flow episode; dashboard update only."})
+            elif episode_id and result.get("flow_episode_size", 1) > 1 and not result.get("flow_episode_leader"):
+                result.update({"should_notify": False, "notify_reason": "Related strike is not the lead contract for this flow episode; dashboard update only."})
             elif recent_symbol_counts.get(symbol, 0) + per_symbol.get(symbol, 0) >= int(effective_cfg.get("max_notifications_per_symbol", 2)):
                 result.update({"should_notify": False, "notify_reason": "Per-symbol notification budget reached in the recent window; grouped dashboard update only."})
             if result.get("should_notify"):
+                if episode_id:
+                    notified_episodes.add(episode_id)
                 per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
                 self.storage.append_alert(result)
             if result.get("alert_tier") in {"Tier 1", "Tier 2"}:
