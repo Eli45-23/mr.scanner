@@ -278,6 +278,38 @@ class OptionsDataClient:
                     out[symbol] = trades if isinstance(trades, list) else []
         return out
 
+    def get_option_bars(self, option_symbols: List[str], *, start: datetime, end: datetime, timeframe: str = "1Min", feed: Optional[str] = None, limit: int = 10000) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for batch in chunked(option_symbols, 100):
+            params = {"symbols": ",".join(batch), "timeframe": timeframe, "start": _iso(start), "end": _iso(end), "feed": (feed or self.options_feed).lower(), "limit": limit}
+            response = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params=params, timeout=45)
+            if response.status_code >= 400 and params["feed"] == "opra" and self.allow_indicative_fallback:
+                params["feed"] = "indicative"
+                response = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params=params, timeout=45)
+            if response.status_code >= 400:
+                continue
+            raw = response.json().get("bars", {})
+            if isinstance(raw, dict):
+                for symbol, bars in raw.items():
+                    out[symbol] = bars if isinstance(bars, list) else []
+        return out
+
+    def get_option_quotes(self, option_symbols: List[str], *, start: datetime, end: datetime, feed: Optional[str] = None, limit: int = 10000) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for batch in chunked(option_symbols, 100):
+            params = {"symbols": ",".join(batch), "start": _iso(start), "end": _iso(end), "feed": (feed or self.options_feed).lower(), "limit": limit}
+            response = self._request("GET", self.options_data_base_url, "/v1beta1/options/quotes", params=params, timeout=45)
+            if response.status_code >= 400 and params["feed"] == "opra" and self.allow_indicative_fallback:
+                params["feed"] = "indicative"
+                response = self._request("GET", self.options_data_base_url, "/v1beta1/options/quotes", params=params, timeout=45)
+            if response.status_code >= 400:
+                continue
+            raw = response.json().get("quotes", {})
+            if isinstance(raw, dict):
+                for symbol, quotes in raw.items():
+                    out[symbol] = quotes if isinstance(quotes, list) else []
+        return out
+
     def get_stock_bars(self, symbols: List[str], *, start: datetime, end: datetime, timeframe: str = "1Min") -> Dict[str, List[Dict[str, Any]]]:
         response = self._request(
             "GET",

@@ -67,6 +67,11 @@ def parse_record_time(record: Dict[str, Any]) -> Optional[datetime]:
         or record.get("time")
         or record.get("bar_time")
         or record.get("created_at")
+        or record.get("scanner_detected_time")
+        or record.get("detected_at")
+        or record.get("reviewed_at")
+        or record.get("original_time")
+        or record.get("episode_updated_at")
     )
     if not isinstance(raw, str) or not raw:
         return None
@@ -266,12 +271,19 @@ def build_review_summary(
     openai_records: Optional[List[Dict[str, Any]]] = None,
     liquidity_sweep_records: Optional[List[Dict[str, Any]]] = None,
     orchestrator_records: Optional[List[Dict[str, Any]]] = None,
+    whale_records: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> str:
     chop_records = chop_records or []
     missed_entry_records = missed_entry_records or []
     openai_records = openai_records or []
     liquidity_sweep_records = liquidity_sweep_records or []
     orchestrator_records = orchestrator_records or []
+    whale_records = whale_records or {}
+    whale_scans = whale_records.get("scans", [])
+    whale_episodes = whale_records.get("episodes", [])
+    whale_outcomes = whale_records.get("outcomes", [])
+    whale_oi = whale_records.get("oi_reviews", [])
+    coverage_warnings = [row for row in whale_scans if (row.get("coverage_warning") or (row.get("diagnostics") or {}).get("coverage_warning"))]
     market_status = latest_status_for_day(market_data_records)
     alert_rows = [
         [
@@ -441,6 +453,14 @@ def build_review_summary(
 - GOOD_POSITION scenario records: {len(good_position)}
 - LATE / DO_NOT_CHASE records: {len(late_or_chase)}
 
+## Options Whale Data Quality
+- Scan passes: {len(whale_scans)}
+- Canonical flow episodes: {len(whale_episodes)}
+- Episode outcomes: {len(whale_outcomes)}
+- Next-day OI reviews: {len(whale_oi)}
+- Scan passes with coverage warnings: {len(coverage_warnings)}
+- Latest coverage warning: {(coverage_warnings[-1].get("coverage_warning") or (coverage_warnings[-1].get("diagnostics") or {}).get("coverage_warning")) if coverage_warnings else "None"}
+
 ## Phone Conclusions
 - Active alert types: PHASE3_HEADS_UP, STOCK_ONLY_WARNING, NORMAL_WATCH, NORMAL_SMS
 - Mixed / No Trade: {conclusion_counts["MIXED / NO TRADE"]}
@@ -538,6 +558,12 @@ def build_review_summary(
 - `logs/supply_demand_zones.jsonl`
 - `logs/market_structure.jsonl`
 - `logs/liquidity_sweeps.jsonl`
+- `logs/options_whale_scans.jsonl`
+- `logs/options_whale_qualified_events.jsonl`
+- `logs/options_whale_alerts.jsonl`
+- `logs/options_whale_episodes.jsonl`
+- `logs/options_oi_reviews.jsonl`
+- `data/options_whale_episode_outcomes.jsonl`
 - `logs/chop_mode.jsonl` if available
 - `logs/missed_clean_entry.jsonl` if available
 - `logs/alert_orchestrator.jsonl` if available
@@ -621,6 +647,20 @@ def export_review_package(
     alert_orchestrator = records_for_day(read_jsonl(log_dir / "alert_orchestrator.jsonl"), day_text)
     market_map_updates = records_for_day(read_jsonl(log_dir / "market_map_updates.jsonl"), day_text)
     morning_playbook = records_for_day(read_jsonl(log_dir / "morning_playbook.jsonl"), day_text)
+    whale_sources = {
+        "scans": log_dir / "options_whale_scans.jsonl",
+        "qualified_events": log_dir / "options_whale_qualified_events.jsonl",
+        "alerts": log_dir / "options_whale_alerts.jsonl",
+        "episodes": log_dir / "options_whale_episodes.jsonl",
+        "oi_reviews": log_dir / "options_oi_reviews.jsonl",
+    }
+    whale_records = {name: records_for_day(read_jsonl(path), day_text) for name, path in whale_sources.items()}
+    data_dir = log_dir.parent / "data"
+    outcome_sources = {
+        "outcomes": data_dir / "options_whale_episode_outcomes.jsonl",
+        "legacy_outcomes": data_dir / "options_whale_outcomes.jsonl",
+    }
+    whale_records.update({name: records_for_day(read_jsonl(path), day_text) for name, path in outcome_sources.items()})
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -652,6 +692,13 @@ def export_review_package(
         write_jsonl(logs_out / "market_map_updates.jsonl", market_map_updates)
     if (log_dir / "morning_playbook.jsonl").exists():
         write_jsonl(logs_out / "morning_playbook.jsonl", morning_playbook)
+    for name, source in whale_sources.items():
+        if source.exists():
+            write_jsonl(logs_out / source.name, whale_records[name])
+            write_jsonl(window_out / f"{source.stem}_window.jsonl", records_in_window(whale_records[name], start_dt, end_dt))
+    for name, source in outcome_sources.items():
+        if source.exists():
+            write_jsonl(package_dir / "data" / source.name, whale_records[name])
     write_jsonl(window_out / "alerts_window.jsonl", records_in_window(alerts, start_dt, end_dt))
     write_jsonl(window_out / "scenario_engine_window.jsonl", records_in_window(scenarios, start_dt, end_dt))
     write_jsonl(window_out / "phase3_heads_up_window.jsonl", records_in_window(heads_up, start_dt, end_dt))
@@ -736,6 +783,7 @@ def export_review_package(
         openai_records=openai_formatter,
         liquidity_sweep_records=liquidity_sweeps,
         orchestrator_records=alert_orchestrator,
+        whale_records=whale_records,
     )
     summary_path = package_dir / "review_summary.md"
     summary_path.write_text(summary, encoding="utf-8")

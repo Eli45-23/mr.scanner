@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 import elite_momentum_scanner as scanner_app
 import requests
 from scanner.options_data_client import OptionsDataClient
-from scanner.options_whale_scanner import OptionsWhaleScanner, options_market_session_state
+from scanner.options_whale_scanner import OptionsWhaleScanner, build_reliability_table, options_market_session_state
 from scanner.options_whale_storage import OptionsWhaleStorage
 from tools import dashboard_snapshot_exporter as snapshot_exporter
 from tools.preview_liquidity_sweeps import (
@@ -45,6 +45,7 @@ LIQUIDITY_SWEEP_LOG_PATH = APP_DIR / "logs" / "liquidity_sweeps.jsonl"
 ALERT_ORCHESTRATOR_LOG_PATH = APP_DIR / "logs" / "alert_orchestrator.jsonl"
 CHOP_MODE_LOG_PATH = APP_DIR / "logs" / "chop_mode.jsonl"
 OPTIONS_WHALE_LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
+OPTIONS_REVIEW_JOB_STATE_PATH = APP_DIR / "state" / "options_review_jobs.json"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -603,8 +604,74 @@ def options_whale_auto_scan_loop() -> None:
             STATE.options_whale_next_scan_monotonic = time.monotonic() + interval
         if not paused:
             run_options_whale_scan_locked("auto")
+        run_options_review_jobs(config)
         if STATE.stop_event.wait(interval):
             break
+
+
+def _read_review_job_state() -> Dict[str, Any]:
+    try:
+        value = json.loads(OPTIONS_REVIEW_JOB_STATE_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_review_job_state(value: Dict[str, Any]) -> None:
+    OPTIONS_REVIEW_JOB_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = OPTIONS_REVIEW_JOB_STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(OPTIONS_REVIEW_JOB_STATE_PATH)
+
+
+def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    settings = config.get("options_review_jobs", {})
+    if not settings.get("enabled", True):
+        return {"enabled": False}
+    current = (now or datetime.now(timezone.utc)).astimezone(ET)
+    state = _read_review_job_state()
+    results: Dict[str, Any] = {"enabled": True}
+    errors: List[str] = []
+    last = parse_scan_timestamp(state.get("outcomes_last_run"))
+    interval = max(60, int(settings.get("outcomes_interval_seconds", 300)))
+    if last is None or (current.astimezone(timezone.utc) - last.astimezone(timezone.utc)).total_seconds() >= interval:
+        try:
+            from tools.review_options_alert_outcomes import review_alerts
+            results["outcomes"] = review_alerts(limit=int(settings.get("review_limit", 1000)))
+            state["outcomes_last_run"] = current.isoformat()
+        except Exception as exc:
+            logger.exception("Options outcome review job failed")
+            errors.append(f"outcomes: {exc}")
+    oi_hour, oi_minute = [int(part) for part in str(settings.get("oi_time_et", "09:45")).split(":", 1)]
+    if (current.hour, current.minute) >= (oi_hour, oi_minute) and state.get("oi_day") != current.date().isoformat():
+        try:
+            from tools.review_next_day_oi import review_from_live_contracts
+            results["oi"] = review_from_live_contracts(limit=int(settings.get("review_limit", 1000)))
+            state["oi_day"] = current.date().isoformat()
+        except Exception as exc:
+            logger.exception("Options OI review job failed")
+            errors.append(f"oi: {exc}")
+    package_hour, package_minute = [int(part) for part in str(settings.get("package_time_et", "16:05")).split(":", 1)]
+    if (current.hour, current.minute) >= (package_hour, package_minute) and state.get("package_day") != current.date().isoformat():
+        try:
+            snapshot_exporter.export_dashboard_snapshot()
+            from tools.export_review_package import export_review_package
+            results["package"] = export_review_package(
+                day_text=current.date().isoformat(), start_text="09:00", end_text="16:00",
+                output_dir=APP_DIR / "exports", log_dir=APP_DIR / "logs",
+                snapshot_dir=APP_DIR / "exports", config_example=APP_DIR / "config.example.json",
+            )
+            state["package_day"] = current.date().isoformat()
+        except Exception as exc:
+            logger.exception("Options package review job failed")
+            errors.append(f"package: {exc}")
+    try:
+        _write_review_job_state(state)
+    except OSError as exc:
+        errors.append(f"state: {exc}")
+    if errors:
+        results["errors"] = errors
+    return results
 
 
 def ensure_options_whale_auto_scan() -> None:
@@ -776,6 +843,37 @@ def options_whales_history(limit: int = 100) -> Dict[str, Any]:
     history["alerts"] = alerts
     history["metadata"] = metadata
     return history
+
+
+def options_whales_coverage() -> Dict[str, Any]:
+    latest = read_latest_options_whale_scan()
+    diagnostics = latest.get("diagnostics") if isinstance(latest.get("diagnostics"), dict) else latest
+    ages = diagnostics.get("coverage_symbol_ages_seconds") or {}
+    stale_symbols = diagnostics.get("coverage_stale_symbols") or []
+    rows = [
+        {"symbol": str(symbol).upper(), "age_seconds": age, "stale": str(symbol).upper() in set(stale_symbols)}
+        for symbol, age in ages.items()
+    ]
+    rows.sort(key=lambda row: float(row.get("age_seconds") or 0), reverse=True)
+    return {
+        "timestamp": latest.get("timestamp"),
+        "coverage_warning": diagnostics.get("coverage_warning", ""),
+        "stale_symbols": stale_symbols,
+        "symbols_scanned": list(dict.fromkeys((diagnostics.get("first_20_underlyings_scanned") or []) + (diagnostics.get("last_20_underlyings_scanned") or []))),
+        "rotation_page": diagnostics.get("coverage_rotation_page"),
+        "rotation_cursor": diagnostics.get("coverage_cycle_cursor"),
+        "rows": rows,
+    }
+
+
+def options_whales_reliability() -> Dict[str, Any]:
+    config = scanner_app.load_config(STATE.config_path)
+    cfg = config.get("options_whale_scanner", {})
+    outcomes = OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=10000)
+    table = build_reliability_table(outcomes, cfg)
+    rows = [{"bucket": "|".join(key), **value} for key, value in table.items()]
+    rows.sort(key=lambda row: (row.get("reliability_effective_samples", 0), row.get("bucket", "")), reverse=True)
+    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows}
 
 
 def options_whales_filters() -> Dict[str, Any]:
@@ -4350,7 +4448,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     function optionFollowText(item) {
       return String(item.option_price_follow_through_status || item.follow_through_status || 'pending').replaceAll('_', ' ');
     }
-    function renderStatus(status, latest, universe) {
+    function renderStatus(status, latest, universe, coverage, reliability) {
       const scan = latest.last_scan || {};
       const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
       const current = status.scan_running ? 'Running' : 'Idle';
@@ -4372,8 +4470,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Results', (latest.results || []).length),
         card('Fresh prints', latest.fresh_count ?? latest.diagnostics?.fresh_count ?? 0, 'good'),
         card('Old prints', latest.stale_count ?? latest.diagnostics?.stale_count ?? 0, (latest.stale_count ?? latest.diagnostics?.stale_count ?? 0) ? 'warn' : ''),
+        card('Stale coverage', (coverage.stale_symbols || []).length, (coverage.stale_symbols || []).length ? 'warn' : 'good'),
+        card('Reliability buckets', reliability.bucket_count ?? 0),
       ].join('');
-      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message].filter(Boolean);
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }
@@ -4497,12 +4597,14 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     async function refresh() {
       try {
-        const [status, latest, universe] = await Promise.all([
+        const [status, latest, universe, coverage, reliability] = await Promise.all([
           api('/api/options-whales/status'),
           api('/api/options-whales/latest'),
-          api('/api/options-whales/universe/status')
+          api('/api/options-whales/universe/status'),
+          api('/api/options-whales/coverage'),
+          api('/api/options-whales/reliability')
         ]);
-        renderStatus(status, latest, universe);
+        renderStatus(status, latest, universe, coverage, reliability);
         renderRows(latest);
         maybePlayUpdateSound(status, latest);
       } catch (err) {
@@ -4658,6 +4760,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(options_whales_filters())
             elif parsed.path == "/api/options-whales/universe/status":
                 self.send_json(options_whale_scanner().universe_status())
+            elif parsed.path == "/api/options-whales/coverage":
+                self.send_json(options_whales_coverage())
+            elif parsed.path == "/api/options-whales/reliability":
+                self.send_json(options_whales_reliability())
             elif parsed.path == "/api/options-whales/export.json":
                 self.send_json(options_whales_export_json())
             elif parsed.path == "/api/options-whales/export.csv":

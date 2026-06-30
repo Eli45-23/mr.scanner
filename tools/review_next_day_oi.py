@@ -54,15 +54,19 @@ def build_client(config: Dict[str, Any]) -> OptionsDataClient:
 
 
 def append_reviews(rows: Iterable[Dict[str, Any]], storage: OptionsWhaleStorage) -> None:
+    existing = {(str(row.get("episode_id") or ""), str(row.get("option_symbol") or ""), str(row.get("original_time") or "")) for row in storage.latest_oi_reviews(limit=10000)}
     for row in rows:
-        storage.append_oi_review({"reviewed_at": datetime.now(timezone.utc).isoformat(), **row})
+        key = (str(row.get("episode_id") or ""), str(row.get("option_symbol") or ""), str(row.get("original_time") or ""))
+        if key not in existing:
+            storage.append_oi_review({"reviewed_at": datetime.now(timezone.utc).isoformat(), **row})
+            existing.add(key)
 
 
 def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, latest_only: bool = False) -> Dict[str, Any]:
     scanner_app.load_dotenv()
     config = scanner_app.load_config(None)
     storage = OptionsWhaleStorage(ROOT)
-    alerts = _read_latest_results() if latest_only else storage.latest_alerts(limit=limit) or _read_latest_results()
+    alerts = _read_latest_results() if latest_only else storage.latest_episodes(limit=limit) or storage.latest_alerts(limit=limit) or _read_latest_results()
     alerts = _unique_by_contract(alerts)[-max(1, int(limit)):]
     oi_map = fetch_next_day_oi_map(build_client(config), alerts)
     reviews = review_alerts_with_next_day_oi(alerts, oi_map)

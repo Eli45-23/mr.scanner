@@ -8,11 +8,13 @@ from scanner.options_whale_scanner import (
     OptionsWhaleScanner,
     apply_index_0dte_noise_filter,
     apply_symbol_bias_memory,
+    apply_reliability_adjustment,
     attach_flow_episode_context,
     attach_outcome_completeness,
     attach_simple_follow_through,
     build_flow_episode_key,
     build_symbol_bias_memory,
+    build_reliability_table,
     build_premium_display_fields,
     build_premium_pressure_fields,
     build_premium_timing_fields,
@@ -129,7 +131,34 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertIn("AIVC", result["first_20_underlyings_scanned"])
             self.assertIn("ZZZZ", result["first_20_underlyings_scanned"])
             self.assertGreater(result["underlying_symbols_scanned"], 2)
-            self.assertEqual(client.contract_calls[0], ["SPY", "AAPL"])
+            self.assertEqual(client.contract_calls[:2], [["SPY"], ["AAPL"]])
+
+    def test_rotation_persists_and_advances_across_scanner_instances(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = [{"underlying_symbol": symbol, "contract_count": 10} for symbol in ("AAPL", "AAA", "BBB", "CCC")]
+            self.write_universe(root, entries)
+            config = {
+                "options_whale_scanner": {
+                    "enabled": True,
+                    "max_contracts_per_scan": 20,
+                    "min_score": 99,
+                    "min_premium": 999999999,
+                    "always_scan_symbols": ["AAPL"],
+                    "priority_contract_budget": 5,
+                    "max_contracts_per_underlying": 5,
+                    "rotation_symbols_per_scan": 1,
+                },
+            }
+            first_client = FakeWhaleClient()
+            first = OptionsWhaleScanner(config, first_client, OptionsWhaleStorage(root), root=root)
+            first_result = first.scan()
+            second_client = FakeWhaleClient()
+            second = OptionsWhaleScanner(config, second_client, OptionsWhaleStorage(root), root=root)
+            second_result = second.scan()
+            self.assertEqual(first_result["coverage_core_symbols"], ["AAPL"])
+            self.assertNotEqual(first_result["coverage_rotation_page"], second_result["coverage_rotation_page"])
+            self.assertTrue((root / "data" / "options_whale_scan_state.json").exists())
 
     def test_no_candidate_scan_returns_near_misses_and_rejection_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -430,6 +459,23 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         self.assertEqual(adjusted["pre_memory_whale_score"], 80)
         self.assertIn("weak", adjusted["symbol_bias_memory_label"])
         self.assertIn("score reduced", adjusted["learned_quality_reason"])
+
+    def test_reliability_adjustment_is_bounded_and_requires_samples(self):
+        outcomes = []
+        for idx in range(30):
+            outcomes.append({
+                "alert_key": f"episode-{idx}", "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                "flow_bias": "BULLISH", "whale_score": 92, "dte_bucket": "0DTE",
+                "direction_confidence": "MEDIUM", "market_regime": "CHOPPY",
+                "windows": [{"minutes": 15, "status": "ok", "signed_move_pct": 0.2 if idx < 3 else -0.2}],
+            })
+        cfg = {"reliability_min_effective_samples": 20, "reliability_max_penalty": 8, "reliability_max_bonus": 5}
+        table = build_reliability_table(outcomes, cfg)
+        result = {"candidate": {"dte": 0, "dte_bucket": "0DTE"}, "whale_score": 92, "direction_confidence": "MEDIUM", "market_regime": "CHOPPY"}
+        adjusted = apply_reliability_adjustment(result, table, cfg)
+        self.assertEqual(adjusted["reliability_status"], "applied")
+        self.assertGreaterEqual(adjusted["reliability_score_adjustment"], -8)
+        self.assertLess(adjusted["whale_score"], 92)
 
     def test_attach_outcome_completeness_adds_badge_fields(self):
         row = {

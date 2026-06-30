@@ -34,9 +34,11 @@ class OptionsWhaleStorage:
         self.log_dir = root / "logs"
         self.alerts_path = self.log_dir / "options_whale_alerts.jsonl"
         self.qualified_events_path = self.log_dir / "options_whale_qualified_events.jsonl"
+        self.episodes_path = self.log_dir / "options_whale_episodes.jsonl"
         self.scans_path = self.log_dir / "options_whale_scans.jsonl"
         self.oi_reviews_path = self.log_dir / "options_oi_reviews.jsonl"
         self.outcomes_path = root / "data" / "options_whale_outcomes.jsonl"
+        self.episode_outcomes_path = root / "data" / "options_whale_episode_outcomes.jsonl"
 
     def append_alert(self, record: Dict[str, Any]) -> None:
         append_jsonl(self.alerts_path, record)
@@ -47,14 +49,35 @@ class OptionsWhaleStorage:
     def latest_qualified_events(self, limit: int = 1000) -> List[Dict[str, Any]]:
         return read_jsonl(self.qualified_events_path, limit=limit)
 
+    def append_episode(self, record: Dict[str, Any]) -> None:
+        append_jsonl(self.episodes_path, record)
+
+    def latest_episodes(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        rows = read_jsonl(self.episodes_path)
+        latest: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = str(row.get("flow_episode_id") or row.get("episode_id") or "")
+            if key:
+                latest[key] = row
+        return list(latest.values())[-limit:]
+
     def latest_outcomes(self, limit: int = 5000) -> List[Dict[str, Any]]:
         return read_jsonl(self.outcomes_path, limit=limit)
+
+    def latest_episode_outcomes(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        return read_jsonl(self.episode_outcomes_path, limit=limit)
+
+    def append_episode_outcome(self, record: Dict[str, Any]) -> None:
+        append_jsonl(self.episode_outcomes_path, record)
 
     def append_scan(self, record: Dict[str, Any]) -> None:
         append_jsonl(self.scans_path, record)
 
     def append_oi_review(self, record: Dict[str, Any]) -> None:
         append_jsonl(self.oi_reviews_path, record)
+
+    def latest_oi_reviews(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        return read_jsonl(self.oi_reviews_path, limit=limit)
 
     def latest_alerts(self, limit: int = 100) -> List[Dict[str, Any]]:
         return read_jsonl(self.alerts_path, limit=limit)

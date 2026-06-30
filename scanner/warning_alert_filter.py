@@ -27,6 +27,7 @@ def classify_warning_alert(payload: Dict[str, Any], config: Dict[str, Any]) -> D
     ).upper()
     category = str(payload.get("category") or "").upper()
     combined = " ".join((conclusion, decision, category))
+    setup = str(payload.get("setup_name") or payload.get("primary_setup") or "").strip().upper()
     clean_chop_exit = bool(payload.get("clean_chop_exit") or payload.get("chop_exit_clean_confirmation"))
 
     if clean_chop_exit and settings.get("allow_chop_exit_text", True):
@@ -68,6 +69,21 @@ def classify_warning_alert(payload: Dict[str, Any], config: Dict[str, Any]) -> D
             "telegram_allowed": False,
             "suppression_reason": "mixed_dashboard_only",
             "warning_type": "mixed_signal",
+            "clean_chop_exit": False,
+            "version": WARNING_FILTER_VERSION,
+        }
+
+    dashboard_only_setups = {
+        str(value).strip().upper()
+        for value in settings.get("dashboard_only_setups", ["MIXED SIGNAL", "BULLISH PULLBACK HOLDING"])
+        if str(value).strip()
+    }
+    if setup in dashboard_only_setups:
+        return {
+            "matched": True,
+            "telegram_allowed": False,
+            "suppression_reason": "configured_setup_dashboard_only",
+            "warning_type": "setup_dashboard_only",
             "clean_chop_exit": False,
             "version": WARNING_FILTER_VERSION,
         }

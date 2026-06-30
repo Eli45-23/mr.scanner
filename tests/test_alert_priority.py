@@ -69,6 +69,21 @@ class AlertPriorityTests(unittest.TestCase):
             self.assertTrue(result["warning_filter_suppressed"])
             self.assertEqual(result["warning_suppression_reason"], reason)
 
+    def test_bullish_pullback_holding_is_always_dashboard_only(self) -> None:
+        result = self.classify(
+            primary_setup="Bullish Pullback Holding",
+            scenario_stage="CONFIRMED",
+            strategy_confidence_score=99,
+            existing_user_facing_approved=True,
+        )
+        self.assertEqual(result["tier"], "TIER_2_DASHBOARD_ONLY")
+        self.assertFalse(result["should_send_telegram"])
+        self.assertEqual(result["warning_filter_type"], "setup_dashboard_only")
+
+    def test_bearish_pullback_rejection_is_not_blocked_by_bullish_rule(self) -> None:
+        result = self.classify(primary_setup="Bearish Pullback Rejecting")
+        self.assertEqual(result["tier"], "TIER_1_TEXT_ALERT")
+
     def test_first_chop_activation_can_text_once(self) -> None:
         result = self.classify(
             phone_conclusion="CHOP MODE",

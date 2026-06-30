@@ -14,7 +14,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import elite_momentum_scanner as scanner_app
-from scanner.options_alert_outcomes import evaluate_alert_outcome, summarize_outcomes
+from scanner.options_alert_outcomes import evaluate_alert_outcome, evaluate_option_price_outcome, summarize_outcomes
 from scanner.options_data_client import OptionsDataClient
 from tools.summarize_options_outcomes import is_clean_completed
 from scanner.options_whale_storage import OptionsWhaleStorage
@@ -54,6 +54,9 @@ def candidate(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def alert_key(row: Dict[str, Any]) -> str:
+    episode_id = row.get("flow_episode_id") or row.get("episode_id")
+    if episode_id:
+        return f"episode|{episode_id}"
     c = candidate(row)
     return "|".join(str(part or "") for part in (
         row.get("timestamp") or row.get("time_detected") or c.get("time_detected"),
@@ -210,12 +213,15 @@ def review_alerts(
     latest = read_latest()
     storage_root = LATEST_PATH.parent.parent if LATEST_PATH.parent.name == "data" else LATEST_PATH.parent
     storage = OptionsWhaleStorage(storage_root)
-    results = storage.latest_qualified_events(limit=max(1, int(limit))) or list(latest.get("results") or [])
+    episodes = storage.latest_episodes(limit=max(1, int(limit)))
+    episode_mode = bool(episodes)
+    results = episodes or storage.latest_qualified_events(limit=max(1, int(limit))) or list(latest.get("results") or [])
+    outcome_path = storage.episode_outcomes_path if episode_mode else OUTCOMES_PATH
     if include_near_misses:
         results.extend(latest.get("near_misses") or [])
     results = results[: max(1, int(limit))]
-    finalized = load_finalized_keys()
-    previous_by_key = load_latest_outcomes_by_key()
+    finalized = load_finalized_keys(outcome_path)
+    previous_by_key = load_latest_outcomes_by_key(outcome_path)
     reviewed: List[Dict[str, Any]] = []
     appendable: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -241,19 +247,39 @@ def review_alerts(
             skipped.append({"alert_key": key, "reason": f"bars_unavailable: {exc}"})
             continue
         outcome = evaluate_alert_outcome(row, bars, windows=OUTCOME_WINDOWS)
+        option_symbol = str(c.get("option_symbol") or "")
+        option_bars: List[Dict[str, Any]] = []
+        option_quotes: List[Dict[str, Any]] = []
+        if option_symbol and hasattr(client, "get_option_bars"):
+            try:
+                option_bars = client.get_option_bars([option_symbol], start=start, end=end).get(option_symbol, [])
+            except Exception:
+                option_bars = []
+        if option_symbol and hasattr(client, "get_option_quotes"):
+            try:
+                option_quotes = client.get_option_quotes([option_symbol], start=start, end=end).get(option_symbol, [])
+            except Exception:
+                option_quotes = []
+        option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS)
         reviewed_row = {
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "alert_key": key,
+            "episode_id": row.get("flow_episode_id") or row.get("episode_id"),
             "underlying_symbol": symbol,
             "option_symbol": c.get("option_symbol"),
             "option_type": c.get("option_type"),
             "strike": c.get("strike"),
             "expiration": c.get("expiration"),
             "whale_score": row.get("whale_score") or row.get("score"),
+            "dte": c.get("dte"),
+            "dte_bucket": c.get("dte_bucket"),
+            "direction_confidence": row.get("direction_confidence") or c.get("direction_confidence"),
+            "market_regime": row.get("market_regime") or c.get("market_regime") or "UNKNOWN",
             "classification": row.get("classification"),
             "alert_tier": row.get("alert_tier"),
             "score_components": row.get("score_components"),
             **outcome,
+            **option_outcome,
             **build_outcome_diagnostics(
                 bars=bars,
                 start=start,
@@ -270,7 +296,7 @@ def review_alerts(
             unchanged_pending_count += 1
 
     if appendable and not dry_run:
-        append_outcomes(appendable)
+        append_outcomes(appendable, outcome_path)
     summary = summarize_outcomes(reviewed)
     return {
         "reviewed_count": len(reviewed),
@@ -281,7 +307,8 @@ def review_alerts(
         "completed_count": summary.get("completed", 0),
         "pending_count": summary.get("pending", 0),
         "insufficient_future_session_count": summary.get("insufficient_future_session", 0),
-        "output_path": display_path(OUTCOMES_PATH),
+        "output_path": display_path(outcome_path),
+        "episode_mode": episode_mode,
         "dry_run": dry_run,
         "force": force,
         "summary": summary,

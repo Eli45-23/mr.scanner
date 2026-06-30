@@ -52,6 +52,20 @@ class OptionsOiReviewTests(unittest.TestCase):
         self.assertEqual(result["next_day_oi_status"], "pending")
         self.assertIn("awaiting", result["next_day_oi_reason"])
 
+    def test_large_oi_decrease_is_likely_closing(self):
+        result = classify_next_day_oi(self.alert(volume=1000, oi=1000), 100)
+        self.assertEqual(result["next_day_oi_status"], "likely_closing")
+
+    def test_episode_with_offsetting_oi_changes_is_possible_roll_or_spread(self):
+        alert = self.alert(symbol="QQQ260618P00726000")
+        alert["flow_episode_id"] = "QQQ|BEARISH|bucket"
+        alert["episode_member_contracts"] = [
+            {"option_symbol": "QQQ260618P00726000", "open_interest": 100},
+            {"option_symbol": "QQQ260619P00726000", "open_interest": 500},
+        ]
+        rows = review_alerts_with_next_day_oi([alert], {"QQQ260618P00726000": 700, "QQQ260619P00726000": 100})
+        self.assertEqual(rows[0]["next_day_oi_status"], "roll_or_spread_possible")
+
     def test_review_alerts_outputs_contract_review(self):
         rows = review_alerts_with_next_day_oi([self.alert(volume=1000, oi=100)], {"QQQ260618P00726000": 700})
         self.assertEqual(len(rows), 1)

@@ -9,7 +9,9 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
-OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
+LEGACY_OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
+EPISODE_OUTCOMES_PATH = APP_DIR / "data" / "options_whale_episode_outcomes.jsonl"
+OUTCOMES_PATH = EPISODE_OUTCOMES_PATH if EPISODE_OUTCOMES_PATH.exists() else LEGACY_OUTCOMES_PATH
 COMPLETED_STATUSES = {"ok", "partial"}
 
 
@@ -118,6 +120,8 @@ def group_key(row: Dict[str, Any], group_by: str) -> str:
         return score_bucket(row.get("whale_score"))
     if group_by == "unusualness_bucket":
         return unusualness_bucket(row)
+    if group_by in {"dte_bucket", "direction_confidence", "market_regime", "reliability_bucket"}:
+        return str(row.get(group_by) or "UNKNOWN").upper()
     if group_by == "symbol_flow_bias":
         return f"{str(row.get('underlying_symbol') or 'UNKNOWN').upper()}|{str(row.get('flow_bias') or 'UNKNOWN').upper()}"
     return "ALL"
@@ -131,6 +135,8 @@ def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     dirty = [row for row in items if is_dirty_completed(row)]
     missing = [row for row in items if str(row.get("outcome_status")) == "missing_start_context"]
     favorable = [row for row in completed if is_favorable(row)]
+    meaningful_10 = [row for row in completed if any(item.get("meaningful_0_10") is True for item in row.get("windows") or [] if isinstance(item, dict))]
+    meaningful_20 = [row for row in completed if any(item.get("meaningful_0_20") is True for item in row.get("windows") or [] if isinstance(item, dict))]
     max_favorable_values = [
         value for value in (safe_float(row.get("max_favorable_move_pct")) for row in completed) if value is not None
     ]
@@ -147,6 +153,8 @@ def summarize_group(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "missing_start_context": len(missing),
         "favorable_count": len(favorable),
         "favorable_rate": round(len(favorable) / len(completed), 4) if completed else None,
+        "meaningful_0_10_rate": round(len(meaningful_10) / len(completed), 4) if completed else None,
+        "meaningful_0_20_rate": round(len(meaningful_20) / len(completed), 4) if completed else None,
         "average_max_favorable_move_pct": round(sum(max_favorable_values) / len(max_favorable_values), 4) if max_favorable_values else None,
         "average_max_adverse_move_pct": round(sum(max_adverse_values) / len(max_adverse_values), 4) if max_adverse_values else None,
         "average_whale_score": round(sum(scores) / len(scores), 2) if scores else None,
@@ -172,6 +180,10 @@ def summarize_outcome_file(path: Path = OUTCOMES_PATH, *, min_completed: int = 1
         "alert_tier",
         "score_bucket",
         "unusualness_bucket",
+        "dte_bucket",
+        "direction_confidence",
+        "market_regime",
+        "reliability_bucket",
     ):
         buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for row in rows:
@@ -213,7 +225,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize options whale outcome history.")
     parser.add_argument("--path", default=str(OUTCOMES_PATH), help="Path to options outcome JSONL file.")
     parser.add_argument("--group", default="symbol_flow_bias", choices=[
-        "symbol", "symbol_flow_bias", "option_type", "flow_bias", "flow_bias_source", "alert_tier", "score_bucket", "unusualness_bucket"
+        "symbol", "symbol_flow_bias", "option_type", "flow_bias", "flow_bias_source", "alert_tier", "score_bucket", "unusualness_bucket", "dte_bucket", "direction_confidence", "market_regime", "reliability_bucket"
     ])
     parser.add_argument("--min-completed", type=int, default=1)
     parser.add_argument("--limit", type=int, default=12)

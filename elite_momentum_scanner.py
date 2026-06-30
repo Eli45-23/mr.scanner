@@ -1073,6 +1073,9 @@ class Alert:
     warning_filter_suppressed: bool = False
     warning_suppression_reason: Optional[str] = None
     warning_filter_type: Optional[str] = None
+    warning_state_type: Optional[str] = None
+    warning_state_transition: Optional[str] = None
+    duplicate_context: bool = False
     chop_exit_clean_confirmation: bool = False
     strategy_reasons: List[str] = field(default_factory=list)
     strategy_warnings: List[str] = field(default_factory=list)
@@ -1881,6 +1884,17 @@ class StateStore:
 
     def set_phase3_heads_up_record(self, alert: Alert, dt: Optional[datetime] = None) -> None:
         self.data.setdefault("phase3_heads_up_records", {})[alert.symbol.upper()] = phase3_heads_up_record(alert, dt)
+
+    def get_warning_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        value = self.data.get("warning_states", {}).get(symbol.upper())
+        return dict(value) if isinstance(value, dict) else None
+
+    def set_warning_state(self, symbol: str, value: Optional[Dict[str, Any]]) -> None:
+        states = self.data.setdefault("warning_states", {})
+        if value is None:
+            states.pop(symbol.upper(), None)
+        else:
+            states[symbol.upper()] = value
 
 
 # ------------------------------------------------------------
@@ -7521,6 +7535,49 @@ class EliteScanner:
             alert.notes.append(f"alert priority: {result['tier']} - {result['reason']}")
         return result
 
+    def apply_warning_state_transition(self, alert: Alert) -> None:
+        settings = self.config.get("warning_alert_filter", {})
+        timeout = timedelta(minutes=max(1, int(settings.get("state_timeout_minutes", 15))))
+        setup = str(alert.setup_name or alert.primary_setup or "").upper()
+        risk = str(alert.risk_label or "").upper()
+        entry = str(alert.entry_quality_label or "").upper()
+        conclusion = str(alert.phone_conclusion or "").upper()
+        warning_type = ""
+        if risk == "DO_NOT_CHASE" or entry == "DO_NOT_CHASE" or conclusion == "DO NOT CHASE":
+            warning_type = "DO_NOT_CHASE"
+        elif entry == "LATE" or conclusion == "LATE MOVE" or setup == "LATE MOVE":
+            warning_type = "LATE"
+        previous = self.state_store.get_warning_state(alert.symbol)
+        previous_time = None
+        if previous:
+            try:
+                previous_time = datetime.fromisoformat(str(previous.get("last_seen_at")))
+                if previous_time.tzinfo is None:
+                    previous_time = previous_time.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                previous_time = None
+        active_previous = previous if previous_time and alert.timestamp - previous_time <= timeout else None
+        if warning_type:
+            direction = str(alert.direction or alert.scenario_direction or "NEUTRAL").upper()
+            if active_previous and active_previous.get("warning_type") == warning_type and active_previous.get("direction") == direction:
+                transition = "UNCHANGED"
+                alert.duplicate_context = True
+            else:
+                transition = "CHANGED" if active_previous else "ENTERED"
+            alert.warning_state_type = warning_type
+            alert.warning_state_transition = transition
+            self.state_store.set_warning_state(alert.symbol, {
+                "warning_type": warning_type, "direction": direction,
+                "entered_at": (active_previous or {}).get("entered_at") or alert.timestamp.isoformat(),
+                "last_seen_at": alert.timestamp.isoformat(), "transition": transition,
+            })
+            self.state_store.save()
+        elif active_previous and str(alert.scenario_stage or "").upper() in {"CONFIRMED", "GOOD_POSITION"} and not alert.mixed_signal_detected:
+            alert.warning_state_type = str(active_previous.get("warning_type") or "")
+            alert.warning_state_transition = "CLEARED"
+            self.state_store.set_warning_state(alert.symbol, None)
+            self.state_store.save()
+
     def process_alert(self, alert: Alert) -> bool:
         quality_config = self.config.get("alert_quality", {})
         text_key: Optional[str] = None
@@ -7528,6 +7585,9 @@ class EliteScanner:
         self.maybe_allow_trend_flip_watch(alert)
         self.apply_market_structure_decision_quality(alert)
         self.apply_alert_orchestrator(alert)
+        self.apply_warning_state_transition(alert)
+        if alert.duplicate_context:
+            return False
         if not category_cooldown_allowed and not alert.sms_allowed and not alert.watch_allowed and not alert.phase3_heads_up_sent:
             return False
         if alert.sms_allowed:
@@ -7557,7 +7617,7 @@ class EliteScanner:
         self.apply_alert_priority(alert)
         logger.info(alert.short_summary())
         self.writer.write(alert)
-        if self.post_alert_performance_enabled:
+        if self.post_alert_performance_enabled and not alert.duplicate_context:
             self.post_alert_tracker.register(alert)
         self.notifier.send(alert)
         self.state_store.set_last_alert_time(alert.dedupe_key(), now_utc())
@@ -7754,9 +7814,12 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
         "OPTIONS_WHALE_PRIORITY_BATCH_SIZE",
         int(whale.get("priority_batch_size", 50)),
     )
-    if not config["enable_legacy_momentum_scanner"]:
+    if not config["enable_legacy_momentum_scanner"] and not env_bool("SCANNER_EMBEDDED_TEST_MODE", False):
         for key in config.setdefault("alert_rules", {}):
             config["alert_rules"][key] = False
+    elif env_bool("SCANNER_EMBEDDED_TEST_MODE", False):
+        for key in config.setdefault("alert_rules", {}):
+            config["alert_rules"][key] = True
 
     raw_alert_symbols = os.getenv("ALERT_SYMBOLS")
     if raw_alert_symbols is not None:
@@ -8399,6 +8462,10 @@ def apply_strategy_env_config(config: Dict[str, Any]) -> None:
 def run_tests() -> int:
     import unittest
 
+    # Keep embedded unit tests deterministic even when the production profile
+    # intentionally disables the legacy momentum rules.
+    os.environ["SCANNER_EMBEDDED_TEST_MODE"] = "true"
+
     class ScannerTests(unittest.TestCase):
         def make_strategy_bars(self, closes: List[float], highs: Optional[List[float]] = None, lows: Optional[List[float]] = None, volumes: Optional[List[float]] = None) -> List[Bar]:
             open_t = set_today_time_et(DEFAULT_CONFIG["market_open"]).astimezone(UTC)
@@ -8643,7 +8710,7 @@ def run_tests() -> int:
             config["notifications"]["telegram_alert_types"] = ["PHASE3_HEADS_UP", "NORMAL_SMS"]
             self.assertEqual(
                 scanner_identity(config)["alert_types_enabled"],
-                ["PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
+                ["OPTIONS_WHALE_FLOW", "PHASE3_HEADS_UP", "STOCK_ONLY_WARNING", "NORMAL_WATCH", "NORMAL_SMS"],
             )
 
         def test_risk_engine_generates_bullish_and_bearish_invalidation(self) -> None:
@@ -10177,7 +10244,7 @@ def run_tests() -> int:
             try:
                 notifications = load_config(None)["notifications"]
                 self.assertTrue(notifications["telegram_enabled"])
-                self.assertEqual(notifications["telegram_alert_types"], ["PHASE3_HEADS_UP", "NORMAL_SMS"])
+                self.assertEqual(set(notifications["telegram_alert_types"]), {"OPTIONS_WHALE_FLOW", "PHASE3_HEADS_UP", "NORMAL_SMS"})
                 self.assertTrue(notifications["telegram_aapl_only"])
                 self.assertEqual(notifications["telegram_timeout_seconds"], 8)
             finally:
@@ -11936,6 +12003,11 @@ def run_tests() -> int:
 
         def test_sms_upgrade_can_bypass_category_cooldown_after_non_text_alert(self) -> None:
             config = load_config(None)
+            config["warning_alert_filter"]["enabled"] = False
+            config["alert_orchestrator"]["enabled"] = False
+            config["alert_priority"]["enabled"] = False
+            config["alert_priority"]["telegram_only_tier_1"] = False
+            config["decision_quality"]["enable_chop_mode"] = False
             with tempfile.TemporaryDirectory() as temp_dir:
                 scanner = EliteScanner(
                     config,

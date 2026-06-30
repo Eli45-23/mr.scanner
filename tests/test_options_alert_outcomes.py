@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from scanner.options_alert_outcomes import _first_bar_at_or_after, _parse_time, evaluate_alert_outcome, infer_flow_bias, infer_flow_bias_details, summarize_outcomes
+from scanner.options_alert_outcomes import _first_bar_at_or_after, _parse_time, evaluate_alert_outcome, evaluate_option_price_outcome, infer_flow_bias, infer_flow_bias_details, summarize_outcomes
 
 
 class OptionsAlertOutcomeTests(unittest.TestCase):
@@ -44,6 +44,28 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertEqual(outcome["flow_bias_source"], "option_type_fallback")
         self.assertTrue(outcome["windows"][0]["favorable"])
         self.assertGreater(outcome["max_favorable_move_pct"], 0)
+        self.assertTrue(outcome["windows"][0]["meaningful_0_20"])
+
+    def test_option_price_outcome_reports_reference_and_executable_long_return(self):
+        start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+        alert = {
+            "timestamp": start.isoformat(),
+            "aggression_side": "near_ask",
+            "candidate": {"contract_price_paid": 1.05, "bid": 1.00, "ask": 1.10},
+        }
+        bars = [{"t": (start + timedelta(minutes=5)).isoformat(), "c": 1.30}]
+        quotes = [{"t": (start + timedelta(minutes=5)).isoformat(), "bp": 1.25, "ap": 1.35}]
+        result = evaluate_option_price_outcome(alert, bars, quotes, windows=(5,))
+        self.assertEqual(result["option_position_side"], "LONG")
+        self.assertGreater(result["option_windows"][0]["reference_return_pct"], 0)
+        self.assertGreater(result["option_windows"][0]["estimated_executable_return_pct"], 0)
+
+    def test_option_price_outcome_does_not_invent_executable_return_without_quotes(self):
+        start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+        alert = {"timestamp": start.isoformat(), "aggression_side": "near_ask", "candidate": {"last": 1.0}}
+        result = evaluate_option_price_outcome(alert, [{"t": (start + timedelta(minutes=5)).isoformat(), "c": 1.2}], [], windows=(5,))
+        self.assertIsNone(result["option_windows"][0]["estimated_executable_return_pct"])
+        self.assertEqual(result["option_windows"][0]["executable_status"], "historical_quote_unavailable")
 
     def test_put_flow_favorable_when_price_falls(self):
         start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)

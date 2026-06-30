@@ -81,6 +81,10 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     (snapshots / "dashboard_snapshot_latest.json").write_text("{}")
     config = tmp_path / "config.example.json"
     config.write_text("{}")
+    write_jsonl(logs / "options_whale_scans.jsonl", [record(coverage_warning="AAPL coverage is stale")])
+    write_jsonl(logs / "options_whale_episodes.jsonl", [record(episode_id="ep-1")])
+    write_jsonl(logs / "options_oi_reviews.jsonl", [record(episode_id="ep-1", status="confirmed_opening")])
+    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [record(episode_id="ep-1")])
     result = export_review_package(
         day_text=DAY,
         start_text="09:30",
@@ -93,3 +97,9 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     assert result["alert_quality_markdown"].exists()
     assert result["alert_quality_json"].exists()
     assert result["zip"].exists()
+    package = result["package_dir"]
+    assert (package / "logs" / "options_whale_scans.jsonl").exists()
+    assert (package / "logs" / "options_whale_episodes.jsonl").exists()
+    assert (package / "logs" / "options_oi_reviews.jsonl").exists()
+    assert (package / "data" / "options_whale_episode_outcomes.jsonl").exists()
+    assert "Scan passes with coverage warnings: 1" in result["summary"].read_text()

@@ -74,7 +74,7 @@ def classify_next_day_oi(original: Dict[str, Any], next_day_open_interest: int |
         estimate = "likely_opening"
         reason = f"next-day OI increased by {change:,}, which is at least 50% of same-day volume ({vol:,})"
     elif change <= -not_confirmed_threshold:
-        status = "not_confirmed"
+        status = "likely_closing"
         estimate = "likely_closing"
         reason = f"next-day OI decreased by {abs(change):,}; same-day flow did not confirm as opening"
     elif abs(change) < not_confirmed_threshold:
@@ -108,6 +108,16 @@ def review_alerts_with_next_day_oi(alerts: Iterable[Dict[str, Any]], oi_by_contr
         if not symbol:
             continue
         result = classify_next_day_oi(alert, oi_by_contract.get(symbol))
+        members = alert.get("episode_member_contracts") if isinstance(alert.get("episode_member_contracts"), list) else []
+        member_changes = []
+        for member in members:
+            member_symbol = str(member.get("option_symbol") or "")
+            if member_symbol in oi_by_contract:
+                member_changes.append(_safe_int(oi_by_contract[member_symbol]) - _safe_int(member.get("open_interest")))
+        if len(member_changes) >= 2 and any(value > 0 for value in member_changes) and any(value < 0 for value in member_changes):
+            result.update({"next_day_oi_status": "roll_or_spread_possible", "open_close_estimate_after_oi": "mixed", "next_day_oi_reason": "Related episode contracts have offsetting next-day OI changes; a roll or spread is possible."})
+        elif alert.get("possible_multileg") and result.get("next_day_oi_status") == "confirmed_opening":
+            result.update({"next_day_oi_status": "hedge_or_unclear", "open_close_estimate_after_oi": "unknown", "next_day_oi_reason": "OI increased, but multi-leg structure means directional intent may be hedged."})
         if result["next_day_oi_status"] == "pending":
             continue
         candidate = _candidate(alert)
@@ -120,6 +130,7 @@ def review_alerts_with_next_day_oi(alerts: Iterable[Dict[str, Any]], oi_by_contr
             "prior_open_interest": candidate.get("open_interest") or alert.get("open_interest"),
             "same_day_volume": candidate.get("volume") or alert.get("volume"),
             "original_time": alert.get("time_detected") or alert.get("timestamp") or candidate.get("time_detected"),
+            "episode_id": alert.get("flow_episode_id") or alert.get("episode_id"),
             **result,
         })
     return reviews
