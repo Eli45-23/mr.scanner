@@ -14,6 +14,7 @@ __pycache__/
 
 # Runtime data and generated exports
 logs/
+data/market_regime_latest.json
 state/
 exports/
 data/options_universe.json

@@ -28,17 +28,17 @@ class OptionsFlowClassifierTests(unittest.TestCase):
 
     def test_opening_estimate_handles_zero_oi(self):
         result = estimate_opening_flow({"volume": 1000, "open_interest": 0})
-        self.assertEqual(result["opening_flow_estimate"], "possible opening flow")
-        self.assertEqual(result["open_close_estimate"], "likely_opening")
+        self.assertEqual(result["opening_flow_estimate"], "suspected opening flow")
+        self.assertEqual(result["open_close_estimate"], "suspected_opening")
         self.assertTrue(result["awaiting_next_day_oi_confirmation"])
 
     def test_open_close_estimates_closing_mixed_and_unknown(self):
         closing = estimate_opening_flow({"volume": 100, "open_interest": 1000})
-        self.assertEqual(closing["open_close_estimate"], "likely_closing")
+        self.assertEqual(closing["open_close_estimate"], "suspected_closing")
         mixed = estimate_opening_flow({"volume": 100, "open_interest": 100})
-        self.assertEqual(mixed["open_close_estimate"], "mixed")
+        self.assertEqual(mixed["open_close_estimate"], "unclear_intraday")
         unknown = estimate_opening_flow({"volume": 0, "open_interest": 0})
-        self.assertEqual(unknown["open_close_estimate"], "unknown")
+        self.assertEqual(unknown["open_close_estimate"], "unclear_intraday")
 
 
 if __name__ == "__main__":

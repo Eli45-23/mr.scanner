@@ -37,14 +37,14 @@ class OptionsOiReviewTests(unittest.TestCase):
     def test_confirms_opening_when_next_day_oi_rises_enough(self):
         result = classify_next_day_oi(self.alert(volume=1000, oi=100), 700)
         self.assertEqual(result["next_day_oi_status"], "confirmed_opening")
-        self.assertEqual(result["open_close_estimate_after_oi"], "likely_opening")
+        self.assertEqual(result["open_close_estimate_after_oi"], "confirmed_opening")
         self.assertEqual(result["next_day_oi_change"], 600)
         self.assertTrue(result["likely_opening"])
 
     def test_not_confirmed_when_oi_barely_changes(self):
         result = classify_next_day_oi(self.alert(volume=1000, oi=100), 180)
         self.assertEqual(result["next_day_oi_status"], "not_confirmed")
-        self.assertEqual(result["open_close_estimate_after_oi"], "mixed")
+        self.assertEqual(result["open_close_estimate_after_oi"], "not_confirmed")
         self.assertFalse(result["likely_opening"])
 
     def test_pending_when_no_next_day_oi_available(self):

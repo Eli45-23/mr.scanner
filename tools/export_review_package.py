@@ -630,6 +630,7 @@ def export_review_package(
     options = records_for_day(read_jsonl(log_dir / "option_quality_decisions.jsonl"), day_text)
     market_data = records_for_day(read_jsonl(log_dir / "market_data_status.jsonl"), day_text)
     market_regimes = records_for_day(read_jsonl(log_dir / "market_regime.jsonl"), day_text)
+    market_regime_heartbeats = records_for_day(read_jsonl(log_dir / "market_regime_heartbeat.jsonl"), day_text)
     multi_timeframe = records_for_day(read_jsonl(log_dir / "multi_timeframe_context.jsonl"), day_text)
     notifications = records_for_day(read_jsonl(log_dir / "notification_status.jsonl"), day_text)
     startup_status = records_for_day(read_jsonl(log_dir / "scanner_startup_status.jsonl"), day_text)
@@ -653,6 +654,7 @@ def export_review_package(
         "alerts": log_dir / "options_whale_alerts.jsonl",
         "episodes": log_dir / "options_whale_episodes.jsonl",
         "oi_reviews": log_dir / "options_oi_reviews.jsonl",
+        "price_observations": log_dir / "options_price_observations.jsonl",
     }
     whale_records = {name: records_for_day(read_jsonl(path), day_text) for name, path in whale_sources.items()}
     data_dir = log_dir.parent / "data"
@@ -668,6 +670,7 @@ def export_review_package(
     write_jsonl(logs_out / "option_quality_decisions.jsonl", options)
     write_jsonl(logs_out / "market_data_status.jsonl", market_data)
     write_jsonl(logs_out / "market_regime.jsonl", market_regimes)
+    write_jsonl(logs_out / "market_regime_heartbeat.jsonl", market_regime_heartbeats)
     write_jsonl(logs_out / "multi_timeframe_context.jsonl", multi_timeframe)
     write_jsonl(logs_out / "notification_status.jsonl", notifications)
     write_jsonl(logs_out / "scanner_startup_status.jsonl", startup_status)
@@ -705,6 +708,7 @@ def export_review_package(
     write_jsonl(window_out / "option_quality_decisions_window.jsonl", records_in_window(options, start_dt, end_dt))
     write_jsonl(window_out / "market_data_status_window.jsonl", records_in_window(market_data, start_dt, end_dt))
     write_jsonl(window_out / "market_regime_window.jsonl", records_in_window(market_regimes, start_dt, end_dt))
+    write_jsonl(window_out / "market_regime_heartbeat_window.jsonl", records_in_window(market_regime_heartbeats, start_dt, end_dt))
     write_jsonl(window_out / "multi_timeframe_context_window.jsonl", records_in_window(multi_timeframe, start_dt, end_dt))
     write_jsonl(window_out / "notification_status_window.jsonl", records_in_window(notifications, start_dt, end_dt))
     write_jsonl(window_out / "post_alert_performance_window.jsonl", records_in_window(post_alert_performance, start_dt, end_dt))

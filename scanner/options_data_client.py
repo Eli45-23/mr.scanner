@@ -82,10 +82,6 @@ def _env_base(name: str, default: str) -> str:
     return _clean_base_url(os.getenv(name, default) or default)
 
 
-def _short_body(response: requests.Response, limit: int = 500) -> str:
-    return (response.text or "")[:limit]
-
-
 def endpoint_hint(status_code: int, endpoint: str = "endpoint") -> str:
     if status_code == 401:
         return (
@@ -128,6 +124,7 @@ class OptionsDataClient:
         self.options_data_base_url = _clean_base_url(options_data_base_url or _env_base("ALPACA_OPTIONS_DATA_BASE_URL", DATA_BASE))
         env_live_trade = str(os.getenv("ALPACA_LIVE_TRADE", "")).strip().lower() in {"1", "true", "yes", "on"}
         self.live_trade = bool(env_live_trade if live_trade is None else live_trade)
+        self.request_diagnostics: Dict[str, Dict[str, Any]] = {}
         explicit_contracts_base = _clean_base_url(options_contracts_base_url or os.getenv("ALPACA_OPTIONS_CONTRACTS_BASE_URL", ""))
         if explicit_contracts_base:
             self.options_contracts_base_url = explicit_contracts_base
@@ -163,7 +160,7 @@ class OptionsDataClient:
             "url": self.endpoint_url(base, path),
             "path": path,
             "http_status": response.status_code,
-            "response_body": _short_body(response),
+            "response_error": f"HTTP {response.status_code} {getattr(response, 'reason', '') or ''}".strip() if response.status_code >= 400 else "",
             "entitlement_hint": endpoint_hint(response.status_code, name),
         }
 
@@ -281,34 +278,46 @@ class OptionsDataClient:
     def get_option_bars(self, option_symbols: List[str], *, start: datetime, end: datetime, timeframe: str = "1Min", feed: Optional[str] = None, limit: int = 10000) -> Dict[str, List[Dict[str, Any]]]:
         out: Dict[str, List[Dict[str, Any]]] = {}
         for batch in chunked(option_symbols, 100):
-            params = {"symbols": ",".join(batch), "timeframe": timeframe, "start": _iso(start), "end": _iso(end), "feed": (feed or self.options_feed).lower(), "limit": limit}
-            response = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params=params, timeout=45)
-            if response.status_code >= 400 and params["feed"] == "opra" and self.allow_indicative_fallback:
-                params["feed"] = "indicative"
-                response = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params=params, timeout=45)
-            if response.status_code >= 400:
-                continue
-            raw = response.json().get("bars", {})
-            if isinstance(raw, dict):
-                for symbol, bars in raw.items():
-                    out[symbol] = bars if isinstance(bars, list) else []
+            params = {"symbols": ",".join(batch), "timeframe": timeframe, "start": _iso(start), "end": _iso(end), "limit": limit, "sort": "asc"}
+            token: Optional[str] = None
+            page_count = row_count = 0
+            while True:
+                if token:
+                    params["page_token"] = token
+                try:
+                    response = self._request("GET", self.options_data_base_url, "/v1beta1/options/bars", params=params, timeout=45)
+                except requests.RequestException as exc:
+                    self.request_diagnostics["historical_option_bars"] = {
+                        "endpoint": "historical_option_bars", "path": "/v1beta1/options/bars",
+                        "http_status": None, "error_category": "network_error",
+                        "message": type(exc).__name__, "pages": page_count, "rows": row_count,
+                        "start": _iso(start), "end": _iso(end),
+                    }
+                    break
+                page_count += 1
+                diagnostic = {**self._diagnostic("historical_option_bars", response, self.options_data_base_url, "/v1beta1/options/bars"), "pages": page_count, "rows": row_count, "rate_limit": self._rate_headers(response), "start": _iso(start), "end": _iso(end)}
+                self.request_diagnostics["historical_option_bars"] = diagnostic
+                if response.status_code >= 400:
+                    break
+                body = response.json()
+                raw = body.get("bars", {})
+                if isinstance(raw, dict):
+                    for symbol, bars in raw.items():
+                        values = bars if isinstance(bars, list) else []
+                        out.setdefault(symbol, []).extend(values)
+                        row_count += len(values)
+                token = body.get("next_page_token")
+                self.request_diagnostics["historical_option_bars"].update({"pages": page_count, "rows": row_count})
+                if not token:
+                    break
         return out
 
     def get_option_quotes(self, option_symbols: List[str], *, start: datetime, end: datetime, feed: Optional[str] = None, limit: int = 10000) -> Dict[str, List[Dict[str, Any]]]:
-        out: Dict[str, List[Dict[str, Any]]] = {}
-        for batch in chunked(option_symbols, 100):
-            params = {"symbols": ",".join(batch), "start": _iso(start), "end": _iso(end), "feed": (feed or self.options_feed).lower(), "limit": limit}
-            response = self._request("GET", self.options_data_base_url, "/v1beta1/options/quotes", params=params, timeout=45)
-            if response.status_code >= 400 and params["feed"] == "opra" and self.allow_indicative_fallback:
-                params["feed"] = "indicative"
-                response = self._request("GET", self.options_data_base_url, "/v1beta1/options/quotes", params=params, timeout=45)
-            if response.status_code >= 400:
-                continue
-            raw = response.json().get("quotes", {})
-            if isinstance(raw, dict):
-                for symbol, quotes in raw.items():
-                    out[symbol] = quotes if isinstance(quotes, list) else []
-        return out
+        self.request_diagnostics["historical_option_quotes"] = {"endpoint": "historical_option_quotes", "http_status": None, "error_category": "unsupported_endpoint", "message": "Alpaca does not expose historical option quotes; using captured live NBBO observations.", "start": _iso(start), "end": _iso(end), "rows": 0}
+        return {}
+
+    def data_health(self) -> Dict[str, Any]:
+        return {"request_diagnostics": dict(self.request_diagnostics)}
 
     def get_stock_bars(self, symbols: List[str], *, start: datetime, end: datetime, timeframe: str = "1Min") -> Dict[str, List[Dict[str, Any]]]:
         response = self._request(

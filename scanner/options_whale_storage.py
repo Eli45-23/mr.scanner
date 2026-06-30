@@ -37,6 +37,7 @@ class OptionsWhaleStorage:
         self.episodes_path = self.log_dir / "options_whale_episodes.jsonl"
         self.scans_path = self.log_dir / "options_whale_scans.jsonl"
         self.oi_reviews_path = self.log_dir / "options_oi_reviews.jsonl"
+        self.quote_observations_path = self.log_dir / "options_price_observations.jsonl"
         self.outcomes_path = root / "data" / "options_whale_outcomes.jsonl"
         self.episode_outcomes_path = root / "data" / "options_whale_episode_outcomes.jsonl"
 
@@ -78,6 +79,13 @@ class OptionsWhaleStorage:
 
     def latest_oi_reviews(self, limit: int = 1000) -> List[Dict[str, Any]]:
         return read_jsonl(self.oi_reviews_path, limit=limit)
+
+    def append_quote_observation(self, record: Dict[str, Any]) -> None:
+        append_jsonl(self.quote_observations_path, record)
+
+    def option_quote_observations(self, option_symbol: str, limit: int = 5000) -> List[Dict[str, Any]]:
+        symbol = str(option_symbol or "").upper()
+        return [row for row in read_jsonl(self.quote_observations_path, limit=limit) if str(row.get("option_symbol") or "").upper() == symbol]
 
     def latest_alerts(self, limit: int = 100) -> List[Dict[str, Any]]:
         return read_jsonl(self.alerts_path, limit=limit)

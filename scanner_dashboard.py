@@ -748,6 +748,25 @@ def options_whales_status() -> Dict[str, Any]:
         }
 
 
+def options_whales_data_health() -> Dict[str, Any]:
+    scanner = options_whale_scanner()
+    latest = read_latest_options_whale_scan()
+    heartbeat_path = APP_DIR / "data" / "market_regime_latest.json"
+    heartbeat: Dict[str, Any] = {}
+    if heartbeat_path.exists():
+        try:
+            heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            heartbeat = {"result": "ERROR", "reason": "market regime heartbeat could not be read"}
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "option_api": scanner.client.data_health(),
+        "market_regime_heartbeat": heartbeat,
+        "coverage": options_whales_coverage(),
+        "last_scan_error": latest.get("error") or STATE.options_whale_last_scan_error,
+    }
+
+
 def options_whales_scan() -> Dict[str, Any]:
     return run_options_whale_scan_locked("manual")
 
@@ -3421,7 +3440,7 @@ INDEX_HTML = r"""<!doctype html>
           Alert Tier ${esc(item.alert_tier || '')} | ${esc(item.alert_tier_reason || '')} |
           Decision ${esc(item.phone_conclusion || '')} | ${esc(item.phone_conclusion_reason || '')} |
           Tier ${esc(item.scenario_alert_tier || '')} | Alert Block ${esc(item.scenario_alert_block_reason || '')} | Eligible ${item.scenario_alert_eligible ? 'Yes' : 'No'} | Would SMS ${item.scenario_would_sms ? 'Yes' : 'No'} |
-          Heads-Up ${esc(item.phase3_heads_up_type || 'BLOCKED')} / ${item.phase3_heads_up_eligible ? 'Eligible' : 'No'} / Sent ${item.phase3_heads_up_sent ? 'Yes' : 'No'} |
+          Heads-Up ${esc(item.phase3_heads_up_type || 'BLOCKED')} / ${item.phase3_heads_up_eligible ? 'Eligible' : 'No'} / Delivered ${item.phase3_delivery_succeeded ? 'Yes' : 'No'} |
           ${esc(item.phase3_heads_up_block_reason || '')} |
           Dedupe ${item.phase3_heads_up_dedupe_blocked ? 'Blocked' : 'Clear'} ${item.phase3_heads_up_dedupe_minutes_remaining ?? ''} |
           Market Confirm ${esc(item.market_confirmation_status || 'UNKNOWN')} |
@@ -3510,7 +3529,7 @@ INDEX_HTML = r"""<!doctype html>
           <div><span class="muted">Scenario Alert Block</span> ${esc(item.scenario_alert_block_reason || '')}</div>
           <div><span class="muted">Scenario SMS Block</span> ${esc(item.scenario_sms_block_reason || '')}</div>
           <div><span class="muted">Phase 3 Heads-Up Eligible</span> ${item.phase3_heads_up_eligible ? 'Yes' : 'No'}</div>
-          <div><span class="muted">Phase 3 Heads-Up Sent</span> ${item.phase3_heads_up_sent ? 'Yes' : 'No'}</div>
+          <div><span class="muted">Phase 3 Delivery</span> Eligible ${item.phase3_heads_up_eligible ? 'Yes' : 'No'} / Attempted ${item.phase3_delivery_attempted ? 'Yes' : 'No'} / Delivered ${item.phase3_delivery_succeeded ? 'Yes' : 'No'}</div>
           <div><span class="muted">Phase 3 Heads-Up Type</span> ${esc(item.phase3_heads_up_type || 'BLOCKED')}</div>
           <div><span class="muted">Phase 3 Heads-Up Block</span> ${esc(item.phase3_heads_up_block_reason || '')}</div>
           <div><span class="muted">Heads-Up Dedupe</span> ${item.phase3_heads_up_dedupe_blocked ? 'Blocked' : 'Clear'} ${item.phase3_heads_up_dedupe_minutes_remaining ?? ''}</div>
@@ -4764,6 +4783,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(options_whales_coverage())
             elif parsed.path == "/api/options-whales/reliability":
                 self.send_json(options_whales_reliability())
+            elif parsed.path == "/api/options-whales/data-health":
+                self.send_json(options_whales_data_health())
             elif parsed.path == "/api/options-whales/export.json":
                 self.send_json(options_whales_export_json())
             elif parsed.path == "/api/options-whales/export.csv":

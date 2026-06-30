@@ -77,9 +77,12 @@ def default_options_whale_config() -> Dict[str, Any]:
         "priority_contract_budget": 3000,
         "max_contracts_per_underlying": 600,
         "rotation_symbols_per_scan": 15,
+        "rotation_safety_factor": 1.15,
         "contract_catalog_refresh_seconds": 900,
         "contract_catalog_max_per_symbol": 5000,
         "coverage_warning_age_seconds": 300,
+        "active_episode_quote_minutes": 75,
+        "active_episode_quote_limit": 500,
         "index_0dte_min_score": 85,
         "index_0dte_min_premium": 250000,
         "index_0dte_max_spread_percent": 8,
@@ -96,13 +99,21 @@ def default_options_whale_config() -> Dict[str, Any]:
         "symbol_bias_memory_break_min_completed": 10,
         "symbol_bias_memory_contradiction_gap": 0.20,
         "reliability_calibration_enabled": True,
-        "reliability_min_effective_samples": 20,
-        "reliability_history_days": 20,
+        "reliability_min_effective_samples": 30,
+        "reliability_min_sessions": 20,
+        "reliability_history_days": 60,
         "reliability_half_life_days": 5,
         "reliability_prior_successes": 10,
         "reliability_prior_failures": 10,
         "reliability_max_penalty": 8,
         "reliability_max_bonus": 5,
+        "bearish_tier1_min_score": 90,
+        "bearish_tier1_min_price_context": 8,
+        "zero_dte_tier1_min_score": 90,
+        "zero_dte_tier1_min_premium": 250000,
+        "zero_dte_tier1_max_spread_percent": 8,
+        "zero_dte_tier1_min_price_context": 8,
+        "strict_cohort_min_meaningful_rate": 0.30,
     }
 
 
@@ -385,6 +396,9 @@ def build_notification_event_key(row: Dict[str, Any]) -> tuple[str, str, str]:
 
 
 def infer_direction_bias_label(row: Dict[str, Any]) -> str:
+    explicit = str(row.get("flow_episode_bias") or row.get("flow_bias") or "").upper()
+    if explicit in {"BULLISH", "BEARISH"}:
+        return explicit
     label = str(_key_value(row, "direction_label") or row.get("direction_label") or "").lower()
     option_type = str(_key_value(row, "option_type") or "").upper()
     if "bearish" in label:
@@ -637,11 +651,12 @@ def _reliability_score_bucket(value: Any) -> str:
     return "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
 
 
-def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[tuple[str, str, str, str], Dict[str, Any]]:
+def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[tuple[str, str, str, str, str], Dict[str, Any]]:
     now = datetime.now(timezone.utc)
     history_days = max(1, int(cfg.get("reliability_history_days", 20)))
     half_life = max(0.1, float(cfg.get("reliability_half_life_days", 5)))
-    buckets: Dict[tuple[str, str, str, str], Dict[str, float]] = {}
+    buckets: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    score_totals: Dict[str, Dict[str, float]] = {}
     for row in latest_outcomes_by_key(outcomes).values():
         stamp = _parse_iso_time(row.get("detected_at") or row.get("reviewed_at"))
         if stamp and (now - stamp).days > history_days:
@@ -658,30 +673,43 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
             str(row.get("dte_bucket") or _reliability_dte_bucket(row.get("dte"))),
             str(row.get("direction_confidence") or "UNKNOWN").upper(),
             str(row.get("market_regime") or "UNKNOWN").upper(),
+            str(row.get("flow_bias") or "UNKNOWN").upper(),
         )
         age = max(0.0, (now - stamp).total_seconds() / 86400.0) if stamp else 0.0
         weight = 0.5 ** (age / half_life)
-        bucket = buckets.setdefault(key, {"effective_samples": 0.0, "successes": 0.0, "raw_samples": 0.0})
+        bucket = buckets.setdefault(key, {"effective_samples": 0.0, "successes": 0.0, "raw_samples": 0.0, "sessions": set()})
         bucket["effective_samples"] += weight
         bucket["raw_samples"] += 1
+        if stamp:
+            bucket["sessions"].add(stamp.date().isoformat())
+        score_total = score_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0})
+        score_total["samples"] += weight
         if float(signed) >= 0.10:
             bucket["successes"] += weight
-    table: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+            score_total["successes"] += weight
+    score_rates = {name: value["successes"] / value["samples"] for name, value in score_totals.items() if value["samples"]}
+    guard_active = bool(score_rates.get("90+") is not None and score_rates.get("80-89") is not None and score_rates["90+"] <= score_rates["80-89"])
+    guard_reason = "90+ score outcomes do not outperform 80-89 outcomes." if guard_active else ""
+    table: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     prior_success = float(cfg.get("reliability_prior_successes", 10))
     prior_failure = float(cfg.get("reliability_prior_failures", 10))
     for key, bucket in buckets.items():
         posterior = (bucket["successes"] + prior_success) / (bucket["effective_samples"] + prior_success + prior_failure)
         adjustment = round((posterior - 0.50) * 20)
         adjustment = max(-int(cfg.get("reliability_max_penalty", 8)), min(int(cfg.get("reliability_max_bonus", 5)), adjustment))
-        table[key] = {"reliability_rate": round(posterior, 4), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_score_adjustment": adjustment}
+        session_count = len(bucket["sessions"])
+        qualified = session_count >= int(cfg.get("reliability_min_sessions", 20)) and bucket["effective_samples"] >= float(cfg.get("reliability_min_effective_samples", 30))
+        if guard_active and adjustment > 0:
+            adjustment = 0
+        table[key] = {"reliability_rate": round(posterior, 4), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason}
     return table
 
 
-def apply_reliability_adjustment(result: Dict[str, Any], table: Dict[tuple[str, str, str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+def apply_reliability_adjustment(result: Dict[str, Any], table: Dict[tuple[str, str, str, str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     candidate = result.get("candidate") or {}
-    key = (_reliability_score_bucket(result.get("whale_score")), str(candidate.get("dte_bucket") or _reliability_dte_bucket(candidate.get("dte"))), str(result.get("direction_confidence") or candidate.get("direction_confidence") or "UNKNOWN").upper(), str(result.get("market_regime") or "UNKNOWN").upper())
+    key = (_reliability_score_bucket(result.get("whale_score")), str(candidate.get("dte_bucket") or _reliability_dte_bucket(candidate.get("dte"))), str(result.get("direction_confidence") or candidate.get("direction_confidence") or "UNKNOWN").upper(), str(result.get("market_regime") or "UNKNOWN").upper(), infer_direction_bias_label(result).upper())
     learned = table.get(key)
-    if not learned or float(learned.get("reliability_effective_samples") or 0) < float(cfg.get("reliability_min_effective_samples", 20)):
+    if not learned or not learned.get("reliability_qualified"):
         result.update({"reliability_bucket": "|".join(key), "reliability_status": "insufficient_history", "reliability_score_adjustment": 0})
         return result
     adjustment = int(learned.get("reliability_score_adjustment") or 0)
@@ -802,6 +830,26 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
     required_confidence = str(cfg.get("tier1_min_direction_confidence", "MEDIUM")).upper()
     observed_confidence = str(result.get("direction_confidence") or candidate.get("direction_confidence") or "LOW").upper()
+    bias = infer_direction_bias_label(result)
+    regime = str(result.get("market_regime") or "UNKNOWN").upper()
+    bullish_regimes = {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}
+    bearish_regimes = {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
+    aligned_regime = regime in (bearish_regimes if bias == "BEARISH" else bullish_regimes if bias == "BULLISH" else set())
+    reliability_qualified = bool(result.get("reliability_qualified"))
+    reliability_rate = safe_float(result.get("reliability_rate"))
+    cohort_reasons: List[str] = []
+    if bias == "BEARISH":
+        if not aligned_regime: cohort_reasons.append("bearish Tier 1 requires a known bearish-aligned regime")
+        if score < int(cfg.get("bearish_tier1_min_score", 90)): cohort_reasons.append("bearish score below Tier 1 threshold")
+        if safe_float(result.get("price_confirmation_score")) < int(cfg.get("bearish_tier1_min_price_context", 8)): cohort_reasons.append("bearish price confirmation below Tier 1 threshold")
+        if not reliability_qualified or reliability_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("bearish reliability is not proven across multiple sessions")
+    if int(candidate.get("dte") or 0) == 0:
+        if not aligned_regime: cohort_reasons.append("0DTE Tier 1 requires a known aligned regime")
+        if score < int(cfg.get("zero_dte_tier1_min_score", 90)): cohort_reasons.append("0DTE score below Tier 1 threshold")
+        if safe_float(candidate.get("estimated_premium")) < float(cfg.get("zero_dte_tier1_min_premium", 250000)): cohort_reasons.append("0DTE premium below Tier 1 threshold")
+        if candidate.get("spread_percent") is None or safe_float(candidate.get("spread_percent")) > float(cfg.get("zero_dte_tier1_max_spread_percent", 8)): cohort_reasons.append("0DTE spread exceeds Tier 1 threshold")
+        if safe_float(result.get("price_confirmation_score")) < int(cfg.get("zero_dte_tier1_min_price_context", 8)): cohort_reasons.append("0DTE price confirmation below Tier 1 threshold")
+        if not reliability_qualified or reliability_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("0DTE reliability is not proven across multiple sessions")
     if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
         return "Tier 2", False, "Delayed or stale flow is dashboard-only until fresh evidence arrives."
     if candidate.get("possible_multileg"):
@@ -809,6 +857,10 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
         return "Tier 2", False, "Direction confidence is below the Tier 1 requirement."
     if score >= int(cfg.get("tier1_min_score", 95)) and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= int(cfg.get("tier1_min_price_context", 8)):
+        if cohort_reasons:
+            result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": cohort_reasons})
+            return "Tier 2", False, "; ".join(cohort_reasons)
+        result.update({"cohort_tier1_gate_passed": True, "cohort_tier1_gate_reasons": []})
         return "Tier 1", True, "Extreme score, aggressive flow, acceptable spread, and price context."
     if score >= 80 and not any("wide spread" in str(w).lower() or "stale" in str(w).lower() for w in warnings):
         return "Tier 2", bool(cfg.get("notify_tier_2", False)), "High score with minor or no quality warnings."
@@ -1024,7 +1076,13 @@ class OptionsWhaleScanner:
         rotating = [symbol for symbol in underlyings if symbol not in set(core)]
         state = self._load_scan_state()
         cursor = int(state.get("symbol_cursor") or 0) % max(1, len(rotating))
-        rotation_count = max(1, int(self.whale.get("rotation_symbols_per_scan", 15)))
+        previous_cycle = _parse_iso_time(state.get("last_updated"))
+        measured_cycle = max(1.0, (datetime.now(timezone.utc) - previous_cycle).total_seconds()) if previous_cycle else float(self.whale.get("scan_interval_seconds", 30))
+        prior_ewma = safe_float(state.get("cycle_duration_ewma_seconds")) or measured_cycle
+        cycle_ewma = prior_ewma * 0.7 + measured_cycle * 0.3
+        target_age = max(1, int(self.whale.get("coverage_warning_age_seconds", 300)))
+        dynamic_count = math.ceil(len(rotating) * cycle_ewma / target_age * float(self.whale.get("rotation_safety_factor", 1.15))) if rotating else 0
+        rotation_count = max(1, int(self.whale.get("rotation_symbols_per_scan", 15)), dynamic_count)
         rotation_page = [rotating[(cursor + offset) % len(rotating)] for offset in range(min(rotation_count, len(rotating)))] if rotating else []
         selected_underlyings = core + rotation_page
         self.last_scan_order = {
@@ -1078,7 +1136,9 @@ class OptionsWhaleScanner:
                 counts[underlying] = counts.get(underlying, 0) + 1
                 if len(contracts) >= max_contracts:
                     break
-        state["symbol_cursor"] = (cursor + len(rotation_page)) % max(1, len(rotating))
+        rotating_scanned_count = sum(1 for symbol in scanned_underlyings if symbol not in set(core))
+        state["symbol_cursor"] = (cursor + rotating_scanned_count) % max(1, len(rotating))
+        state["cycle_duration_ewma_seconds"] = round(cycle_ewma, 2)
         state["last_updated"] = now_iso
         self._save_scan_state(state)
         now_dt = datetime.now(timezone.utc)
@@ -1086,18 +1146,23 @@ class OptionsWhaleScanner:
         for symbol in underlyings:
             stamp = _parse_iso_time(last_scanned_at.get(symbol))
             symbol_ages[symbol] = round((now_dt - stamp).total_seconds(), 1) if stamp else None
-        warning_age = max(1, int(self.whale.get("coverage_warning_age_seconds", 300)))
+        warning_age = target_age
         stale_symbols = [symbol for symbol, age in symbol_ages.items() if age is None or age > warning_age]
+        warmup_symbols = [symbol for symbol, age in symbol_ages.items() if age is None]
         self.last_scan_order.update({
             "underlying_symbols_scanned": len(scanned_underlyings),
             "first_20_underlyings_scanned": scanned_underlyings[:20],
             "last_20_underlyings_scanned": scanned_underlyings[-20:],
             "coverage_cycle_cursor": state["symbol_cursor"],
             "coverage_rotation_page": rotation_page,
+            "coverage_rotation_symbols_requested": rotation_count,
+            "coverage_rotation_symbols_dynamic": dynamic_count,
+            "coverage_cycle_duration_ewma_seconds": round(cycle_ewma, 2),
             "coverage_core_symbols": core,
             "coverage_symbol_ages_seconds": symbol_ages,
             "coverage_stale_symbols": stale_symbols,
             "coverage_warning": f"{len(stale_symbols)} symbols exceed the {warning_age}s coverage target." if stale_symbols else "",
+            "coverage_warning_type": "startup_warmup" if warmup_symbols else "sustained_miss" if stale_symbols else "none",
             "coverage_catalog_counts": catalog_counts,
             "coverage_selected_counts": selected_counts,
             "coverage_fetch_failures": failures,
@@ -1113,14 +1178,24 @@ class OptionsWhaleScanner:
         return prices
 
     def _latest_market_regime(self) -> str:
-        path = self.root / "logs" / "market_regime.jsonl"
+        latest_path = self.root / "data" / "market_regime_latest.json"
+        try:
+            row = json.loads(latest_path.read_text(encoding="utf-8"))
+            stamp = _parse_iso_time(row.get("timestamp"))
+            ages = row.get("source_bar_ages_seconds") or {}
+            bars_fresh = all(ages.get(symbol) is not None and float(ages.get(symbol)) <= 90 for symbol in ("SPY", "QQQ"))
+            if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 90 and row.get("context_complete") and bars_fresh:
+                return str(row.get("market_regime") or "UNKNOWN").upper()
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        path = self.root / "logs" / "market_regime_heartbeat.jsonl"
         if not path.exists():
             return "UNKNOWN"
         try:
             for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
                 row = json.loads(line)
                 stamp = _parse_iso_time(row.get("timestamp"))
-                if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 300:
+                if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 90 and row.get("context_complete"):
                     return str(row.get("market_regime") or row.get("regime") or "UNKNOWN").upper()
         except (OSError, json.JSONDecodeError):
             pass
@@ -1275,7 +1350,28 @@ class OptionsWhaleScanner:
         contracts = self._contracts()
         option_symbols = [_contract_symbol(c) for c in contracts if _contract_symbol(c)]
         max_contracts = int(self.whale.get("max_contracts_per_scan", 10000))
-        snapshots = self.client.get_option_snapshots(option_symbols[:max_contracts])
+        active_cutoff = start - timedelta(minutes=max(5, int(effective_cfg.get("active_episode_quote_minutes", 75))))
+        active_rows = []
+        for episode in self.storage.latest_episodes(limit=5000):
+            stamp = _parse_iso_time(episode.get("episode_updated_at") or episode.get("scanner_detected_time"))
+            if stamp and stamp >= active_cutoff:
+                active_rows.append(episode)
+        active_rows.sort(key=lambda row: (str(row.get("alert_tier")) == "Tier 1", _parse_iso_time(row.get("episode_updated_at")) or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+        active_symbols = []
+        for row in active_rows:
+            symbol = str(_key_value(row, "option_symbol") or "")
+            if symbol and symbol not in active_symbols:
+                active_symbols.append(symbol)
+        active_symbols = active_symbols[: max(1, int(effective_cfg.get("active_episode_quote_limit", 500)))]
+        snapshot_symbols = list(dict.fromkeys(option_symbols[:max_contracts] + active_symbols))
+        snapshots = self.client.get_option_snapshots(snapshot_symbols)
+        for symbol in active_symbols:
+            snapshot = snapshots.get(symbol) or {}
+            quote, trade = _snapshot_quote(snapshot), _snapshot_trade(snapshot)
+            bid = safe_float(quote.get("bp") or quote.get("bid_price") or quote.get("bid")) or None
+            ask = safe_float(quote.get("ap") or quote.get("ask_price") or quote.get("ask")) or None
+            if bid or ask:
+                self.storage.append_quote_observation({"timestamp": utc_now_iso(), "option_symbol": symbol, "bid": bid, "ask": ask, "last": safe_float(trade.get("p") or trade.get("price")) or None, "quote_time": quote.get("t") or quote.get("timestamp"), "data_source": snapshot.get("data_source") or "alpaca", "observation_type": "active_episode_nbbo"})
         underlyings = sorted({_contract_underlying(c) for c in contracts if _contract_underlying(c)})
         prices = self._underlying_prices(underlyings[:500])
         end = datetime.now(timezone.utc)
@@ -1413,6 +1509,9 @@ class OptionsWhaleScanner:
                 result["debug_label"] = "DEBUG LOOSE MODE — not alert quality"
             result["message_preview"] = format_whale_alert(result)
             results.append(result)
+            candidate_for_quote = result.get("candidate") or {}
+            if candidate_for_quote.get("bid") or candidate_for_quote.get("ask"):
+                self.storage.append_quote_observation({"timestamp": candidate_for_quote.get("time_detected") or utc_now_iso(), "option_symbol": candidate_for_quote.get("option_symbol"), "bid": candidate_for_quote.get("bid"), "ask": candidate_for_quote.get("ask"), "last": candidate_for_quote.get("last"), "quote_time": candidate_for_quote.get("quote_time"), "data_source": candidate_for_quote.get("data_source"), "observation_type": "episode_entry_nbbo"})
         results.sort(key=lambda item: int(item.get("whale_score") or 0), reverse=True)
         results = results[: int(effective_cfg.get("max_results", 100))]
         results = attach_simple_follow_through(results, self.storage.latest_alerts(limit=500))

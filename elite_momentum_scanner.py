@@ -99,6 +99,7 @@ from scanner.market_map_update import (
 from strategies import evaluate_strategy_suite
 from strategies.base import ema as strategy_ema, vwap as strategy_vwap
 from strategies.context import evaluate_multi_timeframe_context
+from strategies.confirmation.market_regime import evaluate_market_regime
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -113,6 +114,8 @@ MARKET_DATA_STATUS_LOG = LOG_DIR / "market_data_status.jsonl"
 NOTIFICATION_STATUS_LOG = LOG_DIR / "notification_status.jsonl"
 SCANNER_STARTUP_STATUS_LOG = LOG_DIR / "scanner_startup_status.jsonl"
 MARKET_REGIME_LOG = LOG_DIR / "market_regime.jsonl"
+MARKET_REGIME_HEARTBEAT_LOG = LOG_DIR / "market_regime_heartbeat.jsonl"
+MARKET_REGIME_LATEST = APP_DIR / "data" / "market_regime_latest.json"
 MULTI_TIMEFRAME_CONTEXT_LOG = LOG_DIR / "multi_timeframe_context.jsonl"
 POST_ALERT_PERFORMANCE_LOG = LOG_DIR / "post_alert_performance.jsonl"
 NEWS_CONTEXT_LOG = LOG_DIR / "news_context.jsonl"
@@ -986,6 +989,12 @@ class Alert:
     stock_setup_score_reason: Optional[str] = None
     phase3_heads_up_eligible: Optional[bool] = None
     phase3_heads_up_sent: Optional[bool] = None
+    phase3_delivery_requested: bool = False
+    phase3_delivery_attempted: bool = False
+    phase3_delivery_succeeded: bool = False
+    phase3_delivery_timestamp: Optional[str] = None
+    phase3_delivery_channel: Optional[str] = None
+    phase3_delivery_error: Optional[str] = None
     phase3_heads_up_block_reason: Optional[str] = None
     phase3_heads_up_type: Optional[str] = None
     phase3_heads_up_dedupe_key: Optional[str] = None
@@ -2008,6 +2017,11 @@ class AlertWriter:
                 "stock_setup_score_reason",
                 "phase3_heads_up_eligible",
                 "phase3_heads_up_sent",
+                "phase3_delivery_requested",
+                "phase3_delivery_attempted",
+                "phase3_delivery_succeeded",
+                "phase3_delivery_timestamp",
+                "phase3_delivery_channel",
                 "phase3_heads_up_block_reason",
                 "phase3_heads_up_type",
                 "phase3_heads_up_dedupe_key",
@@ -2115,7 +2129,12 @@ class AlertWriter:
                 alert.scenario_sms_block_reason,
                 alert.stock_setup_score_reason,
                 alert.phase3_heads_up_eligible,
-                alert.phase3_heads_up_sent,
+                alert.phase3_delivery_succeeded,
+                bool(alert.phase3_delivery_requested or alert.phase3_heads_up_sent),
+                alert.phase3_delivery_attempted,
+                alert.phase3_delivery_succeeded,
+                alert.phase3_delivery_timestamp,
+                alert.phase3_delivery_channel,
                 alert.phase3_heads_up_block_reason,
                 alert.phase3_heads_up_type,
                 alert.phase3_heads_up_dedupe_key,
@@ -2133,6 +2152,8 @@ class AlertWriter:
             f.write(json.dumps({
                 **asdict(alert),
                 "timestamp": alert.timestamp.isoformat(),
+                "phase3_heads_up_sent": bool(alert.phase3_delivery_succeeded),
+                "phase3_delivery_requested": bool(alert.phase3_delivery_requested or alert.phase3_heads_up_sent),
             }) + "\n")
         self._append_jsonl(
             self.scenario_jsonl_path,
@@ -2187,7 +2208,13 @@ class AlertWriter:
                 "stock_setup_score": alert.stock_setup_score,
                 "stock_setup_score_reason": alert.stock_setup_score_reason,
                 "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
-                "phase3_heads_up_sent": alert.phase3_heads_up_sent,
+                "phase3_heads_up_sent": bool(alert.phase3_delivery_succeeded),
+                "phase3_delivery_requested": bool(alert.phase3_delivery_requested or alert.phase3_heads_up_sent),
+                "phase3_delivery_attempted": bool(alert.phase3_delivery_attempted),
+                "phase3_delivery_succeeded": bool(alert.phase3_delivery_succeeded),
+                "phase3_delivery_timestamp": alert.phase3_delivery_timestamp,
+                "phase3_delivery_channel": alert.phase3_delivery_channel,
+                "phase3_delivery_error": alert.phase3_delivery_error,
                 "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
                 "phase3_heads_up_type": alert.phase3_heads_up_type,
                 "phase3_heads_up_dedupe_key": alert.phase3_heads_up_dedupe_key,
@@ -2396,7 +2423,10 @@ class AlertWriter:
                 "option_feed_status": alert.option_feed_status,
                 "heads_up_type": alert.phase3_heads_up_type,
                 "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
-                "phase3_heads_up_sent": alert.phase3_heads_up_sent,
+                "phase3_heads_up_sent": bool(alert.phase3_delivery_succeeded),
+                "phase3_delivery_requested": bool(alert.phase3_delivery_requested or alert.phase3_heads_up_sent),
+                "phase3_delivery_attempted": bool(alert.phase3_delivery_attempted),
+                "phase3_delivery_succeeded": bool(alert.phase3_delivery_succeeded),
                 "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
                 "dedupe_key": alert.phase3_heads_up_dedupe_key,
                 "message_fingerprint": alert.phase3_heads_up_message_fingerprint,
@@ -2417,9 +2447,9 @@ class AlertWriter:
                 "option_stale_did_not_block_heads_up": alert.option_stale_did_not_block_heads_up,
                 "watch_only_late_move": alert.watch_only_late_move,
                 "do_not_chase_watch": alert.do_not_chase_watch,
-                "telegram_attempted": bool(alert.phase3_heads_up_sent),
-                "telegram_sent": False,
-                "telegram_error": "",
+                "telegram_attempted": bool(alert.phase3_delivery_attempted),
+                "telegram_sent": bool(alert.phase3_delivery_succeeded),
+                "telegram_error": alert.phase3_delivery_error or "",
                 "message_preview": alert.phase3_heads_up_message_preview,
                 "scenario_reasons": alert.scenario_reasons,
                 "scenario_warnings": alert.scenario_warnings,
@@ -3691,6 +3721,9 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
         "scenario_score": alert.scenario_score,
         "phase3_heads_up_eligible": alert.phase3_heads_up_eligible,
         "phase3_heads_up_sent": False,
+        "phase3_delivery_requested": False,
+        "phase3_delivery_attempted": False,
+        "phase3_delivery_succeeded": False,
         "phase3_heads_up_block_reason": alert.phase3_heads_up_block_reason,
         "dedupe_key": alert.phase3_heads_up_dedupe_key,
         "message_fingerprint": alert.phase3_heads_up_message_fingerprint,
@@ -3719,6 +3752,13 @@ def append_phase3_telegram_dedupe_block(alert: Alert) -> None:
 def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -> None:
     if not alert.phase3_heads_up_eligible:
         return
+    alert.phase3_delivery_requested = True
+    alert.phase3_delivery_attempted = True
+    alert.phase3_delivery_succeeded = bool(sent)
+    alert.phase3_heads_up_sent = bool(sent)
+    alert.phase3_delivery_timestamp = now_utc().isoformat()
+    alert.phase3_delivery_channel = "telegram"
+    alert.phase3_delivery_error = "" if sent else redact_notification_error(error)
     alert.phase3_heads_up_final_decision = "SENT" if sent else "TELEGRAM_FAILED"
     alert.phase3_heads_up_final_block_reason = "" if sent else redact_notification_error(error)
     assign_professional_alert_tier(alert)
@@ -3751,6 +3791,13 @@ def append_phase3_telegram_delivery(alert: Alert, sent: bool, error: Any = "") -
         "telegram_attempted": True,
         "telegram_sent": bool(sent),
         "telegram_error": redact_notification_error(error),
+        "phase3_delivery_requested": True,
+        "phase3_delivery_attempted": True,
+        "phase3_delivery_succeeded": bool(sent),
+        "phase3_heads_up_sent": bool(sent),
+        "phase3_delivery_timestamp": alert.phase3_delivery_timestamp,
+        "phase3_delivery_channel": "telegram",
+        "phase3_delivery_error": alert.phase3_delivery_error,
     }
     try:
         with (LOG_DIR / "phase3_heads_up.jsonl").open("a", encoding="utf-8") as handle:
@@ -4717,6 +4764,7 @@ class EliteScanner:
             alert.sms_allowed = False
             alert.watch_allowed = False
             alert.phase3_heads_up_sent = bool(warning_due)
+            alert.phase3_delivery_requested = bool(warning_due)
             alert.phase3_heads_up_eligible = bool(warning_due)
             alert.phase3_heads_up_type = "STOCK_ONLY_WARNING" if warning_due else "BLOCKED"
             alert.chop_warning_sent = bool(warning_due)
@@ -5297,6 +5345,28 @@ class EliteScanner:
             else:
                 context[symbol] = "FLAT"
         return context
+
+    def publish_market_regime_heartbeat(self, snapshots: Dict[str, SymbolSnapshot], market_bars: Dict[str, List[Bar]]) -> Dict[str, Any]:
+        current = now_utc()
+        aapl_bars = snapshots.get("AAPL").recent_bars if snapshots.get("AAPL") else None
+        result = evaluate_market_regime(market_bars, self.config, aapl_bars=aapl_bars)
+        source_times = {symbol: (bars[-1].t.isoformat() if bars else None) for symbol, bars in market_bars.items()}
+        source_ages = {symbol: (round((current - bars[-1].t.astimezone(UTC)).total_seconds(), 1) if bars else None) for symbol, bars in market_bars.items()}
+        complete = all(market_bars.get(symbol) for symbol in ("SPY", "QQQ"))
+        payload = {"timestamp": current.isoformat(), "heartbeat_version": 1, **result, "source_bar_timestamps": source_times, "source_bar_ages_seconds": source_ages, "context_complete": complete}
+        if not complete:
+            payload.update({"market_regime": "UNKNOWN", "regime_reason": "SPY/QQQ heartbeat context is incomplete."})
+        try:
+            MARKET_REGIME_HEARTBEAT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with MARKET_REGIME_HEARTBEAT_LOG.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, default=str, sort_keys=True) + "\n")
+            MARKET_REGIME_LATEST.parent.mkdir(parents=True, exist_ok=True)
+            temporary = MARKET_REGIME_LATEST.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, indent=2, default=str, sort_keys=True), encoding="utf-8")
+            temporary.replace(MARKET_REGIME_LATEST)
+        except OSError as exc:
+            logger.warning("Market regime heartbeat failed safely: %s", redact_notification_error(exc))
+        return payload
 
     def market_alignment_for(self, direction: str, market_context: Optional[Dict[str, str]]) -> str:
         if direction not in {"BULLISH", "BEARISH"} or not market_context:
@@ -5987,6 +6057,7 @@ class EliteScanner:
             return
 
         alert.phase3_heads_up_sent = True
+        alert.phase3_delivery_requested = True
         alert.phase3_heads_up_block_reason = ""
         alert.phase3_heads_up_final_decision = (
             "TELEGRAM_ATTEMPTED" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
@@ -7650,6 +7721,7 @@ class EliteScanner:
             for symbol, snap in snapshots.items()
             if symbol in {"SPY", "QQQ"} and snap.recent_bars
         }
+        self.publish_market_regime_heartbeat(snapshots, market_bars)
         count = 0
         for symbol in self.symbols:
             snap = snapshots.get(symbol)

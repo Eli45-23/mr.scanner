@@ -28,6 +28,7 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
     def test_routes_exist_and_scan_has_no_symbol_parameter(self):
         text = Path(scanner_dashboard.__file__).read_text(encoding="utf-8")
         self.assertIn("/api/options-whales/status", text)
+        self.assertIn("/api/options-whales/data-health", text)
         self.assertIn("/api/options-whales/scan", text)
         self.assertIn("/api/options-whales/auto-scan/pause", text)
         self.assertIn("/api/options-whales/auto-scan/resume", text)

@@ -71,7 +71,7 @@ def classify_next_day_oi(original: Dict[str, Any], next_day_open_interest: int |
         reason = "volume, prior OI, and next-day OI are unavailable or zero"
     elif change >= opening_threshold:
         status = "confirmed_opening"
-        estimate = "likely_opening"
+        estimate = "confirmed_opening"
         reason = f"next-day OI increased by {change:,}, which is at least 50% of same-day volume ({vol:,})"
     elif change <= -not_confirmed_threshold:
         status = "likely_closing"
@@ -79,11 +79,11 @@ def classify_next_day_oi(original: Dict[str, Any], next_day_open_interest: int |
         reason = f"next-day OI decreased by {abs(change):,}; same-day flow did not confirm as opening"
     elif abs(change) < not_confirmed_threshold:
         status = "not_confirmed"
-        estimate = "mixed"
+        estimate = "not_confirmed"
         reason = f"next-day OI changed by only {change:,}, too small versus same-day volume ({vol:,}) to confirm opening"
     else:
         status = "not_confirmed"
-        estimate = "mixed"
+        estimate = "not_confirmed"
         reason = f"next-day OI increased by {change:,}, but not enough versus same-day volume ({vol:,}) to confirm opening"
 
     return {
@@ -97,7 +97,7 @@ def classify_next_day_oi(original: Dict[str, Any], next_day_open_interest: int |
         "open_interest_change": change,
         "likely_opening": status == "confirmed_opening",
         "likely_closing": estimate == "likely_closing",
-        "likely_roll_or_unclear": estimate in {"mixed", "unknown"},
+        "likely_roll_or_unclear": estimate in {"not_confirmed", "unknown", "roll_or_spread_possible", "hedge_or_unclear"},
     }
 
 
@@ -115,9 +115,9 @@ def review_alerts_with_next_day_oi(alerts: Iterable[Dict[str, Any]], oi_by_contr
             if member_symbol in oi_by_contract:
                 member_changes.append(_safe_int(oi_by_contract[member_symbol]) - _safe_int(member.get("open_interest")))
         if len(member_changes) >= 2 and any(value > 0 for value in member_changes) and any(value < 0 for value in member_changes):
-            result.update({"next_day_oi_status": "roll_or_spread_possible", "open_close_estimate_after_oi": "mixed", "next_day_oi_reason": "Related episode contracts have offsetting next-day OI changes; a roll or spread is possible."})
+            result.update({"next_day_oi_status": "roll_or_spread_possible", "open_close_estimate_after_oi": "roll_or_spread_possible", "next_day_oi_reason": "Related episode contracts have offsetting next-day OI changes; a roll or spread is possible."})
         elif alert.get("possible_multileg") and result.get("next_day_oi_status") == "confirmed_opening":
-            result.update({"next_day_oi_status": "hedge_or_unclear", "open_close_estimate_after_oi": "unknown", "next_day_oi_reason": "OI increased, but multi-leg structure means directional intent may be hedged."})
+            result.update({"next_day_oi_status": "hedge_or_unclear", "open_close_estimate_after_oi": "hedge_or_unclear", "next_day_oi_reason": "OI increased, but multi-leg structure means directional intent may be hedged."})
         if result["next_day_oi_status"] == "pending":
             continue
         candidate = _candidate(alert)

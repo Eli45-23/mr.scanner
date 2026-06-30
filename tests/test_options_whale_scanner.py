@@ -21,6 +21,7 @@ from scanner.options_whale_scanner import (
     build_whale_print_key,
     dedupe_whale_prints,
     format_whale_alert,
+    result_alert_tier,
     options_market_session_state,
     _parse_iso_time,
     _quote_age_seconds,
@@ -469,13 +470,36 @@ class OptionsWhaleScannerTests(unittest.TestCase):
                 "direction_confidence": "MEDIUM", "market_regime": "CHOPPY",
                 "windows": [{"minutes": 15, "status": "ok", "signed_move_pct": 0.2 if idx < 3 else -0.2}],
             })
-        cfg = {"reliability_min_effective_samples": 20, "reliability_max_penalty": 8, "reliability_max_bonus": 5}
+        cfg = {"reliability_min_effective_samples": 20, "reliability_min_sessions": 1, "reliability_max_penalty": 8, "reliability_max_bonus": 5}
         table = build_reliability_table(outcomes, cfg)
-        result = {"candidate": {"dte": 0, "dte_bucket": "0DTE"}, "whale_score": 92, "direction_confidence": "MEDIUM", "market_regime": "CHOPPY"}
+        result = {"candidate": {"dte": 0, "dte_bucket": "0DTE"}, "whale_score": 92, "direction_confidence": "MEDIUM", "market_regime": "CHOPPY", "flow_bias": "BULLISH"}
         adjusted = apply_reliability_adjustment(result, table, cfg)
         self.assertEqual(adjusted["reliability_status"], "applied")
         self.assertGreaterEqual(adjusted["reliability_score_adjustment"], -8)
         self.assertLess(adjusted["whale_score"], 92)
+
+    def test_strict_zero_dte_gate_keeps_unproven_flow_dashboard_only(self):
+        result = {
+            "candidate": {"dte": 0, "option_type": "CALL", "estimated_premium": 300000, "spread_percent": 5, "warnings": [], "fresh_flow_label": "Fresh premium print"},
+            "whale_score": 98, "direction_confidence": "HIGH", "market_regime": "TRENDING_UP",
+            "aggression_side": "near_ask", "price_context_score": 9, "price_confirmation_score": 9,
+            "reliability_qualified": False,
+        }
+        tier, notify, reason = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
+        self.assertEqual(tier, "Tier 2")
+        self.assertFalse(notify)
+        self.assertIn("reliability", reason)
+
+    def test_strict_zero_dte_gate_allows_proven_aligned_flow(self):
+        result = {
+            "candidate": {"dte": 0, "option_type": "CALL", "estimated_premium": 300000, "spread_percent": 5, "warnings": [], "fresh_flow_label": "Fresh premium print"},
+            "whale_score": 98, "direction_confidence": "HIGH", "market_regime": "TRENDING_UP",
+            "aggression_side": "near_ask", "price_context_score": 9, "price_confirmation_score": 9,
+            "reliability_qualified": True, "reliability_rate": 0.45,
+        }
+        tier, notify, _ = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
+        self.assertEqual(tier, "Tier 1")
+        self.assertTrue(notify)
 
     def test_attach_outcome_completeness_adds_badge_fields(self):
         row = {

@@ -142,6 +142,35 @@ class OptionsDataClientTests(unittest.TestCase):
         self.assertNotIn("feed", trades_call[2])
         self.assertNotIn("feed", bars_call[2])
 
+    def test_historical_bars_paginate_and_publish_redacted_health(self):
+        from datetime import datetime, timezone
+
+        class PagedSession(FakeSession):
+            def request(self, method, url, params=None, timeout=0):
+                self.calls.append((method, url, params or {}))
+                if (params or {}).get("page_token") == "next":
+                    return FakeResponse(payload={"bars": {"AAPL1": [{"c": 1.2}]}})
+                return FakeResponse(payload={"bars": {"AAPL1": [{"c": 1.1}]}, "next_page_token": "next"})
+
+        session = PagedSession()
+        client = OptionsDataClient("key", "secret", session=session)
+        now = datetime.now(timezone.utc)
+        bars = client.get_option_bars(["AAPL1"], start=now, end=now)
+        self.assertEqual(len(bars["AAPL1"]), 2)
+        diagnostic = client.data_health()["request_diagnostics"]["historical_option_bars"]
+        self.assertEqual(diagnostic["pages"], 2)
+        self.assertEqual(diagnostic["rows"], 2)
+        self.assertNotIn("response_body", diagnostic)
+
+    def test_historical_quotes_are_explicitly_unsupported(self):
+        from datetime import datetime, timezone
+
+        client = OptionsDataClient("key", "secret", session=FakeSession())
+        now = datetime.now(timezone.utc)
+        self.assertEqual(client.get_option_quotes(["AAPL1"], start=now, end=now), {})
+        health = client.data_health()["request_diagnostics"]["historical_option_quotes"]
+        self.assertEqual(health["error_category"], "unsupported_endpoint")
+
 
 if __name__ == "__main__":
     unittest.main()

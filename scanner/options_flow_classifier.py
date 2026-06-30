@@ -83,8 +83,8 @@ def estimate_opening_flow(candidate: Dict[str, Any]) -> Dict[str, Any]:
     if oi <= 0 and volume > 0:
         return {
             **base,
-            "opening_flow_estimate": "possible opening flow",
-            "open_close_estimate": "likely_opening",
+            "opening_flow_estimate": "suspected opening flow",
+            "open_close_estimate": "suspected_opening",
             "opening_confidence": "MEDIUM",
             "open_close_confidence": "MEDIUM",
             "open_close_reason": "Volume printed against zero or unavailable open interest; next-day OI is required for confirmation.",
@@ -94,8 +94,8 @@ def estimate_opening_flow(candidate: Dict[str, Any]) -> Dict[str, Any]:
     if ratio >= 2.0:
         return {
             **base,
-            "opening_flow_estimate": "possible opening flow",
-            "open_close_estimate": "likely_opening",
+            "opening_flow_estimate": "suspected opening flow",
+            "open_close_estimate": "suspected_opening",
             "opening_confidence": "MEDIUM",
             "open_close_confidence": "MEDIUM",
             "open_close_reason": "Volume is much greater than current open interest; next-day OI is required for confirmation.",
@@ -104,8 +104,8 @@ def estimate_opening_flow(candidate: Dict[str, Any]) -> Dict[str, Any]:
     if oi >= volume * 3 and oi > 0:
         return {
             **base,
-            "opening_flow_estimate": "could be closing or rolling",
-            "open_close_estimate": "likely_closing",
+            "opening_flow_estimate": "suspected closing or rolling",
+            "open_close_estimate": "suspected_closing",
             "opening_confidence": "LOW",
             "open_close_confidence": "LOW",
             "open_close_reason": "Existing open interest is large relative to today’s volume, so the flow may be closing or rolling.",
@@ -115,7 +115,7 @@ def estimate_opening_flow(candidate: Dict[str, Any]) -> Dict[str, Any]:
         return {
             **base,
             "opening_flow_estimate": "mixed",
-            "open_close_estimate": "mixed",
+            "open_close_estimate": "unclear_intraday",
             "opening_confidence": "LOW",
             "open_close_confidence": "LOW",
             "open_close_reason": "Volume is meaningful but not large enough versus open interest to separate opening from closing.",
@@ -124,7 +124,7 @@ def estimate_opening_flow(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return {
         **base,
         "opening_flow_estimate": "unclear",
-        "open_close_estimate": "unknown",
+        "open_close_estimate": "unclear_intraday",
         "opening_confidence": "LOW",
         "open_close_confidence": "LOW",
         "open_close_reason": "Current-day volume and open interest do not clearly separate opening, closing, or rolling flow.",

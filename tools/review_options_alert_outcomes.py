@@ -255,12 +255,10 @@ def review_alerts(
                 option_bars = client.get_option_bars([option_symbol], start=start, end=end).get(option_symbol, [])
             except Exception:
                 option_bars = []
-        if option_symbol and hasattr(client, "get_option_quotes"):
-            try:
-                option_quotes = client.get_option_quotes([option_symbol], start=start, end=end).get(option_symbol, [])
-            except Exception:
-                option_quotes = []
+        if option_symbol:
+            option_quotes = storage.option_quote_observations(option_symbol, limit=10000)
         option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS)
+        option_data_diagnostics = client.data_health().get("request_diagnostics", {}) if hasattr(client, "data_health") else {}
         reviewed_row = {
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "alert_key": key,
@@ -280,6 +278,7 @@ def review_alerts(
             "score_components": row.get("score_components"),
             **outcome,
             **option_outcome,
+            "option_data_diagnostics": option_data_diagnostics,
             **build_outcome_diagnostics(
                 bars=bars,
                 start=start,
