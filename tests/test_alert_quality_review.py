@@ -83,8 +83,8 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     config.write_text("{}")
     write_jsonl(logs / "options_whale_scans.jsonl", [record(coverage_warning="AAPL coverage is stale")])
     write_jsonl(logs / "options_whale_episodes.jsonl", [record(episode_id="ep-1")])
-    write_jsonl(logs / "options_oi_reviews.jsonl", [record(episode_id="ep-1", status="confirmed_opening")])
-    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [record(episode_id="ep-1")])
+    write_jsonl(logs / "options_oi_reviews.jsonl", [record(episode_id="ep-1", status="confirmed_opening", original_time=f"{DAY}T10:00:00-04:00"), record(episode_id="wrong-oi", original_time="2026-06-11T10:00:00-04:00")])
+    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [record(episode_id="ep-1", detected_at=f"{DAY}T10:00:00-04:00"), record(episode_id="wrong-outcome", detected_at="2026-06-11T10:00:00-04:00")])
     result = export_review_package(
         day_text=DAY,
         start_text="09:30",
@@ -102,4 +102,6 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     assert (package / "logs" / "options_whale_episodes.jsonl").exists()
     assert (package / "logs" / "options_oi_reviews.jsonl").exists()
     assert (package / "data" / "options_whale_episode_outcomes.jsonl").exists()
+    assert "wrong-oi" not in (package / "logs" / "options_oi_reviews.jsonl").read_text()
+    assert "wrong-outcome" not in (package / "data" / "options_whale_episode_outcomes.jsonl").read_text()
     assert "Scan passes with coverage warnings: 1" in result["summary"].read_text()

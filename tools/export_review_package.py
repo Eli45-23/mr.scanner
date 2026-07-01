@@ -121,14 +121,29 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
-def records_for_day(records: Iterable[Dict[str, Any]], day_text: str) -> List[Dict[str, Any]]:
-    return [record for record in records if (parse_record_time(record) and parse_record_time(record).date().isoformat() == day_text)]
+def record_time_for(record: Dict[str, Any], timestamp_field: Optional[str] = None) -> Optional[datetime]:
+    if not timestamp_field:
+        return parse_record_time(record)
+    raw = record.get(timestamp_field)
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ET)
+    return parsed.astimezone(ET)
 
 
-def records_in_window(records: Iterable[Dict[str, Any]], start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
+def records_for_day(records: Iterable[Dict[str, Any]], day_text: str, *, timestamp_field: Optional[str] = None) -> List[Dict[str, Any]]:
+    return [record for record in records if (record_time_for(record, timestamp_field) and record_time_for(record, timestamp_field).date().isoformat() == day_text)]
+
+
+def records_in_window(records: Iterable[Dict[str, Any]], start_dt: datetime, end_dt: datetime, *, timestamp_field: Optional[str] = None) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     for record in records:
-        ts = parse_record_time(record)
+        ts = record_time_for(record, timestamp_field)
         if ts and start_dt <= ts <= end_dt:
             selected.append(record)
     return selected
@@ -656,13 +671,13 @@ def export_review_package(
         "oi_reviews": log_dir / "options_oi_reviews.jsonl",
         "price_observations": log_dir / "options_price_observations.jsonl",
     }
-    whale_records = {name: records_for_day(read_jsonl(path), day_text) for name, path in whale_sources.items()}
+    whale_records = {name: records_for_day(read_jsonl(path), day_text, timestamp_field="original_time" if name == "oi_reviews" else None) for name, path in whale_sources.items()}
     data_dir = log_dir.parent / "data"
     outcome_sources = {
         "outcomes": data_dir / "options_whale_episode_outcomes.jsonl",
         "legacy_outcomes": data_dir / "options_whale_outcomes.jsonl",
     }
-    whale_records.update({name: records_for_day(read_jsonl(path), day_text) for name, path in outcome_sources.items()})
+    whale_records.update({name: records_for_day(read_jsonl(path), day_text, timestamp_field="detected_at") for name, path in outcome_sources.items()})
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -698,7 +713,7 @@ def export_review_package(
     for name, source in whale_sources.items():
         if source.exists():
             write_jsonl(logs_out / source.name, whale_records[name])
-            write_jsonl(window_out / f"{source.stem}_window.jsonl", records_in_window(whale_records[name], start_dt, end_dt))
+            write_jsonl(window_out / f"{source.stem}_window.jsonl", records_in_window(whale_records[name], start_dt, end_dt, timestamp_field="original_time" if name == "oi_reviews" else None))
     for name, source in outcome_sources.items():
         if source.exists():
             write_jsonl(package_dir / "data" / source.name, whale_records[name])

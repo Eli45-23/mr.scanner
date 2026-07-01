@@ -643,14 +643,25 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
             logger.exception("Options outcome review job failed")
             errors.append(f"outcomes: {exc}")
     oi_hour, oi_minute = [int(part) for part in str(settings.get("oi_time_et", "09:45")).split(":", 1)]
-    if (current.hour, current.minute) >= (oi_hour, oi_minute) and state.get("oi_day") != current.date().isoformat():
+    retry_end_hour, retry_end_minute = [int(part) for part in str(settings.get("oi_retry_end_et", "12:00")).split(":", 1)]
+    oi_last_attempt = parse_scan_timestamp(state.get("oi_last_attempt"))
+    retry_interval = max(60, int(settings.get("oi_retry_interval_seconds", 900)))
+    retry_due = oi_last_attempt is None or (current.astimezone(timezone.utc) - oi_last_attempt.astimezone(timezone.utc)).total_seconds() >= retry_interval
+    oi_window_open = (current.hour, current.minute) >= (oi_hour, oi_minute) and (current.hour, current.minute) <= (retry_end_hour, retry_end_minute)
+    if oi_window_open and retry_due and state.get("oi_day") != current.date().isoformat():
         try:
             from tools.review_next_day_oi import review_from_live_contracts
             results["oi"] = review_from_live_contracts(limit=int(settings.get("review_limit", 1000)))
-            state["oi_day"] = current.date().isoformat()
+            state["oi_last_attempt"] = current.isoformat()
+            state["oi_source_day"] = results["oi"].get("source_session_date")
+            state["oi_contract_count"] = results["oi"].get("unique_contract_count")
+            state["oi_coverage_rate"] = results["oi"].get("oi_coverage_rate")
+            if results["oi"].get("complete"):
+                state["oi_day"] = current.date().isoformat()
         except Exception as exc:
             logger.exception("Options OI review job failed")
             errors.append(f"oi: {exc}")
+            state["oi_last_attempt"] = current.isoformat()
     package_hour, package_minute = [int(part) for part in str(settings.get("package_time_et", "16:05")).split(":", 1)]
     if (current.hour, current.minute) >= (package_hour, package_minute) and state.get("package_day") != current.date().isoformat():
         try:
@@ -758,12 +769,51 @@ def options_whales_data_health() -> Dict[str, Any]:
             heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             heartbeat = {"result": "ERROR", "reason": "market regime heartbeat could not be read"}
+    outcomes = OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=20000)
+    latest_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in outcomes:
+        key = str(row.get("alert_key") or "")
+        if key and str(row.get("reviewed_at") or "") >= str(latest_by_key.get(key, {}).get("reviewed_at") or ""):
+            latest_by_key[key] = row
+    detected = [(parse_scan_timestamp(row.get("detected_at")), row) for row in latest_by_key.values()]
+    detected = [(stamp, row) for stamp, row in detected if stamp]
+    latest_day = max((stamp.astimezone(ET).date() for stamp, _ in detected), default=None)
+    day_rows = [row for stamp, row in detected if latest_day and stamp.astimezone(ET).date() == latest_day]
+    unavailable = sum(str(row.get("option_outcome_status")) == "option_bars_unavailable" for row in day_rows)
+    executable_total = executable_available = 0
+    endpoint_errors: List[Dict[str, Any]] = []
+    for row in day_rows:
+        for item in row.get("option_windows") or []:
+            if item.get("status") == "ok":
+                executable_total += 1
+                if isinstance(item.get("estimated_executable_return_pct"), (int, float)):
+                    executable_available += 1
+        for name, diagnostic in (row.get("option_data_diagnostics") or {}).items():
+            status_code = diagnostic.get("http_status") if isinstance(diagnostic, dict) else None
+            status_error = isinstance(status_code, (int, float)) and status_code >= 400
+            if isinstance(diagnostic, dict) and (diagnostic.get("error_category") or status_error):
+                endpoint_errors.append({"endpoint": name, **diagnostic})
+    warning_rate = float(scanner.whale.get("option_bar_unavailable_warning_rate", 0.02))
+    unavailable_rate = unavailable / len(day_rows) if day_rows else 0.0
+    outcome_health = {
+        "latest_detection_date": latest_day.isoformat() if latest_day else None,
+        "total_episodes": len(day_rows),
+        "option_bars_unavailable_count": unavailable,
+        "option_bars_unavailable_rate": round(unavailable_rate, 4),
+        "option_bars_warning_rate": warning_rate,
+        "executable_window_count": executable_total,
+        "executable_window_coverage": round(executable_available / executable_total, 4) if executable_total else None,
+        "endpoint_error_count": len(endpoint_errors),
+        "endpoint_errors": endpoint_errors[:10],
+        "warning": unavailable_rate > warning_rate or bool(endpoint_errors),
+    }
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "option_api": scanner.client.data_health(),
         "market_regime_heartbeat": heartbeat,
         "coverage": options_whales_coverage(),
         "last_scan_error": latest.get("error") or STATE.options_whale_last_scan_error,
+        "option_outcome_health": outcome_health,
     }
 
 
@@ -4467,7 +4517,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     function optionFollowText(item) {
       return String(item.option_price_follow_through_status || item.follow_through_status || 'pending').replaceAll('_', ' ');
     }
-    function renderStatus(status, latest, universe, coverage, reliability) {
+    function renderStatus(status, latest, universe, coverage, reliability, dataHealth) {
       const scan = latest.last_scan || {};
       const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
       const current = status.scan_running ? 'Running' : 'Idle';
@@ -4491,8 +4541,11 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Old prints', latest.stale_count ?? latest.diagnostics?.stale_count ?? 0, (latest.stale_count ?? latest.diagnostics?.stale_count ?? 0) ? 'warn' : ''),
         card('Stale coverage', (coverage.stale_symbols || []).length, (coverage.stale_symbols || []).length ? 'warn' : 'good'),
         card('Reliability buckets', reliability.bucket_count ?? 0),
+        card('Option-bar unavailable', `${dataHealth.option_outcome_health?.option_bars_unavailable_count ?? 0} / ${dataHealth.option_outcome_health?.total_episodes ?? 0}`, dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
+        card('Executable return coverage', dataHealth.option_outcome_health?.executable_window_coverage !== null && dataHealth.option_outcome_health?.executable_window_coverage !== undefined ? `${Math.round(dataHealth.option_outcome_health.executable_window_coverage * 100)}%` : 'Unknown', dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
       ].join('');
-      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning].filter(Boolean);
+      const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }
@@ -4616,14 +4669,15 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     async function refresh() {
       try {
-        const [status, latest, universe, coverage, reliability] = await Promise.all([
+        const [status, latest, universe, coverage, reliability, dataHealth] = await Promise.all([
           api('/api/options-whales/status'),
           api('/api/options-whales/latest'),
           api('/api/options-whales/universe/status'),
           api('/api/options-whales/coverage'),
-          api('/api/options-whales/reliability')
+          api('/api/options-whales/reliability'),
+          api('/api/options-whales/data-health')
         ]);
-        renderStatus(status, latest, universe, coverage, reliability);
+        renderStatus(status, latest, universe, coverage, reliability, dataHealth);
         renderRows(latest);
         maybePlayUpdateSound(status, latest);
       } catch (err) {

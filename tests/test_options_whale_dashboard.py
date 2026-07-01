@@ -38,6 +38,21 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Run Whale Scan Now", text)
         self.assertIn("Scan results are stale", text)
 
+    def test_oi_job_retries_until_data_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "review_state.json"
+            config = {"options_review_jobs": {"enabled": True, "outcomes_interval_seconds": 999999, "oi_time_et": "09:45", "oi_retry_interval_seconds": 900, "oi_retry_end_et": "12:00", "package_time_et": "23:59", "review_limit": 1000}}
+            first = {"complete": False, "source_session_date": "2026-07-01", "unique_contract_count": 10, "oi_coverage_rate": 0.0}
+            second = {"complete": True, "source_session_date": "2026-07-01", "unique_contract_count": 10, "oi_coverage_rate": 0.8}
+            with mock.patch.object(scanner_dashboard, "OPTIONS_REVIEW_JOB_STATE_PATH", state_path), mock.patch("tools.review_options_alert_outcomes.review_alerts", return_value={}), mock.patch("tools.review_next_day_oi.review_from_live_contracts", side_effect=[first, second]) as review:
+                scanner_dashboard.run_options_review_jobs(config, datetime(2026, 7, 2, 10, 0, tzinfo=scanner_dashboard.ET))
+                scanner_dashboard.run_options_review_jobs(config, datetime(2026, 7, 2, 10, 5, tzinfo=scanner_dashboard.ET))
+                scanner_dashboard.run_options_review_jobs(config, datetime(2026, 7, 2, 10, 16, tzinfo=scanner_dashboard.ET))
+            self.assertEqual(review.call_count, 2)
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["oi_day"], "2026-07-02")
+            self.assertEqual(state["oi_source_day"], "2026-07-01")
+
     def test_whale_dashboard_does_not_poll_legacy_endpoints(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         legacy_paths = [
@@ -52,6 +67,8 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("/api/options-whales/status", html)
         self.assertIn("/api/options-whales/latest", html)
         self.assertIn("/api/options-whales/universe/status", html)
+        self.assertIn("/api/options-whales/data-health", html)
+        self.assertIn("Option-bar unavailable", html)
 
     def test_whale_dashboard_debug_candidates_are_hidden_by_default(self):
         html = scanner_dashboard.WHALE_INDEX_HTML

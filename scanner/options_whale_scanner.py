@@ -78,6 +78,9 @@ def default_options_whale_config() -> Dict[str, Any]:
         "max_contracts_per_underlying": 600,
         "rotation_symbols_per_scan": 15,
         "rotation_safety_factor": 1.15,
+        "rotation_duration_min_seconds": 5,
+        "rotation_duration_max_seconds": 300,
+        "rotation_reset_gap_multiplier": 2.0,
         "contract_catalog_refresh_seconds": 900,
         "contract_catalog_max_per_symbol": 5000,
         "coverage_warning_age_seconds": 300,
@@ -114,6 +117,12 @@ def default_options_whale_config() -> Dict[str, Any]:
         "zero_dte_tier1_max_spread_percent": 8,
         "zero_dte_tier1_min_price_context": 8,
         "strict_cohort_min_meaningful_rate": 0.30,
+        "strict_cohort_min_executable_positive_rate": 0.50,
+        "notification_dedupe_minutes": 15,
+        "notification_update_min_premium_growth": 0.25,
+        "notification_update_min_score_gain": 5,
+        "notification_update_min_price_confirmation_gain": 2,
+        "option_bar_unavailable_warning_rate": 0.02,
     }
 
 
@@ -395,6 +404,40 @@ def build_notification_event_key(row: Dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def build_notification_state_key(row: Dict[str, Any]) -> tuple[str, str, str]:
+    stamp = _parse_iso_time(_key_value(row, "time_detected") or row.get("scanner_detected_time") or row.get("timestamp"))
+    session_day = stamp.astimezone(MARKET_TIMEZONE).date().isoformat() if stamp else ""
+    return (session_day, str(_key_value(row, "option_symbol") or "").upper(), infer_direction_bias_label(row))
+
+
+def notification_state_update(prior: Dict[str, Any], current: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    prior_time = _parse_iso_time(_key_value(prior, "time_detected") or prior.get("scanner_detected_time") or prior.get("timestamp"))
+    current_time = _parse_iso_time(_key_value(current, "time_detected") or current.get("scanner_detected_time") or current.get("timestamp"))
+    elapsed = (current_time - prior_time).total_seconds() / 60 if prior_time and current_time else 0.0
+    prior_premium = safe_float(_key_value(prior, "estimated_premium"))
+    current_premium = safe_float(_key_value(current, "estimated_premium"))
+    growth = (current_premium / prior_premium - 1.0) if prior_premium > 0 else 0.0
+    score_gain = int(current.get("whale_score") or 0) - int(prior.get("whale_score") or 0)
+    price_gain = safe_float(current.get("price_confirmation_score")) - safe_float(prior.get("price_confirmation_score"))
+    confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    aggression_improved = confidence_rank.get(str(current.get("aggression_confidence") or "LOW").upper(), 0) > confidence_rank.get(str(prior.get("aggression_confidence") or "LOW").upper(), 0)
+    bias = infer_direction_bias_label(current)
+    aligned = {"BULLISH": {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}, "BEARISH": {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}}
+    prior_aligned = str(prior.get("market_regime") or "UNKNOWN").upper() in aligned.get(bias, set())
+    current_aligned = str(current.get("market_regime") or "UNKNOWN").upper() in aligned.get(bias, set())
+    improvements = []
+    if score_gain >= int(cfg.get("notification_update_min_score_gain", 5)): improvements.append("score")
+    if current_aligned and not prior_aligned: improvements.append("regime")
+    if aggression_improved: improvements.append("aggression")
+    if price_gain >= float(cfg.get("notification_update_min_price_confirmation_gain", 2)): improvements.append("price_confirmation")
+    allowed = elapsed >= int(cfg.get("notification_dedupe_minutes", 15)) and growth >= float(cfg.get("notification_update_min_premium_growth", 0.25)) and bool(improvements)
+    reasons = []
+    if elapsed < int(cfg.get("notification_dedupe_minutes", 15)): reasons.append("minimum update interval not reached")
+    if growth < float(cfg.get("notification_update_min_premium_growth", 0.25)): reasons.append("premium growth below material threshold")
+    if not improvements: reasons.append("no qualifying score, regime, aggression, or price-confirmation improvement")
+    return {"notification_state_update_allowed": allowed, "notification_state_elapsed_minutes": round(elapsed, 2), "notification_state_prior_premium": prior_premium, "notification_state_current_premium": current_premium, "notification_state_premium_growth": round(growth, 4), "notification_state_score_gain": score_gain, "notification_state_price_confirmation_gain": round(price_gain, 2), "notification_state_improvements": improvements, "notification_state_suppression_reasons": reasons, "notification_state_last_notified_at": prior_time.isoformat() if prior_time else None}
+
+
 def infer_direction_bias_label(row: Dict[str, Any]) -> str:
     explicit = str(row.get("flow_episode_bias") or row.get("flow_bias") or "").upper()
     if explicit in {"BULLISH", "BEARISH"}:
@@ -662,6 +705,7 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         if stamp and (now - stamp).days > history_days:
             continue
         window = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        option_window = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         if not window:
             continue
         signed = window.get("signed_move_pct")
@@ -677,16 +721,22 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         )
         age = max(0.0, (now - stamp).total_seconds() / 86400.0) if stamp else 0.0
         weight = 0.5 ** (age / half_life)
-        bucket = buckets.setdefault(key, {"effective_samples": 0.0, "successes": 0.0, "raw_samples": 0.0, "sessions": set()})
-        bucket["effective_samples"] += weight
+        bucket = buckets.setdefault(key, {"effective_samples": 0.0, "meaningful_successes": 0.0, "meaningful_samples": 0.0, "executable_successes": 0.0, "executable_samples": 0.0, "raw_samples": 0.0, "sessions": set()})
+        bucket["meaningful_samples"] += weight
         bucket["raw_samples"] += 1
         if stamp:
             bucket["sessions"].add(stamp.date().isoformat())
         score_total = score_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0})
         score_total["samples"] += weight
         if float(signed) >= 0.10:
-            bucket["successes"] += weight
+            bucket["meaningful_successes"] += weight
             score_total["successes"] += weight
+        executable_return = option_window.get("estimated_executable_return_pct") if option_window else None
+        if isinstance(executable_return, (int, float)):
+            bucket["executable_samples"] += weight
+            if float(executable_return) > 0:
+                bucket["executable_successes"] += weight
+        bucket["effective_samples"] = min(bucket["meaningful_samples"], bucket["executable_samples"])
     score_rates = {name: value["successes"] / value["samples"] for name, value in score_totals.items() if value["samples"]}
     guard_active = bool(score_rates.get("90+") is not None and score_rates.get("80-89") is not None and score_rates["90+"] <= score_rates["80-89"])
     guard_reason = "90+ score outcomes do not outperform 80-89 outcomes." if guard_active else ""
@@ -694,14 +744,24 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
     prior_success = float(cfg.get("reliability_prior_successes", 10))
     prior_failure = float(cfg.get("reliability_prior_failures", 10))
     for key, bucket in buckets.items():
-        posterior = (bucket["successes"] + prior_success) / (bucket["effective_samples"] + prior_success + prior_failure)
-        adjustment = round((posterior - 0.50) * 20)
+        meaningful_posterior = (bucket["meaningful_successes"] + prior_success) / (bucket["meaningful_samples"] + prior_success + prior_failure)
+        executable_posterior = (bucket["executable_successes"] + prior_success) / (bucket["executable_samples"] + prior_success + prior_failure) if bucket["executable_samples"] else 0.0
+        meaningful_threshold = float(cfg.get("strict_cohort_min_meaningful_rate", 0.30))
+        executable_threshold = float(cfg.get("strict_cohort_min_executable_positive_rate", 0.50))
+        adjustment = round(((meaningful_posterior - meaningful_threshold) + (executable_posterior - executable_threshold)) * 10)
         adjustment = max(-int(cfg.get("reliability_max_penalty", 8)), min(int(cfg.get("reliability_max_bonus", 5)), adjustment))
         session_count = len(bucket["sessions"])
         qualified = session_count >= int(cfg.get("reliability_min_sessions", 20)) and bucket["effective_samples"] >= float(cfg.get("reliability_min_effective_samples", 30))
-        if guard_active and adjustment > 0:
+        meaningful_passed = meaningful_posterior >= meaningful_threshold
+        executable_passed = executable_posterior >= executable_threshold
+        dual_metric_passed = qualified and meaningful_passed and executable_passed
+        if adjustment > 0 and (guard_active or not dual_metric_passed):
             adjustment = 0
-        table[key] = {"reliability_rate": round(posterior, 4), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason}
+        block_reasons = []
+        if not qualified: block_reasons.append("insufficient sessions or paired effective samples")
+        if not meaningful_passed: block_reasons.append("+0.10% meaningful-move rate below threshold")
+        if not executable_passed: block_reasons.append("positive executable-return rate below threshold")
+        table[key] = {"reliability_rate": round(meaningful_posterior, 4), "reliability_meaningful_rate": round(meaningful_posterior, 4), "reliability_executable_positive_rate": round(executable_posterior, 4), "reliability_meaningful_effective_samples": round(bucket["meaningful_samples"], 2), "reliability_executable_effective_samples": round(bucket["executable_samples"], 2), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_meaningful_passed": meaningful_passed, "reliability_executable_passed": executable_passed, "reliability_dual_metric_passed": dual_metric_passed, "reliability_block_reasons": block_reasons, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason}
     return table
 
 
@@ -709,13 +769,15 @@ def apply_reliability_adjustment(result: Dict[str, Any], table: Dict[tuple[str, 
     candidate = result.get("candidate") or {}
     key = (_reliability_score_bucket(result.get("whale_score")), str(candidate.get("dte_bucket") or _reliability_dte_bucket(candidate.get("dte"))), str(result.get("direction_confidence") or candidate.get("direction_confidence") or "UNKNOWN").upper(), str(result.get("market_regime") or "UNKNOWN").upper(), infer_direction_bias_label(result).upper())
     learned = table.get(key)
-    if not learned or not learned.get("reliability_qualified"):
+    if not learned:
         result.update({"reliability_bucket": "|".join(key), "reliability_status": "insufficient_history", "reliability_score_adjustment": 0})
         return result
     adjustment = int(learned.get("reliability_score_adjustment") or 0)
+    if not learned.get("reliability_qualified"):
+        adjustment = min(0, adjustment)
     original = int(result.get("whale_score") or 0)
     result.update(learned)
-    result.update({"pre_reliability_whale_score": original, "whale_score": max(0, min(100, original + adjustment)), "noise_adjusted_score": max(0, min(100, original + adjustment)), "reliability_bucket": "|".join(key), "reliability_status": "applied"})
+    result.update({"pre_reliability_whale_score": original, "whale_score": max(0, min(100, original + adjustment)), "noise_adjusted_score": max(0, min(100, original + adjustment)), "reliability_bucket": "|".join(key), "reliability_score_adjustment": adjustment, "reliability_status": "applied" if learned.get("reliability_qualified") else "penalty_only_insufficient_history"})
     result["classification"] = classify_score(result["whale_score"])
     return result
 
@@ -836,20 +898,23 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     bearish_regimes = {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
     aligned_regime = regime in (bearish_regimes if bias == "BEARISH" else bullish_regimes if bias == "BULLISH" else set())
     reliability_qualified = bool(result.get("reliability_qualified"))
-    reliability_rate = safe_float(result.get("reliability_rate"))
+    meaningful_rate = safe_float(result.get("reliability_meaningful_rate", result.get("reliability_rate")))
+    executable_rate = safe_float(result.get("reliability_executable_positive_rate"))
     cohort_reasons: List[str] = []
+    if not aligned_regime: cohort_reasons.append(f"{bias.lower() or 'directional'} Tier 1 requires a fresh aligned trending regime")
+    if not reliability_qualified: cohort_reasons.append("Tier 1 reliability is not qualified across enough sessions and paired outcomes")
+    if meaningful_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("+0.10% meaningful-move reliability is below the Tier 1 threshold")
+    if executable_rate < float(cfg.get("strict_cohort_min_executable_positive_rate", 0.50)): cohort_reasons.append("positive executable-return reliability is below the Tier 1 threshold")
+    if not result.get("reliability_dual_metric_passed"): cohort_reasons.append("dual-metric Tier 1 proof is incomplete")
     if bias == "BEARISH":
-        if not aligned_regime: cohort_reasons.append("bearish Tier 1 requires a known bearish-aligned regime")
         if score < int(cfg.get("bearish_tier1_min_score", 90)): cohort_reasons.append("bearish score below Tier 1 threshold")
         if safe_float(result.get("price_confirmation_score")) < int(cfg.get("bearish_tier1_min_price_context", 8)): cohort_reasons.append("bearish price confirmation below Tier 1 threshold")
-        if not reliability_qualified or reliability_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("bearish reliability is not proven across multiple sessions")
     if int(candidate.get("dte") or 0) == 0:
-        if not aligned_regime: cohort_reasons.append("0DTE Tier 1 requires a known aligned regime")
         if score < int(cfg.get("zero_dte_tier1_min_score", 90)): cohort_reasons.append("0DTE score below Tier 1 threshold")
         if safe_float(candidate.get("estimated_premium")) < float(cfg.get("zero_dte_tier1_min_premium", 250000)): cohort_reasons.append("0DTE premium below Tier 1 threshold")
         if candidate.get("spread_percent") is None or safe_float(candidate.get("spread_percent")) > float(cfg.get("zero_dte_tier1_max_spread_percent", 8)): cohort_reasons.append("0DTE spread exceeds Tier 1 threshold")
         if safe_float(result.get("price_confirmation_score")) < int(cfg.get("zero_dte_tier1_min_price_context", 8)): cohort_reasons.append("0DTE price confirmation below Tier 1 threshold")
-        if not reliability_qualified or reliability_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("0DTE reliability is not proven across multiple sessions")
+    cohort_reasons = list(dict.fromkeys(cohort_reasons))
     if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
         return "Tier 2", False, "Delayed or stale flow is dashboard-only until fresh evidence arrives."
     if candidate.get("possible_multileg"):
@@ -1077,12 +1142,19 @@ class OptionsWhaleScanner:
         state = self._load_scan_state()
         cursor = int(state.get("symbol_cursor") or 0) % max(1, len(rotating))
         previous_cycle = _parse_iso_time(state.get("last_updated"))
-        measured_cycle = max(1.0, (datetime.now(timezone.utc) - previous_cycle).total_seconds()) if previous_cycle else float(self.whale.get("scan_interval_seconds", 30))
-        prior_ewma = safe_float(state.get("cycle_duration_ewma_seconds")) or measured_cycle
-        cycle_ewma = prior_ewma * 0.7 + measured_cycle * 0.3
+        now_utc = datetime.now(timezone.utc)
+        raw_measured_cycle = max(1.0, (now_utc - previous_cycle).total_seconds()) if previous_cycle else float(self.whale.get("scan_interval_seconds", 30))
         target_age = max(1, int(self.whale.get("coverage_warning_age_seconds", 300)))
+        reset_gap = target_age * float(self.whale.get("rotation_reset_gap_multiplier", 2.0))
+        session_changed = bool(previous_cycle and previous_cycle.astimezone(MARKET_TIMEZONE).date() != now_utc.astimezone(MARKET_TIMEZONE).date())
+        rotation_timing_reset = bool(not previous_cycle or session_changed or raw_measured_cycle > reset_gap)
+        duration_min = max(1.0, float(self.whale.get("rotation_duration_min_seconds", 5)))
+        duration_max = max(duration_min, float(self.whale.get("rotation_duration_max_seconds", 300)))
+        measured_cycle = min(duration_max, max(duration_min, float(self.whale.get("scan_interval_seconds", 30)) if rotation_timing_reset else raw_measured_cycle))
+        prior_ewma = measured_cycle if rotation_timing_reset else min(duration_max, max(duration_min, safe_float(state.get("cycle_duration_ewma_seconds")) or measured_cycle))
+        cycle_ewma = prior_ewma * 0.7 + measured_cycle * 0.3
         dynamic_count = math.ceil(len(rotating) * cycle_ewma / target_age * float(self.whale.get("rotation_safety_factor", 1.15))) if rotating else 0
-        rotation_count = max(1, int(self.whale.get("rotation_symbols_per_scan", 15)), dynamic_count)
+        rotation_count = min(len(rotating), max(1, int(self.whale.get("rotation_symbols_per_scan", 15)), dynamic_count)) if rotating else 0
         rotation_page = [rotating[(cursor + offset) % len(rotating)] for offset in range(min(rotation_count, len(rotating)))] if rotating else []
         selected_underlyings = core + rotation_page
         self.last_scan_order = {
@@ -1158,6 +1230,10 @@ class OptionsWhaleScanner:
             "coverage_rotation_symbols_requested": rotation_count,
             "coverage_rotation_symbols_dynamic": dynamic_count,
             "coverage_cycle_duration_ewma_seconds": round(cycle_ewma, 2),
+            "coverage_cycle_duration_raw_seconds": round(raw_measured_cycle, 2),
+            "coverage_rotation_timing_reset": rotation_timing_reset,
+            "coverage_rotation_timing_reset_reason": "new_session" if session_changed else "gap_exceeded" if previous_cycle and raw_measured_cycle > reset_gap else "startup" if not previous_cycle else "none",
+            "coverage_rotation_duration_clamped": raw_measured_cycle != measured_cycle,
             "coverage_core_symbols": core,
             "coverage_symbol_ages_seconds": symbol_ages,
             "coverage_stale_symbols": stale_symbols,
@@ -1608,7 +1684,13 @@ class OptionsWhaleScanner:
         except OSError:
             pass
         prior_alerts = self.storage.latest_alerts(limit=5000)
-        prior_events = {build_notification_event_key(row): row for row in prior_alerts}
+        prior_states: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for row in prior_alerts:
+            key = build_notification_state_key(row)
+            current_stamp = _parse_iso_time(_key_value(row, "time_detected") or row.get("scanner_detected_time") or row.get("timestamp"))
+            prior_stamp = _parse_iso_time(_key_value(prior_states.get(key, {}), "time_detected") or prior_states.get(key, {}).get("scanner_detected_time") or prior_states.get(key, {}).get("timestamp"))
+            if all(key) and (not prior_stamp or (current_stamp and current_stamp >= prior_stamp)):
+                prior_states[key] = row
         notification_window = timedelta(minutes=int(effective_cfg.get("notification_dedupe_minutes", 15)))
         now = datetime.now(timezone.utc)
         recent_symbol_counts: Dict[str, int] = {}
@@ -1623,15 +1705,17 @@ class OptionsWhaleScanner:
         for result in results:
             symbol = str((result.get("candidate") or {}).get("underlying_symbol") or "").upper()
             episode_id = str(result.get("flow_episode_id") or "")
-            event_key = build_notification_event_key(result)
-            prior = prior_events.get(event_key)
-            prior_premium = safe_float(_key_value(prior or {}, "estimated_premium"))
-            current_premium = safe_float(_key_value(result, "estimated_premium"))
-            material_update = prior and prior_premium > 0 and current_premium >= prior_premium * 1.25
-            if prior and not material_update:
-                result.update({"should_notify": False, "notify_reason": "Duplicate option-flow event already logged; dashboard update only."})
-            elif material_update:
-                result.update({"update_type": "material_premium_follow_through", "notify_reason": "Material premium follow-through update."})
+            state_key = build_notification_state_key(result)
+            prior = prior_states.get(state_key)
+            if prior:
+                update = notification_state_update(prior, result, effective_cfg)
+                result.update(update)
+                result["update_type"] = "material_contract_state_update" if update["notification_state_update_allowed"] else "dashboard_contract_state_update"
+                result["notification_eligible_before_state_gate"] = bool(result.get("should_notify"))
+                if not update["notification_state_update_allowed"]:
+                    result.update({"should_notify": False, "notify_reason": "Same contract/direction state updated on dashboard only: " + "; ".join(update["notification_state_suppression_reasons"]) + "."})
+                else:
+                    result["notify_reason"] = "Material same-contract state update: premium increased and " + ", ".join(update["notification_state_improvements"]) + " improved."
             elif episode_id and episode_id in notified_episodes:
                 result.update({"should_notify": False, "notify_reason": "Related strike grouped into an existing flow episode; dashboard update only."})
             elif episode_id and result.get("flow_episode_size", 1) > 1 and not result.get("flow_episode_leader"):
@@ -1643,6 +1727,7 @@ class OptionsWhaleScanner:
                     notified_episodes.add(episode_id)
                 per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
                 self.storage.append_alert(result)
+                prior_states[state_key] = result
             if result.get("alert_tier") in {"Tier 1", "Tier 2"}:
                 self.storage.append_qualified_event(result)
         episode_groups: Dict[str, List[Dict[str, Any]]] = {}

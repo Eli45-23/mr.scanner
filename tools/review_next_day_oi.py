@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -45,6 +45,22 @@ def _unique_by_contract(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output
 
 
+def _episode_time(row: Dict[str, Any]) -> datetime | None:
+    candidate = row.get("candidate") if isinstance(row.get("candidate"), dict) else row
+    raw = row.get("scanner_detected_time") or candidate.get("time_detected") or row.get("timestamp") or row.get("episode_updated_at")
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def prior_session_episodes(rows: Iterable[Dict[str, Any]], *, as_of: date) -> tuple[str | None, List[Dict[str, Any]]]:
+    dated = [(stamp.date(), row) for row in rows if (stamp := _episode_time(row)) and stamp.date() < as_of]
+    source_day = max((day for day, _ in dated), default=None)
+    return (source_day.isoformat() if source_day else None, [row for day, row in dated if day == source_day])
+
+
 def build_client(config: Dict[str, Any]) -> OptionsDataClient:
     return OptionsDataClient(
         stock_feed=str(config.get("market_data", {}).get("stock_feed", "sip")),
@@ -54,22 +70,36 @@ def build_client(config: Dict[str, Any]) -> OptionsDataClient:
 
 
 def append_reviews(rows: Iterable[Dict[str, Any]], storage: OptionsWhaleStorage) -> None:
-    existing = {(str(row.get("episode_id") or ""), str(row.get("option_symbol") or ""), str(row.get("original_time") or "")) for row in storage.latest_oi_reviews(limit=10000)}
+    existing = {(str(row.get("episode_id") or ""), str(row.get("option_symbol") or ""), str(row.get("original_time") or "")): row for row in storage.latest_oi_reviews(limit=20000)}
     for row in rows:
         key = (str(row.get("episode_id") or ""), str(row.get("option_symbol") or ""), str(row.get("original_time") or ""))
-        if key not in existing:
+        prior = existing.get(key)
+        if not prior or (str(prior.get("next_day_oi_status")) in {"pending", "unavailable", "unresolved"} and str(row.get("next_day_oi_status")) not in {"pending", "unavailable", "unresolved"}):
             storage.append_oi_review({"reviewed_at": datetime.now(timezone.utc).isoformat(), **row})
-            existing.add(key)
+            existing[key] = row
 
 
-def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, latest_only: bool = False) -> Dict[str, Any]:
+def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, latest_only: bool = False, source_date: str | None = None, as_of: date | None = None) -> Dict[str, Any]:
     scanner_app.load_dotenv()
     config = scanner_app.load_config(None)
     storage = OptionsWhaleStorage(ROOT)
-    alerts = _read_latest_results() if latest_only else storage.latest_episodes(limit=limit) or storage.latest_alerts(limit=limit) or _read_latest_results()
-    alerts = _unique_by_contract(alerts)[-max(1, int(limit)):]
+    all_rows = _read_latest_results() if latest_only else storage.latest_episodes(limit=max(20000, limit)) or storage.latest_alerts(limit=max(20000, limit)) or _read_latest_results()
+    if source_date:
+        source_day = source_date
+        alerts = [row for row in all_rows if (_episode_time(row) and _episode_time(row).date().isoformat() == source_date)]
+    else:
+        source_day, alerts = prior_session_episodes(all_rows, as_of=as_of or datetime.now(timezone.utc).date())
+    alerts = _unique_by_contract(alerts)
     oi_map = fetch_next_day_oi_map(build_client(config), alerts)
     reviews = review_alerts_with_next_day_oi(alerts, oi_map)
+    reviewed_symbols = {str(row.get("option_symbol") or "") for row in reviews}
+    unresolved = []
+    for alert in alerts:
+        candidate = alert.get("candidate") if isinstance(alert.get("candidate"), dict) else alert
+        symbol = str(candidate.get("option_symbol") or candidate.get("contract_symbol") or "")
+        if symbol and symbol not in reviewed_symbols:
+            unresolved.append({"option_symbol": symbol, "underlying_symbol": candidate.get("underlying_symbol"), "expiration": candidate.get("expiration"), "option_type": candidate.get("option_type"), "strike": candidate.get("strike"), "original_time": alert.get("scanner_detected_time") or candidate.get("time_detected") or alert.get("timestamp"), "episode_id": alert.get("episode_id") or alert.get("flow_episode_id"), "next_day_oi_status": "unavailable", "open_close_estimate_after_oi": "unresolved", "next_day_oi_reason": "Next-day OI was unavailable; do not infer opening, closing, rolling, or hedging intent."})
+    reviews.extend(unresolved)
     if reviews and not dry_run:
         append_reviews(reviews, storage)
     statuses: Dict[str, int] = {}
@@ -79,8 +109,13 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
     return {
         "mode": "live_contracts",
         "alerts_checked": len(alerts),
+        "source_session_date": source_day,
+        "unique_contract_count": len(alerts),
         "oi_values_found": len(oi_map),
+        "oi_coverage_rate": round(len(oi_map) / len(alerts), 4) if alerts else None,
         "reviewed_count": len(reviews),
+        "unresolved_count": len(unresolved),
+        "complete": len(oi_map) > 0,
         "dry_run": dry_run,
         "output_path": str(storage.oi_reviews_path.relative_to(ROOT)),
         "statuses": statuses,
@@ -104,11 +139,12 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--latest-only", action="store_true", help="Use only data/options_whale_latest.json results instead of alert history.")
+    parser.add_argument("--source-date", help="Review contracts detected on this source session date (YYYY-MM-DD).")
     args = parser.parse_args()
     if args.oi_json:
         result = review_from_oi_json(Path(args.oi_json))
     else:
-        result = review_from_live_contracts(limit=args.limit, dry_run=args.dry_run, latest_only=args.latest_only)
+        result = review_from_live_contracts(limit=args.limit, dry_run=args.dry_run, latest_only=args.latest_only, source_date=args.source_date)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0
 

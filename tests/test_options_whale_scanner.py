@@ -23,6 +23,7 @@ from scanner.options_whale_scanner import (
     format_whale_alert,
     result_alert_tier,
     options_market_session_state,
+    notification_state_update,
     _parse_iso_time,
     _quote_age_seconds,
 )
@@ -160,6 +161,19 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertEqual(first_result["coverage_core_symbols"], ["AAPL"])
             self.assertNotEqual(first_result["coverage_rotation_page"], second_result["coverage_rotation_page"])
             self.assertTrue((root / "data" / "options_whale_scan_state.json").exists())
+
+    def test_rotation_resets_overnight_gap_and_caps_requested_symbols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entries = [{"underlying_symbol": f"X{idx:03d}", "contract_count": 10} for idx in range(40)]
+            self.write_universe(root, entries)
+            state_path = root / "data" / "options_whale_scan_state.json"
+            state_path.write_text(json.dumps({"symbol_cursor": 0, "contract_cursors": {}, "last_scanned_at": {}, "last_updated": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), "cycle_duration_ewma_seconds": 60000}), encoding="utf-8")
+            scanner = OptionsWhaleScanner({"options_whale_scanner": {"enabled": True, "always_scan_symbols": [], "rotation_symbols_per_scan": 1, "coverage_warning_age_seconds": 300, "max_contracts_per_scan": 100, "min_score": 99, "min_premium": 999999999}}, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
+            result = scanner.scan()
+            self.assertTrue(result["coverage_rotation_timing_reset"])
+            self.assertLessEqual(result["coverage_cycle_duration_ewma_seconds"], 300)
+            self.assertLessEqual(result["coverage_rotation_symbols_requested"], result["underlying_symbols_considered"])
 
     def test_no_candidate_scan_returns_near_misses_and_rejection_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,6 +483,7 @@ class OptionsWhaleScannerTests(unittest.TestCase):
                 "flow_bias": "BULLISH", "whale_score": 92, "dte_bucket": "0DTE",
                 "direction_confidence": "MEDIUM", "market_regime": "CHOPPY",
                 "windows": [{"minutes": 15, "status": "ok", "signed_move_pct": 0.2 if idx < 3 else -0.2}],
+                "option_windows": [{"minutes": 15, "status": "ok", "estimated_executable_return_pct": 5.0 if idx < 3 else -5.0}],
             })
         cfg = {"reliability_min_effective_samples": 20, "reliability_min_sessions": 1, "reliability_max_penalty": 8, "reliability_max_bonus": 5}
         table = build_reliability_table(outcomes, cfg)
@@ -495,11 +510,36 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             "candidate": {"dte": 0, "option_type": "CALL", "estimated_premium": 300000, "spread_percent": 5, "warnings": [], "fresh_flow_label": "Fresh premium print"},
             "whale_score": 98, "direction_confidence": "HIGH", "market_regime": "TRENDING_UP",
             "aggression_side": "near_ask", "price_context_score": 9, "price_confirmation_score": 9,
-            "reliability_qualified": True, "reliability_rate": 0.45,
+            "reliability_qualified": True, "reliability_rate": 0.45, "reliability_meaningful_rate": 0.45,
+            "reliability_executable_positive_rate": 0.60, "reliability_dual_metric_passed": True,
         }
         tier, notify, _ = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
         self.assertEqual(tier, "Tier 1")
         self.assertTrue(notify)
+
+    def test_universal_tier1_gate_blocks_misaligned_bullish_flow(self):
+        result = {
+            "candidate": {"dte": 2, "option_type": "CALL", "estimated_premium": 500000, "spread_percent": 3, "warnings": [], "fresh_flow_label": "Fresh premium print"},
+            "whale_score": 98, "direction_confidence": "HIGH", "market_regime": "CHOPPY",
+            "aggression_side": "near_ask", "price_context_score": 9, "price_confirmation_score": 9,
+            "reliability_qualified": True, "reliability_meaningful_rate": 0.50,
+            "reliability_executable_positive_rate": 0.60, "reliability_dual_metric_passed": True,
+        }
+        tier, notify, reason = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
+        self.assertEqual(tier, "Tier 2")
+        self.assertFalse(notify)
+        self.assertIn("aligned", reason)
+
+    def test_notification_state_update_requires_premium_and_quality_improvement(self):
+        prior = {"candidate": {"option_symbol": "AAPL1", "option_type": "CALL", "estimated_premium": 100000, "time_detected": "2026-07-01T14:00:00Z"}, "flow_bias": "BULLISH", "whale_score": 90, "price_confirmation_score": 7, "aggression_confidence": "MEDIUM", "market_regime": "CHOPPY"}
+        current = {"candidate": {"option_symbol": "AAPL1", "option_type": "CALL", "estimated_premium": 130000, "time_detected": "2026-07-01T14:20:00Z"}, "flow_bias": "BULLISH", "whale_score": 95, "price_confirmation_score": 9, "aggression_confidence": "HIGH", "market_regime": "TRENDING_UP"}
+        result = notification_state_update(prior, current, {})
+        self.assertTrue(result["notification_state_update_allowed"])
+        self.assertIn("score", result["notification_state_improvements"])
+        current["candidate"]["estimated_premium"] = 120000
+        blocked = notification_state_update(prior, current, {})
+        self.assertFalse(blocked["notification_state_update_allowed"])
+        self.assertIn("premium growth below material threshold", blocked["notification_state_suppression_reasons"])
 
     def test_attach_outcome_completeness_adds_badge_fields(self):
         row = {

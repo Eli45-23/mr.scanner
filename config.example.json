@@ -49,6 +49,9 @@
     "max_contracts_per_underlying": 600,
     "rotation_symbols_per_scan": 15,
     "rotation_safety_factor": 1.15,
+    "rotation_duration_min_seconds": 5,
+    "rotation_duration_max_seconds": 300,
+    "rotation_reset_gap_multiplier": 2.0,
     "contract_catalog_refresh_seconds": 900,
     "contract_catalog_max_per_symbol": 5000,
     "coverage_warning_age_seconds": 300,
@@ -74,12 +77,20 @@
     "zero_dte_tier1_min_premium": 250000,
     "zero_dte_tier1_max_spread_percent": 8,
     "zero_dte_tier1_min_price_context": 8,
-    "strict_cohort_min_meaningful_rate": 0.3
+    "strict_cohort_min_meaningful_rate": 0.3,
+    "strict_cohort_min_executable_positive_rate": 0.5,
+    "notification_dedupe_minutes": 15,
+    "notification_update_min_premium_growth": 0.25,
+    "notification_update_min_score_gain": 5,
+    "notification_update_min_price_confirmation_gain": 2,
+    "option_bar_unavailable_warning_rate": 0.02
   },
   "options_review_jobs": {
     "enabled": true,
     "outcomes_interval_seconds": 300,
     "oi_time_et": "09:45",
+    "oi_retry_interval_seconds": 900,
+    "oi_retry_end_et": "12:00",
     "package_time_et": "16:05",
     "review_limit": 1000
   },
