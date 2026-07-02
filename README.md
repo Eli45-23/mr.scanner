@@ -21,9 +21,13 @@ This repo is focused on the Options Whale Scanner workflow.
 | Alert outcome tracking | Implemented for 5m/15m/30m/60m windows |
 | Outcome diagnostics | Implemented; records returned bars, requested windows, and pending reasons |
 | Outcome compaction | Implemented as a safe dry-run-first cleanup tool |
-| Next-day OI confirmation | Implemented as a review tool; useful only after next trading-day OI exists |
+| Next-day OI confirmation | Automated for the prior trading session from 9:45 AM–12:00 PM ET, with retry and unresolved-contract handling |
 | Last good regular-session scan | Implemented; stale after-close scans do not wipe useful in-session dashboard data |
-| Learning/ranking from what mattered | Scaffolded/pending; requires accumulated outcome history |
+| Reliability calibration | Implemented by score × DTE × confidence × regime × direction using +0.10% moves and executable option returns |
+| Tier-1 quality gate | Requires aligned trend regime, 20 sessions, 30 paired effective samples, ≥30% meaningful moves, and ≥50% positive executable returns |
+| Stateful notification updates | Implemented per trading-session contract and direction; repeated alerts require material premium and quality improvement |
+| Adaptive symbol rotation | Implemented with persisted coverage, overnight reset, duration clamps, and per-symbol coverage age |
+| Option outcome health | Exposed on the dashboard and data-health API, including unavailable option bars and executable-return coverage |
 | Dashboard explanation clarity | Implemented on the main dashboard |
 
 ## Safety rules
@@ -45,7 +49,7 @@ Market data access is used for scanning, dashboard display, exports, and outcome
 Use the main dashboard:
 
 ```bash
-cd "/Users/DayTrade/Documents/trade scanner"
+cd /path/to/mr.scanner
 python3 scanner_dashboard.py --open
 ```
 
@@ -69,6 +73,9 @@ The dashboard provides:
 - score breakdowns
 - premium timing, pressure, follow-through, next-day OI, price context, and warning fields
 - clearer scan metrics such as contracts evaluated, passed filters, near misses, and stale quote rejects
+- option-bar availability, executable-return coverage, and endpoint-error health
+- reliability tables with meaningful-move and executable-return proof
+- per-symbol coverage age and adaptive-rotation diagnostics
 - last-good regular-session scan display after market close when fresh quotes are stale
 
 Use the outcome dashboard separately:
@@ -102,6 +109,22 @@ The scanner analyzes options contracts for:
 - same-contract follow-through
 
 All signals are probabilistic. Large options prints can be opening flow, closing flow, hedges, spreads, rolls, dealer positioning, or noisy index/ETF activity.
+
+## Tier-1 alert proof
+
+Tier-1 is intentionally conservative. A candidate must pass the normal freshness, score, aggression, spread, premium, confidence, and price-context checks, plus all of these learned-quality gates:
+
+```text
+regime: TRENDING_UP for bullish flow or TRENDING_DOWN for bearish flow
+distinct sessions: at least 20
+paired effective samples: at least 30
+15-minute +0.10% meaningful-move posterior rate: at least 30%
+15-minute positive executable option-return posterior rate: at least 50%
+```
+
+CHOPPY, RANGE_BOUND, LOW_VOLUME_FAKE_MOVE, REVERSAL_ATTEMPT, UNKNOWN, stale, misaligned, or unqualified flow stays dashboard-only. Negative reliability adjustments may be applied before a cohort qualifies; positive bonuses require both outcome metrics to pass.
+
+Repeated flow is tracked by trading-session contract and direction. A second notification requires at least 15 minutes, at least 25% additional premium, and one material improvement: score +5, a newly aligned regime, stronger aggression, or price-confirmation score +2. Otherwise the dashboard records a state update without another notification.
 
 ## Dashboard terms
 
@@ -149,7 +172,9 @@ The dashboard can keep showing that preserved scan with a market-closed notice i
 
 ### Awaiting next-day OI confirmation
 
-The scanner can estimate whether flow looks opening or closing using same-day data, but true confirmation requires next trading-day open interest. Do not treat same-day next-day OI review results as final.
+The scanner can estimate whether flow looks opening or closing using same-day data, but true confirmation requires next trading-day open interest. Same-day flow remains `suspected_opening`, `suspected_closing`, or unresolved.
+
+When the dashboard is running, the review job starts at 9:45 AM ET, selects every unique contract from the most recent prior trading session, and retries every 15 minutes until noon if no OI data is found. Expired or unavailable contracts remain explicitly unresolved; missing OI is never interpreted as closing flow.
 
 ## Symbol search
 
@@ -296,12 +321,21 @@ The apply mode creates a backup before replacing the runtime outcome file.
 
 ### Review next-day OI
 
-Run this only after next trading-day OI should be available:
+The dashboard runs this automatically. To review manually after next-trading-day OI should be available:
 
 ```bash
 python3 tools/review_next_day_oi.py --limit 100 --dry-run
 python3 tools/review_next_day_oi.py --limit 100
+python3 tools/review_next_day_oi.py --source-date 2026-07-01
 ```
+
+### Export a daily review package
+
+```bash
+python3 tools/export_review_package.py --date 2026-07-01 --start 09:00 --end 16:00
+```
+
+The exporter selects outcome rows by `detected_at`, OI reviews by `original_time`, and operational logs by their event timestamp. This prevents next-day reviews from being assigned to the wrong trading session. The ZIP includes options-flow logs, price observations, outcome data, coverage statistics, regime heartbeats, OI reviews, and dashboard snapshots.
 
 ### Export whale-flow history
 
@@ -323,7 +357,7 @@ python3 tools/export_options_whale_history.py --format csv
 9. Use your chart for confirmation.
 10. Let outcome tracking review alert performance after enough bars exist.
 11. Review the outcome dashboard after the market session or later in the day.
-12. Run next-day OI review only on the next trading day after OI updates.
+12. Check the next-day OI addendum after the automated 9:45 AM–12:00 PM retry window.
 
 After market close, the dashboard may show the last good regular-session scan instead of an empty stale after-close scan.
 
@@ -342,6 +376,15 @@ min_volume_oi_ratio: 2.0
 max_spread_percent: 15
 max_contracts_per_scan: 10000
 max_results: 100
+reliability_min_sessions: 20
+reliability_min_effective_samples: 30
+strict_cohort_min_meaningful_rate: 0.30
+strict_cohort_min_executable_positive_rate: 0.50
+notification_dedupe_minutes: 15
+notification_update_min_premium_growth: 0.25
+rotation_duration_min_seconds: 5
+rotation_duration_max_seconds: 300
+option_bar_unavailable_warning_rate: 0.02
 ```
 
 Index/ETF 0DTE flow has stricter thresholds:
@@ -369,6 +412,9 @@ POST /api/options-whales/auto-scan/pause
 POST /api/options-whales/auto-scan/resume
 GET  /api/options-whales/universe/status
 POST /api/options-whales/universe/rebuild
+GET  /api/options-whales/coverage
+GET  /api/options-whales/reliability
+GET  /api/options-whales/data-health
 GET  /api/options-whales/export.json
 GET  /api/options-whales/export.csv
 ```
@@ -388,7 +434,14 @@ stale_quote_rejection_count
 max_contracts_per_scan
 contract_cap_reached
 scan_session_state
+coverage_rotation_symbols_dynamic
+coverage_cycle_duration_ewma_seconds
+coverage_rotation_timing_reset
+coverage_rotation_duration_clamped
+coverage_symbol_ages_seconds
 ```
+
+`/api/options-whales/data-health` reports the latest outcome detection date, total episodes, unavailable option-bar count/rate, executable-window coverage, endpoint errors, and the configured warning threshold. The dashboard warns when unavailable option bars exceed 2% or an endpoint error exists.
 
 `candidates_found` is preserved for backward compatibility, but dashboard copy should prefer `Passed filters` because that is what the number represents.
 
@@ -546,9 +599,11 @@ Important generated paths:
 logs/options_whale_alerts.jsonl
 logs/options_whale_scans.jsonl
 logs/options_oi_reviews.jsonl
+logs/options_price_observations.jsonl
 data/options_universe.json
 data/options_whale_latest.json
 data/options_whale_last_good_regular_session.json
+data/options_whale_episode_outcomes.jsonl
 data/options_whale_outcomes.jsonl
 data/options_whale_outcomes_compacted.jsonl
 data/options_unusualness_baseline.jsonl
@@ -660,6 +715,8 @@ priority_batch_size
 
 If the contract cap is reached, the dashboard should warn that later symbols may not have been scanned in that run.
 
+Adaptive rotation continuously sizes the rotating symbol batch from measured scan duration and the coverage-age target. Overnight/session gaps reset the timing estimate, measured duration is clamped to 5–300 seconds, and requested rotating symbols cannot exceed the available rotating universe.
+
 ### Outcome stats look incomplete
 
 Outcome tracking needs future bars after an alert. Alerts late in the session may become `insufficient_future_session` because there is not enough regular-session time left for 5m/15m/30m/60m windows.
@@ -696,12 +753,10 @@ Do not add order execution. Any future code that interacts with trading endpoint
 
 Near-term:
 
-- confirm exporter reads the intended scanner history source after storage changes
 - richer pending-outcome re-review workflow after bars become available
-- true next-day OI confirmation after future OI data is available
-- learned quality scoring after enough outcome history is collected
 - cleaner dashboard group stats for which flow types worked best
-- scan rotation or sharding if contract-cap starvation becomes a practical issue
+- multi-session monitoring of Tier-1 meaningful-move and executable-return calibration
+- next-day OI coverage monitoring for expired same-day contracts
 
 Longer-term:
 
