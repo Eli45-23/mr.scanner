@@ -1140,6 +1140,17 @@ class OptionsWhaleScanner:
         core = [symbol for symbol in self._always_scan_symbols() if symbol in set(underlyings)]
         rotating = [symbol for symbol in underlyings if symbol not in set(core)]
         state = self._load_scan_state()
+        last_scanned_at = state.setdefault("last_scanned_at", {})
+        now_priority = datetime.now(timezone.utc)
+        pre_scan_ages: Dict[str, float] = {}
+        for symbol in rotating:
+            stamp = _parse_iso_time(last_scanned_at.get(symbol))
+            age = (now_priority - stamp).total_seconds() if stamp else float("inf")
+            pre_scan_ages[symbol] = age
+        pre_scan_stale_symbols = {
+            symbol for symbol, age in pre_scan_ages.items()
+            if age > float(self.whale.get("coverage_warning_age_seconds", 300))
+        }
         cursor = int(state.get("symbol_cursor") or 0) % max(1, len(rotating))
         previous_cycle = _parse_iso_time(state.get("last_updated"))
         now_utc = datetime.now(timezone.utc)
@@ -1155,7 +1166,15 @@ class OptionsWhaleScanner:
         cycle_ewma = prior_ewma * 0.7 + measured_cycle * 0.3
         dynamic_count = math.ceil(len(rotating) * cycle_ewma / target_age * float(self.whale.get("rotation_safety_factor", 1.15))) if rotating else 0
         rotation_count = min(len(rotating), max(1, int(self.whale.get("rotation_symbols_per_scan", 15)), dynamic_count)) if rotating else 0
-        rotation_page = [rotating[(cursor + offset) % len(rotating)] for offset in range(min(rotation_count, len(rotating)))] if rotating else []
+        rotation_page: List[str] = []
+        if rotating:
+            stale_first = sorted(pre_scan_stale_symbols, key=lambda symbol: (-pre_scan_ages[symbol], symbol))
+            cyclic = [rotating[(cursor + offset) % len(rotating)] for offset in range(len(rotating))]
+            for symbol in stale_first + cyclic:
+                if symbol not in rotation_page:
+                    rotation_page.append(symbol)
+                if len(rotation_page) >= rotation_count:
+                    break
         selected_underlyings = core + rotation_page
         self.last_scan_order = {
             "universe_size": len(entries),
@@ -1176,7 +1195,6 @@ class OptionsWhaleScanner:
         rotating_budget = max_contracts - min(max_contracts, core_quota * len(core))
         rotation_quota = min(per_symbol_cap, max(1, rotating_budget // max(1, len(rotation_page)))) if rotation_page else 0
         contract_cursors = state.setdefault("contract_cursors", {})
-        last_scanned_at = state.setdefault("last_scanned_at", {})
         catalog_counts: Dict[str, int] = {}
         selected_counts: Dict[str, int] = {}
         failures: Dict[str, str] = {}
@@ -1237,6 +1255,7 @@ class OptionsWhaleScanner:
             "coverage_core_symbols": core,
             "coverage_symbol_ages_seconds": symbol_ages,
             "coverage_stale_symbols": stale_symbols,
+            "coverage_stale_symbols_prioritized": [symbol for symbol in rotation_page if symbol in pre_scan_stale_symbols],
             "coverage_warning": f"{len(stale_symbols)} symbols exceed the {warning_age}s coverage target." if stale_symbols else "",
             "coverage_warning_type": "startup_warmup" if warmup_symbols else "sustained_miss" if stale_symbols else "none",
             "coverage_catalog_counts": catalog_counts,
@@ -1684,6 +1703,7 @@ class OptionsWhaleScanner:
         except OSError:
             pass
         prior_alerts = self.storage.latest_alerts(limit=5000)
+        prior_qualified = self.storage.latest_qualified_events(limit=10000)
         prior_states: Dict[tuple[str, str, str], Dict[str, Any]] = {}
         for row in prior_alerts:
             key = build_notification_state_key(row)
@@ -1691,6 +1711,11 @@ class OptionsWhaleScanner:
             prior_stamp = _parse_iso_time(_key_value(prior_states.get(key, {}), "time_detected") or prior_states.get(key, {}).get("scanner_detected_time") or prior_states.get(key, {}).get("timestamp"))
             if all(key) and (not prior_stamp or (current_stamp and current_stamp >= prior_stamp)):
                 prior_states[key] = row
+        qualified_states: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for row in prior_qualified:
+            key = build_notification_state_key(row)
+            if all(key):
+                qualified_states[key] = row
         notification_window = timedelta(minutes=int(effective_cfg.get("notification_dedupe_minutes", 15)))
         now = datetime.now(timezone.utc)
         recent_symbol_counts: Dict[str, int] = {}
@@ -1729,7 +1754,22 @@ class OptionsWhaleScanner:
                 self.storage.append_alert(result)
                 prior_states[state_key] = result
             if result.get("alert_tier") in {"Tier 1", "Tier 2"}:
-                self.storage.append_qualified_event(result)
+                prior_qualified_state = qualified_states.get(state_key)
+                append_dashboard_state = prior_qualified_state is None
+                if prior_qualified_state is not None:
+                    dashboard_update = notification_state_update(prior_qualified_state, result, effective_cfg)
+                    tier_changed = str(prior_qualified_state.get("alert_tier")) != str(result.get("alert_tier"))
+                    append_dashboard_state = bool(dashboard_update["notification_state_update_allowed"] or tier_changed)
+                    result.update({
+                        "dashboard_state_update_allowed": append_dashboard_state,
+                        "dashboard_state_suppression_reason": "" if append_dashboard_state else "; ".join(dashboard_update["notification_state_suppression_reasons"]),
+                        "dashboard_update_type": "material_state_update" if dashboard_update["notification_state_update_allowed"] else "tier_change" if tier_changed else "suppressed_repeat",
+                    })
+                else:
+                    result.update({"dashboard_state_update_allowed": True, "dashboard_state_suppression_reason": "", "dashboard_update_type": "initial_state"})
+                if append_dashboard_state:
+                    self.storage.append_qualified_event(result)
+                    qualified_states[state_key] = result
         episode_groups: Dict[str, List[Dict[str, Any]]] = {}
         for result in results:
             episode_id = str(result.get("flow_episode_id") or "")

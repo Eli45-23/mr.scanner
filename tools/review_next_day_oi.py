@@ -79,7 +79,7 @@ def append_reviews(rows: Iterable[Dict[str, Any]], storage: OptionsWhaleStorage)
             existing[key] = row
 
 
-def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, latest_only: bool = False, source_date: str | None = None, as_of: date | None = None) -> Dict[str, Any]:
+def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, latest_only: bool = False, source_date: str | None = None, as_of: date | None = None, minimum_coverage: float = 0.90) -> Dict[str, Any]:
     scanner_app.load_dotenv()
     config = scanner_app.load_config(None)
     storage = OptionsWhaleStorage(ROOT)
@@ -106,16 +106,18 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
     for row in reviews:
         status = str(row.get("next_day_oi_status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
+    coverage_rate = len(oi_map) / len(alerts) if alerts else 0.0
     return {
         "mode": "live_contracts",
         "alerts_checked": len(alerts),
         "source_session_date": source_day,
         "unique_contract_count": len(alerts),
         "oi_values_found": len(oi_map),
-        "oi_coverage_rate": round(len(oi_map) / len(alerts), 4) if alerts else None,
+        "oi_coverage_rate": round(coverage_rate, 4) if alerts else None,
+        "minimum_coverage_required": minimum_coverage,
         "reviewed_count": len(reviews),
         "unresolved_count": len(unresolved),
-        "complete": len(oi_map) > 0,
+        "complete": bool(alerts) and coverage_rate >= minimum_coverage,
         "dry_run": dry_run,
         "output_path": str(storage.oi_reviews_path.relative_to(ROOT)),
         "statuses": statuses,

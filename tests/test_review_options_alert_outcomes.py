@@ -17,6 +17,9 @@ class FakeBarsClient:
         self.requests.append({"symbols": symbols, "start": start, "end": end, "timeframe": timeframe})
         return {symbol: self.bars_by_symbol.get(symbol, []) for symbol in symbols}
 
+    def data_health(self):
+        return {"request_diagnostics": {}}
+
 
 class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
     def latest_payload(self):
@@ -28,6 +31,17 @@ class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
                     "whale_score": 90,
                     "classification": "EXTREME WHALE FLOW",
                     "alert_tier": "Tier 2",
+                    "flow_bias": "BULLISH",
+                    "reliability_bucket": "90+|0DTE|MEDIUM|TRENDING_UP|BULLISH",
+                    "reliability_status": "penalty_only_insufficient_history",
+                    "reliability_meaningful_rate": 0.44,
+                    "reliability_executable_positive_rate": 0.50,
+                    "reliability_effective_samples": 8.0,
+                    "reliability_session_count": 1,
+                    "reliability_qualified": False,
+                    "reliability_dual_metric_passed": False,
+                    "reliability_block_reasons": ["insufficient sessions or paired effective samples"],
+                    "cohort_tier1_gate_reasons": ["Tier 1 reliability is not qualified"],
                     "candidate": {
                         "underlying_symbol": "ADBE",
                         "option_symbol": "ADBETESTC",
@@ -74,6 +88,24 @@ class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
         self.assertEqual(row["outcome_window_minutes_requested"], [5, 15, 30, 60])
         self.assertIn("bars_start_requested", row)
         self.assertIn("bars_end_requested", row)
+        self.assertEqual(row["reliability_status"], "penalty_only_insufficient_history")
+        self.assertEqual(row["reliability_meaningful_rate"], 0.44)
+        self.assertEqual(row["reliability_block_reasons"], ["insufficient sessions or paired effective samples"])
+
+    def test_option_bars_retry_and_record_attempt_diagnostics(self):
+        detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
+        class RetryClient(FakeBarsClient):
+            def __init__(self, bars_by_symbol):
+                super().__init__(bars_by_symbol)
+                self.option_calls = 0
+            def get_option_bars(self, symbols, *, start, end):
+                self.option_calls += 1
+                return {} if self.option_calls == 1 else {symbols[0]: [{"t": detected.isoformat(), "o": 1, "h": 1, "l": 1, "c": 1}]}
+        client = RetryClient({"ADBE": self.bars(detected, [0, 5, 15, 30, 60])})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_review(Path(temp_dir), client)
+        self.assertEqual(client.option_calls, 2)
+        self.assertEqual([item["rows"] for item in result["reviewed"][0]["option_bar_fetch_attempts"]], [0, 1])
 
     def test_duplicate_pending_reviews_are_not_appended_repeatedly(self):
         detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)

@@ -83,7 +83,9 @@
     "notification_update_min_premium_growth": 0.25,
     "notification_update_min_score_gain": 5,
     "notification_update_min_price_confirmation_gain": 2,
-    "option_bar_unavailable_warning_rate": 0.02
+    "option_bar_unavailable_warning_rate": 0.02,
+    "option_bar_retry_attempts": 3,
+    "option_bar_retry_delay_seconds": 0.25
   },
   "options_review_jobs": {
     "enabled": true,
@@ -91,6 +93,7 @@
     "oi_time_et": "09:45",
     "oi_retry_interval_seconds": 900,
     "oi_retry_end_et": "12:00",
+    "oi_minimum_coverage": 0.9,
     "package_time_et": "16:05",
     "review_limit": 1000
   },

@@ -208,6 +208,7 @@ def review_alerts(
 ) -> Dict[str, Any]:
     scanner_app.load_dotenv()
     config = scanner_app.load_config(None)
+    whale_config = config.get("options_whale_scanner", {})
     client = build_client(config)
     now_utc = datetime.now(timezone.utc)
     latest = read_latest()
@@ -250,11 +251,29 @@ def review_alerts(
         option_symbol = str(c.get("option_symbol") or "")
         option_bars: List[Dict[str, Any]] = []
         option_quotes: List[Dict[str, Any]] = []
+        option_bar_attempts: List[Dict[str, Any]] = []
         if option_symbol and hasattr(client, "get_option_bars"):
-            try:
-                option_bars = client.get_option_bars([option_symbol], start=start, end=end).get(option_symbol, [])
-            except Exception:
-                option_bars = []
+            max_attempts = max(1, int(whale_config.get("option_bar_retry_attempts", 3)))
+            retry_delay = max(0.0, float(whale_config.get("option_bar_retry_delay_seconds", 0.25)))
+            for attempt in range(1, max_attempts + 1):
+                error = ""
+                try:
+                    option_bars = client.get_option_bars([option_symbol], start=start, end=end).get(option_symbol, [])
+                except Exception as exc:
+                    option_bars = []
+                    error = f"{type(exc).__name__}: {exc}"[:240]
+                diagnostic = ((client.data_health().get("request_diagnostics", {}) if hasattr(client, "data_health") else {}).get("historical_option_bars") or {})
+                option_bar_attempts.append({
+                    "attempt": attempt,
+                    "rows": len(option_bars),
+                    "error": error,
+                    "http_status": diagnostic.get("http_status"),
+                    "error_category": diagnostic.get("error_category"),
+                })
+                if option_bars:
+                    break
+                if attempt < max_attempts and retry_delay:
+                    time.sleep(retry_delay)
         if option_symbol:
             option_quotes = storage.option_quote_observations(option_symbol, limit=10000)
         option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS)
@@ -275,10 +294,25 @@ def review_alerts(
             "market_regime": row.get("market_regime") or c.get("market_regime") or "UNKNOWN",
             "classification": row.get("classification"),
             "alert_tier": row.get("alert_tier"),
+            "flow_bias": row.get("flow_bias") or row.get("flow_episode_bias"),
             "score_components": row.get("score_components"),
+            "reliability_bucket": row.get("reliability_bucket"),
+            "reliability_status": row.get("reliability_status"),
+            "reliability_rate": row.get("reliability_rate"),
+            "reliability_meaningful_rate": row.get("reliability_meaningful_rate"),
+            "reliability_executable_positive_rate": row.get("reliability_executable_positive_rate"),
+            "reliability_effective_samples": row.get("reliability_effective_samples"),
+            "reliability_session_count": row.get("reliability_session_count"),
+            "reliability_qualified": bool(row.get("reliability_qualified")),
+            "reliability_dual_metric_passed": bool(row.get("reliability_dual_metric_passed")),
+            "reliability_block_reasons": list(row.get("reliability_block_reasons") or []),
+            "cohort_tier1_gate_passed": bool(row.get("cohort_tier1_gate_passed")),
+            "cohort_tier1_gate_reasons": list(row.get("cohort_tier1_gate_reasons") or []),
+            "notification_eligible": bool(row.get("should_notify")),
             **outcome,
             **option_outcome,
             "option_data_diagnostics": option_data_diagnostics,
+            "option_bar_fetch_attempts": option_bar_attempts,
             **build_outcome_diagnostics(
                 bars=bars,
                 start=start,

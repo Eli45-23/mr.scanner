@@ -175,6 +175,18 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertLessEqual(result["coverage_cycle_duration_ewma_seconds"], 300)
             self.assertLessEqual(result["coverage_rotation_symbols_requested"], result["underlying_symbols_considered"])
 
+    def test_rotation_prioritizes_stale_symbols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_universe(root, [{"underlying_symbol": symbol, "contract_count": 10} for symbol in ("AAA", "BBB", "CCC")])
+            now = datetime.now(timezone.utc)
+            state_path = root / "data" / "options_whale_scan_state.json"
+            state_path.write_text(json.dumps({"symbol_cursor": 0, "contract_cursors": {}, "last_scanned_at": {"AAA": now.isoformat(), "BBB": (now - timedelta(minutes=20)).isoformat(), "CCC": now.isoformat()}, "last_updated": now.isoformat(), "cycle_duration_ewma_seconds": 30}), encoding="utf-8")
+            scanner = OptionsWhaleScanner({"options_whale_scanner": {"enabled": True, "always_scan_symbols": [], "priority_seed_symbols": ["AAA", "BBB", "CCC"], "rotation_symbols_per_scan": 1, "coverage_warning_age_seconds": 300, "max_contracts_per_scan": 10, "min_score": 99, "min_premium": 999999999}}, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
+            result = scanner.scan()
+            self.assertEqual(result["coverage_rotation_page"][0], "BBB")
+            self.assertIn("BBB", result["coverage_stale_symbols_prioritized"])
+
     def test_no_candidate_scan_returns_near_misses_and_rejection_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

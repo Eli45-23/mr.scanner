@@ -651,7 +651,8 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
     if oi_window_open and retry_due and state.get("oi_day") != current.date().isoformat():
         try:
             from tools.review_next_day_oi import review_from_live_contracts
-            results["oi"] = review_from_live_contracts(limit=int(settings.get("review_limit", 1000)))
+            minimum_coverage = min(1.0, max(0.0, float(settings.get("oi_minimum_coverage", 0.90))))
+            results["oi"] = review_from_live_contracts(limit=int(settings.get("review_limit", 1000)), minimum_coverage=minimum_coverage)
             state["oi_last_attempt"] = current.isoformat()
             state["oi_source_day"] = results["oi"].get("source_session_date")
             state["oi_contract_count"] = results["oi"].get("unique_contract_count")
@@ -942,7 +943,38 @@ def options_whales_reliability() -> Dict[str, Any]:
     table = build_reliability_table(outcomes, cfg)
     rows = [{"bucket": "|".join(key), **value} for key, value in table.items()]
     rows.sort(key=lambda row: (row.get("reliability_effective_samples", 0), row.get("bucket", "")), reverse=True)
-    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows}
+    latest: Dict[str, Dict[str, Any]] = {}
+    for outcome in outcomes:
+        key = str(outcome.get("alert_key") or outcome.get("episode_id") or "")
+        if key:
+            latest[key] = outcome
+    min_sessions = int(cfg.get("reliability_min_sessions", 20))
+    min_samples = float(cfg.get("reliability_min_effective_samples", 30))
+    shadow = []
+    for outcome in latest.values():
+        window = next((item for item in outcome.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        option_window = next((item for item in outcome.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        if not window or int(outcome.get("whale_score") or 0) < int(cfg.get("tier1_min_score", 95)):
+            continue
+        bias = str(outcome.get("flow_bias") or "").upper()
+        regime = str(outcome.get("market_regime") or "UNKNOWN").upper()
+        aligned = (bias == "BULLISH" and regime == "TRENDING_UP") or (bias == "BEARISH" and regime == "TRENDING_DOWN")
+        signed = window.get("signed_move_pct")
+        executable = option_window.get("estimated_executable_return_pct") if option_window else None
+        shadow.append({"aligned": aligned, "meaningful": isinstance(signed, (int, float)) and signed >= 0.10, "executable_positive": (executable > 0) if isinstance(executable, (int, float)) else None})
+    aligned_rows = [row for row in shadow if row["aligned"]]
+    paired = [row for row in aligned_rows if row["executable_positive"] is not None]
+    session_count = max((int(row.get("reliability_session_count") or 0) for row in rows), default=0)
+    effective_sample_count = max((float(row.get("reliability_effective_samples") or 0) for row in rows), default=0.0)
+    shadow_summary = {
+        "candidate_count": len(shadow), "aligned_count": len(aligned_rows), "paired_outcome_count": len(paired), "paired_sample_count": round(effective_sample_count, 2),
+        "aligned_meaningful_rate": round(sum(row["meaningful"] for row in aligned_rows) / len(aligned_rows), 4) if aligned_rows else None,
+        "aligned_executable_positive_rate": round(sum(row["executable_positive"] for row in paired) / len(paired), 4) if paired else None,
+        "session_count": session_count, "required_sessions": min_sessions, "required_paired_samples": min_samples,
+        "sessions_remaining": max(0, min_sessions - session_count), "paired_samples_remaining": max(0, round(min_samples - effective_sample_count, 2)),
+        "tier1_gate_unchanged": True,
+    }
+    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows, "shadow_tier1": shadow_summary}
 
 
 def options_whales_filters() -> Dict[str, Any]:
@@ -4541,6 +4573,11 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Old prints', latest.stale_count ?? latest.diagnostics?.stale_count ?? 0, (latest.stale_count ?? latest.diagnostics?.stale_count ?? 0) ? 'warn' : ''),
         card('Stale coverage', (coverage.stale_symbols || []).length, (coverage.stale_symbols || []).length ? 'warn' : 'good'),
         card('Reliability buckets', reliability.bucket_count ?? 0),
+        card('Shadow Tier-1 aligned', `${reliability.shadow_tier1?.aligned_count ?? 0} / ${reliability.shadow_tier1?.candidate_count ?? 0}`),
+        card('Shadow +0.10% rate', reliability.shadow_tier1?.aligned_meaningful_rate !== null && reliability.shadow_tier1?.aligned_meaningful_rate !== undefined ? `${Math.round(reliability.shadow_tier1.aligned_meaningful_rate * 100)}%` : 'No data'),
+        card('Shadow option-win rate', reliability.shadow_tier1?.aligned_executable_positive_rate !== null && reliability.shadow_tier1?.aligned_executable_positive_rate !== undefined ? `${Math.round(reliability.shadow_tier1.aligned_executable_positive_rate * 100)}%` : 'No data'),
+        card('Tier-1 session progress', `${reliability.shadow_tier1?.session_count ?? 0} / ${reliability.shadow_tier1?.required_sessions ?? 20}`, (reliability.shadow_tier1?.sessions_remaining ?? 1) ? 'warn' : 'good'),
+        card('Tier-1 paired outcomes', `${reliability.shadow_tier1?.paired_sample_count ?? 0} / ${reliability.shadow_tier1?.required_paired_samples ?? 30}`, (reliability.shadow_tier1?.paired_samples_remaining ?? 1) ? 'warn' : 'good'),
         card('Option-bar unavailable', `${dataHealth.option_outcome_health?.option_bars_unavailable_count ?? 0} / ${dataHealth.option_outcome_health?.total_episodes ?? 0}`, dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
         card('Executable return coverage', dataHealth.option_outcome_health?.executable_window_coverage !== null && dataHealth.option_outcome_health?.executable_window_coverage !== undefined ? `${Math.round(dataHealth.option_outcome_health.executable_window_coverage * 100)}%` : 'Unknown', dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
       ].join('');

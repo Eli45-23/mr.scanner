@@ -1,7 +1,11 @@
 import unittest
+import tempfile
 from datetime import date
+from pathlib import Path
+from unittest import mock
 
 from scanner.options_oi_review import classify_next_day_oi, fetch_next_day_oi_map, review_alerts_with_next_day_oi
+from tools import review_next_day_oi
 
 
 class FakeContractClient:
@@ -81,6 +85,16 @@ class OptionsOiReviewTests(unittest.TestCase):
         oi_map = fetch_next_day_oi_map(client, [self.alert()])
         self.assertEqual(oi_map["QQQ260618P00726000"], 700)
         self.assertEqual(client.calls[0]["underlying_symbols"], ["QQQ"])
+
+    def test_live_review_requires_minimum_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = mock.Mock()
+            storage.latest_episodes.return_value = [self.alert(symbol="A"), self.alert(symbol="B")]
+            storage.oi_reviews_path = Path(tmp) / "logs" / "options_oi_reviews.jsonl"
+            with mock.patch.object(review_next_day_oi, "ROOT", Path(tmp)), mock.patch.object(review_next_day_oi, "OptionsWhaleStorage", return_value=storage), mock.patch.object(review_next_day_oi.scanner_app, "load_dotenv"), mock.patch.object(review_next_day_oi.scanner_app, "load_config", return_value={}), mock.patch.object(review_next_day_oi, "build_client"), mock.patch.object(review_next_day_oi, "fetch_next_day_oi_map", return_value={"A": 10}), mock.patch.object(review_next_day_oi, "append_reviews"):
+                result = review_next_day_oi.review_from_live_contracts(as_of=date(2026, 6, 18), minimum_coverage=0.9)
+            self.assertEqual(result["oi_coverage_rate"], 0.5)
+            self.assertFalse(result["complete"])
 
 
 if __name__ == "__main__":

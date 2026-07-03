@@ -28,6 +28,7 @@ This repo is focused on the Options Whale Scanner workflow.
 | Stateful notification updates | Implemented per trading-session contract and direction; repeated alerts require material premium and quality improvement |
 | Adaptive symbol rotation | Implemented with persisted coverage, overnight reset, duration clamps, and per-symbol coverage age |
 | Option outcome health | Exposed on the dashboard and data-health API, including unavailable option bars and executable-return coverage |
+| Shadow Tier-1 proof | Tracks aligned candidates, +0.10% outcomes, executable returns, session progress, and paired-sample progress without relaxing production gates |
 | Dashboard explanation clarity | Implemented on the main dashboard |
 
 ## Safety rules
@@ -174,7 +175,7 @@ The dashboard can keep showing that preserved scan with a market-closed notice i
 
 The scanner can estimate whether flow looks opening or closing using same-day data, but true confirmation requires next trading-day open interest. Same-day flow remains `suspected_opening`, `suspected_closing`, or unresolved.
 
-When the dashboard is running, the review job starts at 9:45 AM ET, selects every unique contract from the most recent prior trading session, and retries every 15 minutes until noon if no OI data is found. Expired or unavailable contracts remain explicitly unresolved; missing OI is never interpreted as closing flow.
+When the dashboard is running, the review job starts at 9:45 AM ET, selects every unique contract from the most recent prior trading session, and retries every 15 minutes until noon or at least 90% contract coverage is reached. Partial runs remain incomplete. Expired or unavailable contracts remain explicitly unresolved; missing OI is never interpreted as closing flow.
 
 ## Symbol search
 
