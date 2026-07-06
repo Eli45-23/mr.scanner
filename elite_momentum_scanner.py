@@ -212,6 +212,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "interval_minutes": [1, 3, 5, 10, 15],
         "target_move_pct": 0.30,
+        "meaningful_move_pct": 0.10,
     },
     "discovery": {
         "enabled": True,
@@ -1904,6 +1905,13 @@ class StateStore:
             states.pop(symbol.upper(), None)
         else:
             states[symbol.upper()] = value
+
+    def get_orchestrator_state(self, key: str) -> Optional[Dict[str, Any]]:
+        value = self.data.get("orchestrator_states", {}).get(key)
+        return dict(value) if isinstance(value, dict) else None
+
+    def set_orchestrator_state(self, key: str, value: Dict[str, Any]) -> None:
+        self.data.setdefault("orchestrator_states", {})[key] = dict(value)
 
 
 # ------------------------------------------------------------
@@ -4571,8 +4579,10 @@ class EliteScanner:
         self.post_alert_tracker = PostAlertPerformanceTracker(
             writer.jsonl_path.parent / "post_alert_performance.jsonl",
             state_store.path.parent / "post_alert_performance_pending.json",
+            episode_path=writer.jsonl_path.parent / "alert_episodes.jsonl",
             intervals=performance_config.get("interval_minutes", [1, 3, 5, 10, 15]),
             target_move_pct=float(performance_config.get("target_move_pct", 0.30)),
+            meaningful_move_pct=float(performance_config.get("meaningful_move_pct", 0.10)),
         )
         self.decision_history: List[Dict[str, Any]] = []
         self.last_chop_warning_at: Optional[datetime] = None
@@ -6059,9 +6069,7 @@ class EliteScanner:
         alert.phase3_heads_up_sent = True
         alert.phase3_delivery_requested = True
         alert.phase3_heads_up_block_reason = ""
-        alert.phase3_heads_up_final_decision = (
-            "TELEGRAM_ATTEMPTED" if alert.stock_only_heads_up_allowed else "PHASE3_HEADS_UP"
-        )
+        alert.phase3_heads_up_final_decision = "ELIGIBLE_PENDING_DELIVERY"
         alert.phase3_heads_up_final_block_reason = ""
         alert.text_alert_reason = "Phase 3 heads-up only: confirm on chart"
         alert.notes.append("Phase 3 heads-up only: confirm on chart")
@@ -7029,6 +7037,11 @@ class EliteScanner:
             alert.option_quote_age_seconds = freshness["quote_age_seconds"]
             alert.option_max_quote_age_seconds = freshness["max_allowed_quote_age_seconds"]
             alert.option_stale_reason = freshness["stale_reason"]
+            if freshness["stale_reason"]:
+                if "stale_quote" not in alert.option_quality_reasons:
+                    alert.option_quality_reasons.append("stale_quote")
+                alert.option_quality_message = "; ".join(filter(None, [alert.option_quality_message, freshness["stale_reason"]]))
+                alert.option_tradable = False
             alert.option_data_source = contract.feed or "unknown"
             alert.option_fallback_used = contract.feed == "indicative"
             alert.option_timestamp_source_field = freshness["timestamp_source_field"]
@@ -7550,15 +7563,40 @@ class EliteScanner:
             alert.text_alert_reason = decision["decision_reason"]
             alert.suppressed_by_chop = False
             alert.notes.append("orchestrator: strong trend remains visible, but move is do-not-chase")
+        state_key = f"{alert.symbol}:{decision['final_alert_type']}:{decision['final_direction']}"
+        previous_state = self.state_store.get_orchestrator_state(state_key)
+        current_state = {
+            "timestamp": alert.timestamp.isoformat(),
+            "final_alert_type": decision["final_alert_type"],
+            "final_direction": decision["final_direction"],
+            "final_priority": decision["final_priority"],
+            "decision_reason": decision["decision_reason"],
+            "trade_ready": decision["trade_ready"],
+            "telegram_allowed": decision["telegram_allowed"],
+        }
+        material_change = (
+            previous_state is None
+            or abs(int(current_state["final_priority"]) - int(previous_state.get("final_priority") or 0)) >= int(settings.get("state_change_min_priority_delta", 5))
+            or current_state["decision_reason"] != previous_state.get("decision_reason")
+            or current_state["trade_ready"] != previous_state.get("trade_ready")
+            or current_state["telegram_allowed"] != previous_state.get("telegram_allowed")
+        )
+        decision["state_update_type"] = "INITIAL" if previous_state is None else "MATERIAL_CHANGE" if material_change else "SUPPRESSED_REPEAT"
+        decision["state_event_logged"] = bool(material_change)
+        decision["state_suppression_reason"] = "" if material_change else "No material type, direction, priority, reason, eligibility, or trade-ready change"
+        if material_change:
+            self.state_store.set_orchestrator_state(state_key, current_state)
+            self.state_store.save()
         try:
             path = LOG_DIR / "alert_orchestrator.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({
-                    "timestamp": alert.timestamp.isoformat(),
-                    "symbol": alert.symbol,
-                    **decision,
-                }, default=str, sort_keys=True) + "\n")
+            if material_change:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "timestamp": alert.timestamp.isoformat(),
+                        "symbol": alert.symbol,
+                        **decision,
+                    }, default=str, sort_keys=True) + "\n")
         except OSError as exc:
             logger.warning("Alert orchestrator log failed safely: %s", redact_notification_error(exc))
         return decision
@@ -7688,9 +7726,9 @@ class EliteScanner:
         self.apply_alert_priority(alert)
         logger.info(alert.short_summary())
         self.writer.write(alert)
+        self.notifier.send(alert)
         if self.post_alert_performance_enabled and not alert.duplicate_context:
             self.post_alert_tracker.register(alert)
-        self.notifier.send(alert)
         self.state_store.set_last_alert_time(alert.dedupe_key(), now_utc())
         if (
             alert.orchestrator_final_alert_type == "TREND_CONTEXT"
@@ -9427,7 +9465,8 @@ def run_tests() -> int:
             )
             scanner.evaluate_phase3_heads_up(alert, self.make_phase3_heads_up_snapshot(), "Fresh", {})
             self.assertTrue(alert.phase3_heads_up_sent)
-            self.assertEqual(alert.phase3_heads_up_final_decision, "TELEGRAM_ATTEMPTED")
+            self.assertEqual(alert.phase3_heads_up_final_decision, "ELIGIBLE_PENDING_DELIVERY")
+            self.assertFalse(alert.phase3_delivery_attempted)
             self.assertTrue(alert.market_context_missing_warning)
             self.assertTrue(alert.option_stale_did_not_block_heads_up)
             message = phase3_heads_up_message(alert)
@@ -9472,7 +9511,8 @@ def run_tests() -> int:
             self.assertTrue(alert.stock_only_heads_up_allowed)
             self.assertTrue(alert.watch_only_late_move)
             self.assertEqual(alert.phase3_heads_up_type, "WATCH_ONLY_LATE_MOVE")
-            self.assertEqual(alert.phase3_heads_up_final_decision, "TELEGRAM_ATTEMPTED")
+            self.assertEqual(alert.phase3_heads_up_final_decision, "ELIGIBLE_PENDING_DELIVERY")
+            self.assertFalse(alert.phase3_delivery_attempted)
             self.assertFalse(alert.sms_allowed)
             message = phase3_heads_up_message(alert)
             self.assertIn("WATCH ONLY — LATE / DO NOT CHASE", message)

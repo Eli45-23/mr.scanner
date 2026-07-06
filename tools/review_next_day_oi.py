@@ -90,7 +90,10 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
     else:
         source_day, alerts = prior_session_episodes(all_rows, as_of=as_of or datetime.now(timezone.utc).date())
     alerts = _unique_by_contract(alerts)
-    oi_map = fetch_next_day_oi_map(build_client(config), alerts)
+    client = build_client(config)
+    oi_map = fetch_next_day_oi_map(client, alerts)
+    health = client.data_health() if hasattr(client, "data_health") else {}
+    endpoint_diagnostics = health.get("request_diagnostics", {}) if isinstance(health, dict) else {}
     reviews = review_alerts_with_next_day_oi(alerts, oi_map)
     reviewed_symbols = {str(row.get("option_symbol") or "") for row in reviews}
     unresolved = []
@@ -106,6 +109,10 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
     for row in reviews:
         status = str(row.get("next_day_oi_status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
+    failure_categories = {
+        key: value for key, value in statuses.items()
+        if key in {"unavailable", "pending", "unresolved", "expired"}
+    }
     coverage_rate = len(oi_map) / len(alerts) if alerts else 0.0
     return {
         "mode": "live_contracts",
@@ -121,6 +128,8 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
         "dry_run": dry_run,
         "output_path": str(storage.oi_reviews_path.relative_to(ROOT)),
         "statuses": statuses,
+        "failure_categories": failure_categories,
+        "endpoint_diagnostics": endpoint_diagnostics,
         "reviews": reviews[:20],
     }
 

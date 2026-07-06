@@ -95,6 +95,7 @@ class OptionsOiReviewTests(unittest.TestCase):
                 result = review_next_day_oi.review_from_live_contracts(as_of=date(2026, 6, 18), minimum_coverage=0.9)
             self.assertEqual(result["oi_coverage_rate"], 0.5)
             self.assertFalse(result["complete"])
+            self.assertEqual(result["failure_categories"], {"unavailable": 1})
 
 
 if __name__ == "__main__":

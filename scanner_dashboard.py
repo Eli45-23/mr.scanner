@@ -24,7 +24,7 @@ import elite_momentum_scanner as scanner_app
 import requests
 from scanner.options_data_client import OptionsDataClient
 from scanner.options_whale_scanner import OptionsWhaleScanner, build_reliability_table, options_market_session_state
-from scanner.options_whale_storage import OptionsWhaleStorage
+from scanner.options_whale_storage import OptionsWhaleStorage, read_jsonl
 from tools import dashboard_snapshot_exporter as snapshot_exporter
 from tools.preview_liquidity_sweeps import (
     build_liquidity_sweep_preview,
@@ -654,11 +654,25 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
             minimum_coverage = min(1.0, max(0.0, float(settings.get("oi_minimum_coverage", 0.90))))
             results["oi"] = review_from_live_contracts(limit=int(settings.get("review_limit", 1000)), minimum_coverage=minimum_coverage)
             state["oi_last_attempt"] = current.isoformat()
+            if state.get("oi_attempt_day") != current.date().isoformat() or state.get("oi_source_day") != results["oi"].get("source_session_date"):
+                state["oi_attempt_count"] = 0
+                state["oi_coverage_history"] = []
+            state["oi_attempt_day"] = current.date().isoformat()
+            state["oi_attempt_count"] = int(state.get("oi_attempt_count") or 0) + 1
             state["oi_source_day"] = results["oi"].get("source_session_date")
             state["oi_contract_count"] = results["oi"].get("unique_contract_count")
             state["oi_coverage_rate"] = results["oi"].get("oi_coverage_rate")
+            state["oi_values_found"] = results["oi"].get("oi_values_found")
+            state["oi_unresolved_count"] = results["oi"].get("unresolved_count")
+            state["oi_statuses"] = results["oi"].get("statuses") or {}
+            state["oi_failure_categories"] = results["oi"].get("failure_categories") or {}
+            state["oi_endpoint_diagnostics"] = results["oi"].get("endpoint_diagnostics") or {}
+            history = list(state.get("oi_coverage_history") or [])[-19:]
+            history.append({"attempted_at": current.isoformat(), "coverage_rate": results["oi"].get("oi_coverage_rate"), "values_found": results["oi"].get("oi_values_found"), "unresolved_count": results["oi"].get("unresolved_count")})
+            state["oi_coverage_history"] = history
             if results["oi"].get("complete"):
                 state["oi_day"] = current.date().isoformat()
+                state["oi_completed_at"] = current.isoformat()
         except Exception as exc:
             logger.exception("Options OI review job failed")
             errors.append(f"oi: {exc}")
@@ -808,6 +822,9 @@ def options_whales_data_health() -> Dict[str, Any]:
         "endpoint_errors": endpoint_errors[:10],
         "warning": unavailable_rate > warning_rate or bool(endpoint_errors),
     }
+    oi_progress = _read_review_job_state()
+    canonical_rows = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=10000)
+    canonical_latest = {str(row.get("canonical_episode_id") or row.get("alert_id") or ""): row for row in canonical_rows if row.get("canonical_episode_id") or row.get("alert_id")}
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "option_api": scanner.client.data_health(),
@@ -815,6 +832,22 @@ def options_whales_data_health() -> Dict[str, Any]:
         "coverage": options_whales_coverage(),
         "last_scan_error": latest.get("error") or STATE.options_whale_last_scan_error,
         "option_outcome_health": outcome_health,
+        "oi_review_progress": {
+            "source_session_date": oi_progress.get("oi_source_day"),
+            "last_attempt": oi_progress.get("oi_last_attempt"),
+            "attempt_count": int(oi_progress.get("oi_attempt_count") or 0),
+            "contract_count": oi_progress.get("oi_contract_count"),
+            "values_found": oi_progress.get("oi_values_found"),
+            "unresolved_count": oi_progress.get("oi_unresolved_count"),
+            "coverage_rate": oi_progress.get("oi_coverage_rate"),
+            "minimum_coverage": float(scanner_app.load_config(STATE.config_path).get("options_review_jobs", {}).get("oi_minimum_coverage", 0.90)),
+            "statuses": oi_progress.get("oi_statuses") or {},
+            "failure_categories": oi_progress.get("oi_failure_categories") or {},
+            "endpoint_diagnostics": oi_progress.get("oi_endpoint_diagnostics") or {},
+            "coverage_history": oi_progress.get("oi_coverage_history") or [],
+            "complete": bool(oi_progress.get("oi_day") == datetime.now(ET).date().isoformat()),
+        },
+        "canonical_alert_episodes": {"episode_count": len(canonical_latest), "latest": list(canonical_latest.values())[-20:]},
     }
 
 
@@ -4580,6 +4613,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Tier-1 paired outcomes', `${reliability.shadow_tier1?.paired_sample_count ?? 0} / ${reliability.shadow_tier1?.required_paired_samples ?? 30}`, (reliability.shadow_tier1?.paired_samples_remaining ?? 1) ? 'warn' : 'good'),
         card('Option-bar unavailable', `${dataHealth.option_outcome_health?.option_bars_unavailable_count ?? 0} / ${dataHealth.option_outcome_health?.total_episodes ?? 0}`, dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
         card('Executable return coverage', dataHealth.option_outcome_health?.executable_window_coverage !== null && dataHealth.option_outcome_health?.executable_window_coverage !== undefined ? `${Math.round(dataHealth.option_outcome_health.executable_window_coverage * 100)}%` : 'Unknown', dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
+        card('OI confirmation coverage', dataHealth.oi_review_progress?.coverage_rate !== null && dataHealth.oi_review_progress?.coverage_rate !== undefined ? `${Math.round(dataHealth.oi_review_progress.coverage_rate * 100)}%` : 'Not started', dataHealth.oi_review_progress?.complete ? 'good' : 'warn'),
+        card('OI retry attempts', dataHealth.oi_review_progress?.attempt_count ?? 0),
+        card('OI unresolved', dataHealth.oi_review_progress?.unresolved_count ?? 0, (dataHealth.oi_review_progress?.unresolved_count ?? 0) ? 'warn' : 'good'),
+        card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),
       ].join('');
       const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
       const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning].filter(Boolean);

@@ -29,6 +29,7 @@ This repo is focused on the Options Whale Scanner workflow.
 | Adaptive symbol rotation | Implemented with persisted coverage, overnight reset, duration clamps, and per-symbol coverage age |
 | Option outcome health | Exposed on the dashboard and data-health API, including unavailable option bars and executable-return coverage |
 | Shadow Tier-1 proof | Tracks aligned candidates, +0.10% outcomes, executable returns, session progress, and paired-sample progress without relaxing production gates |
+| Canonical alert episodes | Joins orchestrator decision, delivery state, option-quality reasons, and post-alert outcomes under one stable episode ID |
 | Dashboard explanation clarity | Implemented on the main dashboard |
 
 ## Safety rules

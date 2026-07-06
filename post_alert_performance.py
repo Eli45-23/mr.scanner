@@ -43,7 +43,7 @@ def _alert_value(alert: Any, name: str, default: Any = None) -> Any:
     return getattr(alert, name, default)
 
 
-def alert_tracking_record(alert: Any, target_move_pct: float = 0.30) -> Dict[str, Any]:
+def alert_tracking_record(alert: Any, target_move_pct: float = 0.30, meaningful_move_pct: float = 0.10) -> Dict[str, Any]:
     timestamp = _parse_dt(_alert_value(alert, "timestamp")) or datetime.now(UTC)
     symbol = str(_alert_value(alert, "symbol", "")).upper()
     direction = _direction(
@@ -84,6 +84,15 @@ def alert_tracking_record(alert: Any, target_move_pct: float = 0.30) -> Dict[str
         or _alert_value(alert, "entry_quality_label"),
         "invalidation_level": _alert_value(alert, "invalidation_level"),
         "target_move_pct": float(target_move_pct),
+        "meaningful_move_threshold_pct": float(meaningful_move_pct),
+        "outcome_definition_version": f"v2_meaningful_move_{float(meaningful_move_pct):.2f}",
+        "orchestrator_final_alert_type": _alert_value(alert, "orchestrator_final_alert_type"),
+        "orchestrator_decision_reason": _alert_value(alert, "orchestrator_decision_reason"),
+        "delivery_requested": bool(_alert_value(alert, "phase3_delivery_requested")),
+        "delivery_attempted": bool(_alert_value(alert, "phase3_delivery_attempted")),
+        "delivery_succeeded": bool(_alert_value(alert, "phase3_delivery_succeeded")),
+        "delivery_final_decision": _alert_value(alert, "phase3_heads_up_final_decision"),
+        "option_quality_reasons": list(_alert_value(alert, "option_quality_reasons") or []),
         "interval_prices": {},
         "interval_moves_pct": {},
         "max_favorable_excursion_pct": None,
@@ -163,6 +172,7 @@ def update_performance_record(
     mfe = max([0.0, *favorable])
     mae = max([0.0, *adverse])
     target = float(record.get("target_move_pct") or 0.30)
+    meaningful = float(record.get("meaningful_move_threshold_pct") or 0.10)
     final_key = next((f"{minute}m" for minute in reversed(interval_values) if f"{minute}m" in interval_moves), None)
     final_move = float(interval_moves.get(final_key, 0.0)) if final_key else None
     direction_correct = final_move > 0 if final_move is not None else None
@@ -176,16 +186,22 @@ def update_performance_record(
             "max_favorable_excursion_pct": round(mfe, 4),
             "max_adverse_excursion_pct": round(mae, 4),
             "direction_correct": direction_correct,
-            "alert_was_early": bool(direction_correct and first_move is not None and first_move <= 0 and mfe >= target),
-            "alert_was_late": entry_timing in {"LATE", "DO_NOT_CHASE"} or bool(mae >= target and mfe < target),
+            "alert_was_early": bool(entry_timing in {"EARLY", "GOOD_POSITION"} and mfe >= meaningful),
+            "alert_was_late": entry_timing in {"LATE", "DO_NOT_CHASE"},
             "hit_invalidation": hit_invalidation,
             "hit_target_zone": mfe >= target,
-            "useful_alert": bool(direction_correct and mfe >= target and not hit_invalidation)
+            "useful_alert": bool(final_move is not None and final_move >= meaningful and mfe >= meaningful and not hit_invalidation)
             if direction_correct is not None
             else None,
-            "should_be_blocked_next_time": bool(hit_invalidation or (mae >= target and mfe < target))
+            "should_be_blocked_next_time": bool(hit_invalidation or (final_move <= -meaningful and mae >= meaningful))
             if final_move is not None
             else None,
+            "outcome_reason": (
+                "invalidation hit" if hit_invalidation else
+                f"adverse move exceeded {meaningful:.2f}% and final signed move was negative" if final_move is not None and final_move <= -meaningful and mae >= meaningful else
+                f"final signed move reached +{meaningful:.2f}% without invalidation" if final_move is not None and final_move >= meaningful and not hit_invalidation else
+                "no meaningful directional move"
+            ),
             "status": "COMPLETE" if f"{max(interval_values)}m" in interval_prices else "PENDING",
         }
     )
@@ -200,11 +216,15 @@ class PostAlertPerformanceTracker:
         *,
         intervals: Iterable[int] = DEFAULT_INTERVALS,
         target_move_pct: float = 0.30,
+        episode_path: Optional[Path] = None,
+        meaningful_move_pct: float = 0.10,
     ) -> None:
         self.log_path = log_path
         self.state_path = state_path
         self.intervals = tuple(sorted({int(value) for value in intervals if int(value) > 0})) or DEFAULT_INTERVALS
         self.target_move_pct = float(target_move_pct)
+        self.episode_path = episode_path
+        self.meaningful_move_pct = float(meaningful_move_pct)
         self.pending: Dict[str, Dict[str, Any]] = {}
         self._load()
 
@@ -226,9 +246,13 @@ class PostAlertPerformanceTracker:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if self.episode_path:
+            self.episode_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.episode_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"canonical_episode_id": record.get("alert_id"), "episode_updated_at": record.get("last_updated_at"), **record}, sort_keys=True) + "\n")
 
     def register(self, alert: Any) -> Dict[str, Any]:
-        record = alert_tracking_record(alert, self.target_move_pct)
+        record = alert_tracking_record(alert, self.target_move_pct, self.meaningful_move_pct)
         self.pending[record["alert_id"]] = record
         self._log(record)
         self._save()

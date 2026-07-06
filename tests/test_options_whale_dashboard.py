@@ -52,6 +52,8 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             self.assertEqual(state["oi_day"], "2026-07-02")
             self.assertEqual(state["oi_source_day"], "2026-07-01")
+            self.assertEqual(state["oi_attempt_count"], 2)
+            self.assertEqual(len(state["oi_coverage_history"]), 2)
 
     def test_oi_job_does_not_complete_below_required_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,6 +81,10 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("/api/options-whales/universe/status", html)
         self.assertIn("/api/options-whales/data-health", html)
         self.assertIn("Option-bar unavailable", html)
+        self.assertIn("OI confirmation coverage", html)
+        self.assertIn("OI retry attempts", html)
+        self.assertIn("OI unresolved", html)
+        self.assertIn("Canonical alert episodes", html)
         self.assertIn("Shadow Tier-1 aligned", html)
         self.assertIn("Shadow +0.10% rate", html)
         self.assertIn("Shadow option-win rate", html)

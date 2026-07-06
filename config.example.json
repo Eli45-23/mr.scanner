@@ -206,7 +206,14 @@
     "chop_blocks_trade_quality": true,
     "chop_allows_trend_context": true,
     "do_not_chase_context_enabled": true,
-    "dashboard_context_always": true
+    "dashboard_context_always": true,
+    "state_change_min_priority_delta": 5
+  },
+  "post_alert_performance": {
+    "enabled": true,
+    "interval_minutes": [1, 3, 5, 10, 15],
+    "target_move_pct": 0.3,
+    "meaningful_move_pct": 0.1
   },
   "alert_priority": {
     "enabled": true,
