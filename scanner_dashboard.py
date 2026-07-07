@@ -46,6 +46,7 @@ ALERT_ORCHESTRATOR_LOG_PATH = APP_DIR / "logs" / "alert_orchestrator.jsonl"
 CHOP_MODE_LOG_PATH = APP_DIR / "logs" / "chop_mode.jsonl"
 OPTIONS_WHALE_LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 OPTIONS_REVIEW_JOB_STATE_PATH = APP_DIR / "state" / "options_review_jobs.json"
+SCAN_LOOP_TELEMETRY_PATH = APP_DIR / "state" / "options_scan_loop_telemetry.json"
 
 
 def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
@@ -383,6 +384,15 @@ class DashboardState:
         self.options_whale_last_scan_finished_at: Optional[str] = None
         self.options_whale_last_scan_error = ""
         self.options_whale_next_scan_monotonic = 0.0
+        self.options_review_worker: Optional[threading.Thread] = None
+        self.options_review_worker_started = False
+        self.options_review_worker_running = False
+        self.options_review_worker_last_error = ""
+        try:
+            saved_telemetry = json.loads(SCAN_LOOP_TELEMETRY_PATH.read_text(encoding="utf-8"))
+            self.options_scan_telemetry = saved_telemetry[-200:] if isinstance(saved_telemetry, list) else []
+        except (OSError, json.JSONDecodeError):
+            self.options_scan_telemetry = []
 
     def snapshot(self) -> Dict[str, Any]:
         config = scanner_app.load_config(self.config_path)
@@ -570,6 +580,7 @@ def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
             STATE.options_whale_scan_running = True
             STATE.options_whale_last_scan_started_at = iso_now()
             STATE.options_whale_last_scan_error = ""
+        scan_started_monotonic = time.monotonic()
         scanner = options_whale_scanner()
         result = scanner.scan()
         result["scan_trigger"] = reason
@@ -580,6 +591,10 @@ def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
             STATE.last_scan_at = result.get("timestamp") or iso_now()
             STATE.options_whale_last_scan_finished_at = iso_now()
             STATE.options_whale_last_scan_error = ""
+            if reason == "auto":
+                duration = max(0.0, time.monotonic() - scan_started_monotonic)
+                STATE.options_scan_telemetry.append({"started_at": STATE.options_whale_last_scan_started_at, "finished_at": STATE.options_whale_last_scan_finished_at, "duration_seconds": round(duration, 3)})
+                STATE.options_scan_telemetry = STATE.options_scan_telemetry[-200:]
         return result
     except Exception as exc:
         with STATE.lock:
@@ -596,17 +611,74 @@ def run_options_whale_scan_locked(reason: str = "manual") -> Dict[str, Any]:
 
 
 def options_whale_auto_scan_loop() -> None:
+    next_due = time.monotonic()
+    prior_started: Optional[float] = None
     while not STATE.stop_event.is_set():
         config = scanner_app.load_config(STATE.config_path)
         interval = options_whale_interval(config)
+        now_mono = time.monotonic()
+        if now_mono < next_due and STATE.stop_event.wait(next_due - now_mono):
+            break
+        actual_started = time.monotonic()
+        start_delay = max(0.0, actual_started - next_due)
+        cadence = actual_started - prior_started if prior_started is not None else None
         with STATE.lock:
             paused = STATE.options_whale_auto_scan_paused
-            STATE.options_whale_next_scan_monotonic = time.monotonic() + interval
+            STATE.options_whale_next_scan_monotonic = next_due + interval
         if not paused:
             run_options_whale_scan_locked("auto")
-        run_options_review_jobs(config)
-        if STATE.stop_event.wait(interval):
+            with STATE.lock:
+                if STATE.options_scan_telemetry:
+                    row = STATE.options_scan_telemetry[-1]
+                    row["timestamp"] = row.get("started_at")
+                    row.update({"scheduled_interval_seconds": interval, "actual_cadence_seconds": round(cadence, 3) if cadence is not None else None, "start_delay_seconds": round(start_delay, 3), "overrun_seconds": round(max(0.0, float(row.get("duration_seconds") or 0) - interval), 3), "missed_cycle_count": int(start_delay // interval), "warning": bool(float(row.get("duration_seconds") or 0) > interval or (cadence is not None and cadence > interval * 1.5))})
+                    try:
+                        SCAN_LOOP_TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = SCAN_LOOP_TELEMETRY_PATH.with_suffix(".tmp")
+                        temporary.write_text(json.dumps(STATE.options_scan_telemetry, indent=2, sort_keys=True), encoding="utf-8")
+                        temporary.replace(SCAN_LOOP_TELEMETRY_PATH)
+                        with (APP_DIR / "logs" / "options_scan_loop_health.jsonl").open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(row, sort_keys=True) + "\n")
+                    except OSError as exc:
+                        logger.warning("Scan-loop telemetry persistence failed safely: %s", exc)
+                prior_started = actual_started
+        next_due += interval
+        if next_due < time.monotonic() - interval:
+            next_due = time.monotonic()
+
+
+def options_review_worker_loop() -> None:
+    while not STATE.stop_event.is_set():
+        config = scanner_app.load_config(STATE.config_path)
+        poll_seconds = max(15, int(config.get("options_review_jobs", {}).get("worker_poll_seconds", 30)))
+        with STATE.lock:
+            STATE.options_review_worker_running = True
+        try:
+            run_options_review_jobs(config)
+            with STATE.lock:
+                STATE.options_review_worker_last_error = ""
+        except Exception as exc:
+            logger.exception("Options review worker failed safely")
+            with STATE.lock:
+                STATE.options_review_worker_last_error = str(exc)
+        finally:
+            with STATE.lock:
+                STATE.options_review_worker_running = False
+        if STATE.stop_event.wait(poll_seconds):
             break
+
+
+def ensure_options_review_worker() -> None:
+    config = scanner_app.load_config(STATE.config_path)
+    if not config.get("options_review_jobs", {}).get("enabled", True):
+        return
+    with STATE.lock:
+        if STATE.options_review_worker_started and STATE.options_review_worker and STATE.options_review_worker.is_alive():
+            return
+        STATE.options_review_worker_started = True
+        thread = threading.Thread(target=options_review_worker_loop, name="options-review-worker", daemon=True)
+        STATE.options_review_worker = thread
+        thread.start()
 
 
 def _read_review_job_state() -> Dict[str, Any]:
@@ -645,7 +717,10 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
     oi_hour, oi_minute = [int(part) for part in str(settings.get("oi_time_et", "09:45")).split(":", 1)]
     retry_end_hour, retry_end_minute = [int(part) for part in str(settings.get("oi_retry_end_et", "12:00")).split(":", 1)]
     oi_last_attempt = parse_scan_timestamp(state.get("oi_last_attempt"))
-    retry_interval = max(60, int(settings.get("oi_retry_interval_seconds", 900)))
+    base_retry_interval = max(60, int(settings.get("oi_retry_interval_seconds", 900)))
+    retry_interval = max(base_retry_interval, int(state.get("oi_current_retry_interval_seconds") or base_retry_interval))
+    if state.get("oi_attempt_day") != current.date().isoformat():
+        retry_interval = base_retry_interval
     retry_due = oi_last_attempt is None or (current.astimezone(timezone.utc) - oi_last_attempt.astimezone(timezone.utc)).total_seconds() >= retry_interval
     oi_window_open = (current.hour, current.minute) >= (oi_hour, oi_minute) and (current.hour, current.minute) <= (retry_end_hour, retry_end_minute)
     if oi_window_open and retry_due and state.get("oi_day") != current.date().isoformat():
@@ -665,11 +740,30 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
             state["oi_values_found"] = results["oi"].get("oi_values_found")
             state["oi_unresolved_count"] = results["oi"].get("unresolved_count")
             state["oi_statuses"] = results["oi"].get("statuses") or {}
-            state["oi_failure_categories"] = results["oi"].get("failure_categories") or {}
+            state["oi_failure_categories"] = results["oi"].get("unresolved_failure_categories") or results["oi"].get("failure_categories") or {}
             state["oi_endpoint_diagnostics"] = results["oi"].get("endpoint_diagnostics") or {}
             history = list(state.get("oi_coverage_history") or [])[-19:]
             history.append({"attempted_at": current.isoformat(), "coverage_rate": results["oi"].get("oi_coverage_rate"), "values_found": results["oi"].get("oi_values_found"), "unresolved_count": results["oi"].get("unresolved_count")})
             state["oi_coverage_history"] = history
+            plateau_attempts = max(2, int(settings.get("oi_plateau_attempts", 2)))
+            previous_values = [item.get("values_found") for item in history[:-1] if item.get("values_found") is not None]
+            latest_values = results["oi"].get("oi_values_found")
+            unchanged = 0
+            for prior_value in reversed(previous_values):
+                if prior_value != latest_values:
+                    break
+                unchanged += 1
+            plateau = unchanged >= plateau_attempts - 1
+            if previous_values and latest_values is not None and latest_values > previous_values[-1]:
+                retry_interval = base_retry_interval
+                plateau = False
+            elif plateau:
+                retry_interval = min(int(settings.get("oi_retry_max_seconds", 3600)), max(base_retry_interval * 2, retry_interval * 2))
+            state["oi_plateau_detected"] = plateau
+            state["oi_plateau_unchanged_attempts"] = unchanged + 1 if plateau else 0
+            state["oi_current_retry_interval_seconds"] = retry_interval
+            state["oi_next_attempt_at"] = (current + timedelta(seconds=retry_interval)).isoformat()
+            state["oi_waterfall"] = results["oi"].get("coverage_waterfall") or {}
             if results["oi"].get("complete"):
                 state["oi_day"] = current.date().isoformat()
                 state["oi_completed_at"] = current.isoformat()
@@ -714,6 +808,16 @@ def ensure_options_whale_auto_scan() -> None:
         thread.start()
 
 
+def _percentile(values: List[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
 def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     config = scanner_app.load_config(STATE.config_path)
     interval = options_whale_interval(config)
@@ -727,6 +831,20 @@ def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -
         last_finished = STATE.options_whale_last_scan_finished_at
         last_error = STATE.options_whale_last_scan_error
         next_eta = max(0.0, STATE.options_whale_next_scan_monotonic - time.monotonic()) if STATE.options_whale_next_scan_monotonic else None
+        telemetry = list(STATE.options_scan_telemetry)
+        review_running = STATE.options_review_worker_running
+        review_error = STATE.options_review_worker_last_error
+    durations = [float(row["duration_seconds"]) for row in telemetry if isinstance(row.get("duration_seconds"), (int, float))]
+    cadences = [float(row["actual_cadence_seconds"]) for row in telemetry if isinstance(row.get("actual_cadence_seconds"), (int, float))]
+    scan_loop_health = {
+        "sample_count": len(telemetry), "duration_p50_seconds": round(_percentile(durations, .50), 3) if durations else None,
+        "duration_p95_seconds": round(_percentile(durations, .95), 3) if durations else None,
+        "cadence_p50_seconds": round(_percentile(cadences, .50), 3) if cadences else None,
+        "cadence_p95_seconds": round(_percentile(cadences, .95), 3) if cadences else None,
+        "overrun_count": sum(bool(row.get("overrun_seconds")) for row in telemetry),
+        "missed_cycle_count": sum(int(row.get("missed_cycle_count") or 0) for row in telemetry),
+        "warning": any(bool(row.get("warning")) for row in telemetry[-10:]), "latest": telemetry[-1] if telemetry else {},
+    }
     stale = bool(age is not None and age > interval * 2)
     return {
         "auto_scan_enabled": options_whale_auto_scan_enabled(config),
@@ -750,6 +868,9 @@ def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -
         "preserved_regular_session_scan": bool(latest.get("preserved_regular_session_scan")),
         "stale": stale,
         "stale_warning": "Scan results are stale. Latest scan is stale. Auto-scan may not be running." if stale else "",
+        "scan_loop_health": scan_loop_health,
+        "review_worker_running": review_running,
+        "review_worker_last_error": review_error,
     }
 
 
@@ -774,7 +895,7 @@ def options_whales_status() -> Dict[str, Any]:
         }
 
 
-def options_whales_data_health() -> Dict[str, Any]:
+def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     scanner = options_whale_scanner()
     latest = read_latest_options_whale_scan()
     heartbeat_path = APP_DIR / "data" / "market_regime_latest.json"
@@ -797,7 +918,11 @@ def options_whales_data_health() -> Dict[str, Any]:
     unavailable = sum(str(row.get("option_outcome_status")) == "option_bars_unavailable" for row in day_rows)
     executable_total = executable_available = 0
     endpoint_errors: List[Dict[str, Any]] = []
+    option_bar_failures: List[Dict[str, Any]] = []
+    filters = filters or {}
     for row in day_rows:
+        if isinstance(row.get("option_bar_failure"), dict):
+            option_bar_failures.append(row["option_bar_failure"])
         for item in row.get("option_windows") or []:
             if item.get("status") == "ok":
                 executable_total += 1
@@ -810,6 +935,7 @@ def options_whales_data_health() -> Dict[str, Any]:
                 endpoint_errors.append({"endpoint": name, **diagnostic})
     warning_rate = float(scanner.whale.get("option_bar_unavailable_warning_rate", 0.02))
     unavailable_rate = unavailable / len(day_rows) if day_rows else 0.0
+    option_bar_failures = [row for row in option_bar_failures if (not filters.get("symbol") or str(row.get("underlying_symbol") or "").upper() == filters["symbol"].upper()) and (not filters.get("endpoint") or str(row.get("endpoint") or "") == filters["endpoint"]) and (not filters.get("failure_category") or str(row.get("provider_category") or "") == filters["failure_category"]) and (not filters.get("dte") or str(row.get("dte")) == filters["dte"]) ]
     outcome_health = {
         "latest_detection_date": latest_day.isoformat() if latest_day else None,
         "total_episodes": len(day_rows),
@@ -821,6 +947,11 @@ def options_whales_data_health() -> Dict[str, Any]:
         "endpoint_error_count": len(endpoint_errors),
         "endpoint_errors": endpoint_errors[:10],
         "warning": unavailable_rate > warning_rate or bool(endpoint_errors),
+        "failure_count": len(option_bar_failures),
+        "failures": option_bar_failures[:100],
+        "failures_by_category": dict(__import__("collections").Counter(str(row.get("provider_category") or "unknown") for row in option_bar_failures)),
+        "failures_by_symbol": dict(__import__("collections").Counter(str(row.get("underlying_symbol") or "UNKNOWN") for row in option_bar_failures)),
+        "failures_by_endpoint": dict(__import__("collections").Counter(str(row.get("endpoint") or "unknown") for row in option_bar_failures)),
     }
     oi_progress = _read_review_job_state()
     canonical_rows = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=10000)
@@ -845,9 +976,17 @@ def options_whales_data_health() -> Dict[str, Any]:
             "failure_categories": oi_progress.get("oi_failure_categories") or {},
             "endpoint_diagnostics": oi_progress.get("oi_endpoint_diagnostics") or {},
             "coverage_history": oi_progress.get("oi_coverage_history") or [],
+            "plateau_detected": bool(oi_progress.get("oi_plateau_detected")),
+            "plateau_unchanged_attempts": int(oi_progress.get("oi_plateau_unchanged_attempts") or 0),
+            "current_retry_interval_seconds": oi_progress.get("oi_current_retry_interval_seconds"),
+            "next_attempt_at": oi_progress.get("oi_next_attempt_at"),
+            "coverage_waterfall": oi_progress.get("oi_waterfall") or {},
             "complete": bool(oi_progress.get("oi_day") == datetime.now(ET).date().isoformat()),
         },
         "canonical_alert_episodes": {"episode_count": len(canonical_latest), "latest": list(canonical_latest.values())[-20:]},
+        "scan_loop_health": options_whale_scan_runtime_status(latest).get("scan_loop_health"),
+        "review_worker": {"running": STATE.options_review_worker_running, "last_error": STATE.options_review_worker_last_error},
+        "filters": filters,
     }
 
 
@@ -934,6 +1073,7 @@ def resume_options_whale_auto_scan() -> Dict[str, Any]:
     with STATE.lock:
         STATE.options_whale_auto_scan_paused = False
     ensure_options_whale_auto_scan()
+    ensure_options_review_worker()
     return options_whales_status()
 
 
@@ -969,7 +1109,7 @@ def options_whales_coverage() -> Dict[str, Any]:
     }
 
 
-def options_whales_reliability() -> Dict[str, Any]:
+def options_whales_reliability(filters: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     config = scanner_app.load_config(STATE.config_path)
     cfg = config.get("options_whale_scanner", {})
     outcomes = OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=10000)
@@ -985,6 +1125,8 @@ def options_whales_reliability() -> Dict[str, Any]:
     min_samples = float(cfg.get("reliability_min_effective_samples", 30))
     shadow = []
     for outcome in latest.values():
+        if str(outcome.get("classification") or outcome.get("setup_type") or "").strip().upper() == "MIXED SIGNAL":
+            continue
         window = next((item for item in outcome.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         option_window = next((item for item in outcome.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         if not window or int(outcome.get("whale_score") or 0) < int(cfg.get("tier1_min_score", 95)):
@@ -1007,7 +1149,64 @@ def options_whales_reliability() -> Dict[str, Any]:
         "sessions_remaining": max(0, min_sessions - session_count), "paired_samples_remaining": max(0, round(min_samples - effective_sample_count, 2)),
         "tier1_gate_unchanged": True,
     }
-    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows, "shadow_tier1": shadow_summary}
+    promotion_queue = []
+    for row in rows:
+        qualified = bool(row.get("reliability_qualified") and row.get("reliability_dual_metric_passed"))
+        status = "promotion_ready" if qualified else "blocked" if row.get("reliability_session_count", 0) >= min_sessions else "collecting"
+        promotion_queue.append({**row, "status": status, "manual_approval_required": True, "production_gate_changed": False})
+    filters = filters or {}
+    promotion_queue = [row for row in promotion_queue if (not filters.get("cohort_status") or row["status"] == filters["cohort_status"]) and (not filters.get("direction") or row["bucket"].upper().endswith("|" + filters["direction"].upper())) and (not filters.get("dte") or f"|{filters['dte'].upper()}|" in row["bucket"].upper()) and (not filters.get("regime") or f"|{filters['regime'].upper()}|" in row["bucket"].upper())]
+    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows, "shadow_tier1": shadow_summary, "promotion_queue": promotion_queue, "filters": filters}
+
+
+def options_whales_regression(filters: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    outcomes = OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=20000)
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in outcomes:
+        key = str(row.get("alert_key") or row.get("episode_id") or "")
+        if key and str(row.get("classification") or "").upper() != "MIXED SIGNAL":
+            latest[key] = row
+    dated = []
+    for row in latest.values():
+        stamp = parse_scan_timestamp(row.get("detected_at"))
+        if stamp:
+            dated.append((stamp.astimezone(ET).date().isoformat(), row))
+    sessions = sorted({day for day, _ in dated})[-5:]
+    rows = []
+    for day in sessions:
+        cohort = [row for session, row in dated if session == day]
+        for dimension, getter in (("direction", lambda r: str(r.get("flow_bias") or "UNKNOWN")), ("dte", lambda r: str(r.get("dte_bucket") or "UNKNOWN")), ("regime", lambda r: str(r.get("market_regime") or "UNKNOWN")), ("confidence", lambda r: str(r.get("direction_confidence") or "UNKNOWN")), ("score", lambda r: str(int(float(r.get("whale_score") or 0)) // 10 * 10))):
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for item in cohort:
+                groups.setdefault(getter(item), []).append(item)
+            for value, members in groups.items():
+                meaningful = []
+                executable = []
+                for member in members:
+                    window = next((w for w in member.get("windows") or [] if int(w.get("minutes") or 0) == 15 and w.get("status") == "ok"), None)
+                    option = next((w for w in member.get("option_windows") or [] if int(w.get("minutes") or 0) == 15 and w.get("status") == "ok"), None)
+                    if window and isinstance(window.get("signed_move_pct"), (int, float)): meaningful.append(float(window["signed_move_pct"]))
+                    if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): executable.append(float(option["estimated_executable_return_pct"]))
+                rows.append({"session": day, "dimension": dimension, "value": value, "sample_count": len(members), "meaningful_0_10_rate": round(sum(v >= .10 for v in meaningful) / len(meaningful), 4) if meaningful else None, "mean_signed_move_pct": round(sum(meaningful) / len(meaningful), 4) if meaningful else None, "executable_positive_rate": round(sum(v > 0 for v in executable) / len(executable), 4) if executable else None, "mean_executable_return_pct": round(sum(executable) / len(executable), 4) if executable else None, "underlying_coverage": round(len(meaningful) / len(members), 4), "executable_coverage": round(len(executable) / len(members), 4)})
+    filters = filters or {}
+    rows = [row for row in rows if (not filters.get("session") or row["session"] == filters["session"]) and (not filters.get("dimension") or row["dimension"] == filters["dimension"]) and (not filters.get("value") or row["value"].upper() == filters["value"].upper())]
+    return {"sessions": sessions, "session_count": len(sessions), "rows": rows, "window_trading_sessions": 5, "filters": filters}
+
+
+def options_whales_latency_timeline(filters: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    canonical = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=20000)
+    latest = {str(row.get("canonical_episode_id") or row.get("alert_id")): row for row in canonical if row.get("canonical_episode_id") or row.get("alert_id")}
+    oi_latest = {str(row.get("episode_id") or ""): row for row in OptionsWhaleStorage(APP_DIR).latest_oi_reviews(limit=20000) if row.get("episode_id")}
+    rows = []
+    for episode_id, row in list(latest.items())[-500:]:
+        oi = oi_latest.get(episode_id, {})
+        stages = {"market_observation": row.get("market_observation_at") or row.get("alert_timestamp"), "detection": row.get("alert_timestamp"), "decision": row.get("decision_timestamp"), "eligibility": row.get("notification_eligible_at"), "delivery_attempt": row.get("delivery_attempted_at"), "delivery_success": row.get("delivery_succeeded_at"), "outcome_review": row.get("last_updated_at") if row.get("interval_prices") else None, "oi_confirmation": oi.get("reviewed_at") if str(oi.get("next_day_oi_status") or "") not in {"", "pending", "unavailable", "unresolved"} else None}
+        ordered = [(name, parse_scan_timestamp(value)) for name, value in stages.items() if value]
+        latencies = {f"{ordered[i-1][0]}_to_{ordered[i][0]}_seconds": round((ordered[i][1] - ordered[i-1][1]).total_seconds(), 3) for i in range(1, len(ordered)) if ordered[i][1] and ordered[i-1][1]}
+        rows.append({"canonical_episode_id": episode_id, "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "stages": stages, "missing_stages": [name for name, value in stages.items() if not value], "latencies": latencies})
+    filters = filters or {}
+    rows = [row for row in rows if (not filters.get("symbol") or str(row.get("symbol") or "").upper() == filters["symbol"].upper()) and (not filters.get("direction") or str(row.get("direction") or "").upper() == filters["direction"].upper()) and (not filters.get("setup") or filters["setup"].upper() in str(row.get("setup") or "").upper())]
+    return {"episode_count": len(rows), "rows": rows, "filters": filters}
 
 
 def options_whales_filters() -> Dict[str, Any]:
@@ -4616,6 +4815,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('OI confirmation coverage', dataHealth.oi_review_progress?.coverage_rate !== null && dataHealth.oi_review_progress?.coverage_rate !== undefined ? `${Math.round(dataHealth.oi_review_progress.coverage_rate * 100)}%` : 'Not started', dataHealth.oi_review_progress?.complete ? 'good' : 'warn'),
         card('OI retry attempts', dataHealth.oi_review_progress?.attempt_count ?? 0),
         card('OI unresolved', dataHealth.oi_review_progress?.unresolved_count ?? 0, (dataHealth.oi_review_progress?.unresolved_count ?? 0) ? 'warn' : 'good'),
+        card('OI plateau', dataHealth.oi_review_progress?.plateau_detected ? `Yes — ${dataHealth.oi_review_progress.current_retry_interval_seconds ?? 0}s backoff` : 'No', dataHealth.oi_review_progress?.plateau_detected ? 'warn' : 'good'),
+        card('Scan duration p95', dataHealth.scan_loop_health?.duration_p95_seconds !== null && dataHealth.scan_loop_health?.duration_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.duration_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
+        card('Scan cadence p95', dataHealth.scan_loop_health?.cadence_p95_seconds !== null && dataHealth.scan_loop_health?.cadence_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.cadence_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
+        card('Promotion-ready cohorts', (reliability.promotion_queue || []).filter(row => row.status === 'promotion_ready').length),
         card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),
       ].join('');
       const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
@@ -4910,9 +5113,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/options-whales/coverage":
                 self.send_json(options_whales_coverage())
             elif parsed.path == "/api/options-whales/reliability":
-                self.send_json(options_whales_reliability())
+                query = parse_qs(parsed.query)
+                self.send_json(options_whales_reliability({key: values[0] for key, values in query.items() if values}))
             elif parsed.path == "/api/options-whales/data-health":
-                self.send_json(options_whales_data_health())
+                query = parse_qs(parsed.query)
+                self.send_json(options_whales_data_health({key: values[0] for key, values in query.items() if values}))
+            elif parsed.path == "/api/options-whales/regression":
+                query = parse_qs(parsed.query)
+                self.send_json(options_whales_regression({key: values[0] for key, values in query.items() if values}))
+            elif parsed.path == "/api/options-whales/latency":
+                query = parse_qs(parsed.query)
+                self.send_json(options_whales_latency_timeline({key: values[0] for key, values in query.items() if values}))
             elif parsed.path == "/api/options-whales/export.json":
                 self.send_json(options_whales_export_json())
             elif parsed.path == "/api/options-whales/export.csv":
@@ -4975,6 +5186,7 @@ def main() -> int:
     url = f"http://{args.host}:{args.port}"
     logger.info("Dashboard running at %s", url)
     ensure_options_whale_auto_scan()
+    ensure_options_review_worker()
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:

@@ -91,17 +91,38 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
         source_day, alerts = prior_session_episodes(all_rows, as_of=as_of or datetime.now(timezone.utc).date())
     alerts = _unique_by_contract(alerts)
     client = build_client(config)
+    review_day = as_of or datetime.now(timezone.utc).date()
     oi_map = fetch_next_day_oi_map(client, alerts)
     health = client.data_health() if hasattr(client, "data_health") else {}
     endpoint_diagnostics = health.get("request_diagnostics", {}) if isinstance(health, dict) else {}
     reviews = review_alerts_with_next_day_oi(alerts, oi_map)
     reviewed_symbols = {str(row.get("option_symbol") or "") for row in reviews}
     unresolved = []
+    unresolved_categories: Dict[str, int] = {}
+    endpoint_rows = list(endpoint_diagnostics.values()) if isinstance(endpoint_diagnostics, dict) else []
+    endpoint_error = next((row for row in endpoint_rows if isinstance(row, dict) and (row.get("error_category") or int(row.get("http_status") or 0) >= 400)), {})
     for alert in alerts:
         candidate = alert.get("candidate") if isinstance(alert.get("candidate"), dict) else alert
         symbol = str(candidate.get("option_symbol") or candidate.get("contract_symbol") or "")
         if symbol and symbol not in reviewed_symbols:
-            unresolved.append({"option_symbol": symbol, "underlying_symbol": candidate.get("underlying_symbol"), "expiration": candidate.get("expiration"), "option_type": candidate.get("option_type"), "strike": candidate.get("strike"), "original_time": alert.get("scanner_detected_time") or candidate.get("time_detected") or alert.get("timestamp"), "episode_id": alert.get("episode_id") or alert.get("flow_episode_id"), "next_day_oi_status": "unavailable", "open_close_estimate_after_oi": "unresolved", "next_day_oi_reason": "Next-day OI was unavailable; do not infer opening, closing, rolling, or hedging intent."})
+            expiration = str(candidate.get("expiration") or "")
+            try:
+                expired = date.fromisoformat(expiration) < review_day
+            except ValueError:
+                expired = False
+            if not candidate.get("underlying_symbol") or not expiration:
+                failure_category = "malformed_contract"
+            elif expired:
+                failure_category = "expired"
+            elif endpoint_error:
+                raw_category = str(endpoint_error.get("error_category") or "endpoint_error").lower()
+                failure_category = "entitlement" if "entitle" in raw_category or int(endpoint_error.get("http_status") or 0) == 403 else "rate_limit" if int(endpoint_error.get("http_status") or 0) == 429 else "endpoint_error"
+            elif any(isinstance(row, dict) and int(row.get("rows") or 0) == 0 for row in endpoint_rows):
+                failure_category = "empty_response"
+            else:
+                failure_category = "not_yet_published" if review_day > date.fromisoformat(source_day) else "unknown"
+            unresolved_categories[failure_category] = unresolved_categories.get(failure_category, 0) + 1
+            unresolved.append({"option_symbol": symbol, "underlying_symbol": candidate.get("underlying_symbol"), "expiration": expiration, "option_type": candidate.get("option_type"), "strike": candidate.get("strike"), "original_time": alert.get("scanner_detected_time") or candidate.get("time_detected") or alert.get("timestamp"), "episode_id": alert.get("episode_id") or alert.get("flow_episode_id"), "next_day_oi_status": "unavailable", "oi_failure_category": failure_category, "open_close_estimate_after_oi": "unresolved", "next_day_oi_reason": "Next-day OI was unavailable; do not infer opening, closing, rolling, or hedging intent."})
     reviews.extend(unresolved)
     if reviews and not dry_run:
         append_reviews(reviews, storage)
@@ -109,11 +130,10 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
     for row in reviews:
         status = str(row.get("next_day_oi_status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
-    failure_categories = {
-        key: value for key, value in statuses.items()
-        if key in {"unavailable", "pending", "unresolved", "expired"}
-    }
+    failure_categories = {key: value for key, value in statuses.items() if key in {"unavailable", "pending", "unresolved", "expired"}}
     coverage_rate = len(oi_map) / len(alerts) if alerts else 0.0
+    valid_contracts = sum(bool((row.get("candidate") if isinstance(row.get("candidate"), dict) else row).get("underlying_symbol") and (row.get("candidate") if isinstance(row.get("candidate"), dict) else row).get("expiration")) for row in alerts)
+    waterfall = {"source_contracts": len(alerts), "valid_contracts": valid_contracts, "requested_contracts": valid_contracts, "responses_received": len(oi_map), "oi_found": len(oi_map), "unresolved": len(unresolved), "unresolved_by_category": unresolved_categories, "final_coverage_rate": round(coverage_rate, 4) if alerts else None}
     return {
         "mode": "live_contracts",
         "alerts_checked": len(alerts),
@@ -129,7 +149,9 @@ def review_from_live_contracts(*, limit: int = 100, dry_run: bool = False, lates
         "output_path": str(storage.oi_reviews_path.relative_to(ROOT)),
         "statuses": statuses,
         "failure_categories": failure_categories,
+        "unresolved_failure_categories": unresolved_categories,
         "endpoint_diagnostics": endpoint_diagnostics,
+        "coverage_waterfall": waterfall,
         "reviews": reviews[:20],
     }
 

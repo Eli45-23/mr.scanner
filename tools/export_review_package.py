@@ -671,6 +671,7 @@ def export_review_package(
         "episodes": log_dir / "options_whale_episodes.jsonl",
         "oi_reviews": log_dir / "options_oi_reviews.jsonl",
         "price_observations": log_dir / "options_price_observations.jsonl",
+        "scan_loop_health": log_dir / "options_scan_loop_health.jsonl",
     }
     whale_records = {name: records_for_day(read_jsonl(path), day_text, timestamp_field="original_time" if name == "oi_reviews" else None) for name, path in whale_sources.items()}
     data_dir = log_dir.parent / "data"
@@ -679,6 +680,37 @@ def export_review_package(
         "legacy_outcomes": data_dir / "options_whale_outcomes.jsonl",
     }
     whale_records.update({name: records_for_day(read_jsonl(path), day_text, timestamp_field="detected_at") for name, path in outcome_sources.items()})
+    analytics_out = package_dir / "analytics"
+    analytics_out.mkdir(parents=True, exist_ok=True)
+    attribution_rows = [
+        {"alert_key": row.get("alert_key"), "underlying_symbol": row.get("underlying_symbol"), "option_symbol": row.get("option_symbol"), "detected_at": row.get("detected_at"), "option_windows": row.get("option_windows"), "option_bar_failure": row.get("option_bar_failure")}
+        for row in whale_records.get("outcomes", [])
+    ]
+    (analytics_out / "option_return_cost_attribution.json").write_text(json.dumps(attribution_rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    review_state_path = log_dir.parent / "state" / "options_review_jobs.json"
+    try:
+        review_state = json.loads(review_state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        review_state = {}
+    (analytics_out / "oi_coverage_waterfall.json").write_text(json.dumps({"source_session_date": review_state.get("oi_source_day"), "coverage_waterfall": review_state.get("oi_waterfall") or {}, "coverage_history": review_state.get("oi_coverage_history") or [], "plateau_detected": review_state.get("oi_plateau_detected")}, indent=2, sort_keys=True), encoding="utf-8")
+    timeline_rows = [{"canonical_episode_id": row.get("canonical_episode_id") or row.get("alert_id"), "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "market_observation": row.get("market_observation_at") or row.get("alert_timestamp"), "detection": row.get("alert_timestamp"), "decision": row.get("decision_timestamp"), "eligibility": row.get("notification_eligible_at"), "delivery_attempt": row.get("delivery_attempted_at"), "delivery_success": row.get("delivery_succeeded_at"), "outcome_review": row.get("last_updated_at"), "oi_confirmation": row.get("oi_confirmed_at")} for row in alert_episodes]
+    (analytics_out / "detection_delivery_latency_timeline.json").write_text(json.dumps(timeline_rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    all_outcomes = read_jsonl(outcome_sources["outcomes"])
+    session_rows: Dict[str, List[Dict[str, Any]]] = {}
+    for row in all_outcomes:
+        stamp = parse_record_time(row)
+        if stamp and str(row.get("classification") or "").upper() != "MIXED SIGNAL":
+            session_rows.setdefault(stamp.astimezone(ET).date().isoformat(), []).append(row)
+    last_sessions = sorted(session_rows)[-5:]
+    regression = []
+    for session in last_sessions:
+        rows_for_session = session_rows[session]
+        windows = [next((w for w in row.get("windows") or [] if int(w.get("minutes") or 0) == 15 and w.get("status") == "ok"), None) for row in rows_for_session]
+        values = [float(w["signed_move_pct"]) for w in windows if w and isinstance(w.get("signed_move_pct"), (int, float))]
+        regression.append({"session": session, "sample_count": len(rows_for_session), "underlying_coverage": round(len(values) / len(rows_for_session), 4) if rows_for_session else None, "meaningful_0_10_rate": round(sum(v >= .10 for v in values) / len(values), 4) if values else None, "mean_signed_move_pct": round(sum(values) / len(values), 4) if values else None})
+    (analytics_out / "five_session_regression.json").write_text(json.dumps({"sessions": last_sessions, "rows": regression}, indent=2, sort_keys=True), encoding="utf-8")
+    promotion = [{"bucket": row.get("reliability_bucket"), "session_count": row.get("reliability_session_count"), "effective_samples": row.get("reliability_effective_samples"), "meaningful_rate": row.get("reliability_meaningful_rate"), "executable_positive_rate": row.get("reliability_executable_positive_rate"), "status": "promotion_ready" if row.get("reliability_qualified") and row.get("reliability_dual_metric_passed") else "collecting", "manual_approval_required": True} for row in all_outcomes if row.get("reliability_bucket") and str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
+    (analytics_out / "shadow_cohort_promotion_queue.json").write_text(json.dumps(promotion, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)

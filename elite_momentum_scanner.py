@@ -450,6 +450,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "dashboard_auto_scan": True,
         "priority_seed_symbols": ["SPY", "QQQ", "IWM", "DIA", "NVDA", "AAPL", "TSLA", "AMD", "MSFT", "META", "AMZN", "GOOGL", "NFLX", "AVGO", "COIN", "MSTR", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "TLT", "HYG", "GLD", "SLV"],
         "priority_batch_size": 50,
+        "analytics_session_window": 5,
+        "option_attribution_risk_free_rate": 0.043,
+        "canonical_material_change_only": True,
+        "shadow_promotion_manual_only": True,
+    },
+    "options_review_jobs": {
+        "enabled": True,
+        "worker_poll_seconds": 30,
+        "outcomes_interval_seconds": 300,
+        "oi_time_et": "09:45",
+        "oi_retry_interval_seconds": 900,
+        "oi_plateau_attempts": 2,
+        "oi_retry_max_seconds": 3600,
+        "oi_retry_end_et": "12:00",
+        "oi_minimum_coverage": 0.90,
+        "package_time_et": "16:05",
+        "review_limit": 1000,
     },
     "alert_quality": {
         "sms_min_grade": "B",
@@ -7724,6 +7741,15 @@ class EliteScanner:
         apply_risk_invalidation(alert)
         assign_professional_alert_tier(alert)
         self.apply_alert_priority(alert)
+        if str(alert.setup_name or alert.primary_setup or "").strip().upper() == "MIXED SIGNAL" or alert.mixed_signal_detected:
+            alert.sms_allowed = False
+            alert.watch_allowed = False
+            alert.phase3_heads_up_sent = False
+            alert.phase3_heads_up_eligible = False
+            alert.alert_priority_telegram_allowed = False
+            alert.alert_priority_dashboard_only = True
+            alert.alert_priority_context_only = True
+            alert.notes.append("Mixed Signal is dashboard-only and excluded from actionable/canonical tracking")
         logger.info(alert.short_summary())
         self.writer.write(alert)
         self.notifier.send(alert)

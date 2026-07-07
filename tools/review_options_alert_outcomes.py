@@ -276,7 +276,7 @@ def review_alerts(
                     time.sleep(retry_delay)
         if option_symbol:
             option_quotes = storage.option_quote_observations(option_symbol, limit=10000)
-        option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS)
+        option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS, risk_free_rate=float(whale_config.get("option_attribution_risk_free_rate", 0.043)))
         option_data_diagnostics = client.data_health().get("request_diagnostics", {}) if hasattr(client, "data_health") else {}
         reviewed_row = {
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
@@ -313,6 +313,17 @@ def review_alerts(
             **option_outcome,
             "option_data_diagnostics": option_data_diagnostics,
             "option_bar_fetch_attempts": option_bar_attempts,
+            "option_bar_failure": ({
+                "underlying_symbol": symbol,
+                "option_symbol": option_symbol,
+                "expiration": c.get("expiration"),
+                "dte": c.get("dte"),
+                "endpoint": "historical_option_bars",
+                "http_status": (option_bar_attempts[-1].get("http_status") if option_bar_attempts else None),
+                "provider_category": (option_bar_attempts[-1].get("error_category") if option_bar_attempts else None) or ("empty_response" if option_bar_attempts else "not_requested"),
+                "attempt_count": len(option_bar_attempts),
+                "final_disposition": "retry_exhausted" if option_bar_attempts and not option_bars else "not_requested",
+            } if option_symbol and not option_bars else None),
             **build_outcome_diagnostics(
                 bars=bars,
                 start=start,

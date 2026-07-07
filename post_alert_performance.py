@@ -6,10 +6,42 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 
 UTC = timezone.utc
+ET = ZoneInfo("America/New_York")
 DEFAULT_INTERVALS = (1, 3, 5, 10, 15)
+
+
+def _normalized_setup(value: Any) -> str:
+    return " ".join(str(value or "UNKNOWN").strip().upper().replace("_", " ").split())
+
+
+def is_context_only_setup(alert: Any) -> bool:
+    setup = _normalized_setup(
+        _alert_value(alert, "setup_name")
+        or _alert_value(alert, "primary_setup")
+        or _alert_value(alert, "category")
+    )
+    return setup == "MIXED SIGNAL" or bool(_alert_value(alert, "mixed_signal_detected"))
+
+
+def canonical_episode_key(alert: Any) -> str:
+    timestamp = _parse_dt(_alert_value(alert, "timestamp")) or datetime.now(UTC)
+    symbol = str(_alert_value(alert, "symbol", "")).strip().upper()
+    setup = _normalized_setup(
+        _alert_value(alert, "setup_name")
+        or _alert_value(alert, "primary_setup")
+        or _alert_value(alert, "category")
+    )
+    direction = _direction(
+        _alert_value(alert, "setup_direction")
+        or _alert_value(alert, "scenario_direction")
+        or _alert_value(alert, "direction")
+        or _alert_value(alert, "strategy_direction")
+    )
+    return "|".join((timestamp.astimezone(ET).date().isoformat(), symbol, setup, direction))
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
@@ -58,18 +90,10 @@ def alert_tracking_record(alert: Any, target_move_pct: float = 0.30, meaningful_
         or _alert_value(alert, "category")
         or "Unknown"
     )
-    identity = "|".join(
-        [
-            timestamp.isoformat(),
-            symbol,
-            str(setup_type),
-            direction,
-            str(_alert_value(alert, "alert_tier") or ""),
-            str(_alert_value(alert, "price") or ""),
-        ]
-    )
+    identity = canonical_episode_key(alert)
     return {
         "alert_id": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20],
+        "canonical_episode_key": identity,
         "alert_timestamp": timestamp.isoformat(),
         "last_updated_at": timestamp.isoformat(),
         "status": "PENDING",
@@ -93,6 +117,10 @@ def alert_tracking_record(alert: Any, target_move_pct: float = 0.30, meaningful_
         "delivery_succeeded": bool(_alert_value(alert, "phase3_delivery_succeeded")),
         "delivery_final_decision": _alert_value(alert, "phase3_heads_up_final_decision"),
         "option_quality_reasons": list(_alert_value(alert, "option_quality_reasons") or []),
+        "decision_timestamp": _alert_value(alert, "decision_timestamp") or timestamp.isoformat(),
+        "notification_eligible_at": timestamp.isoformat() if (_alert_value(alert, "phase3_delivery_requested") or _alert_value(alert, "sms_allowed") or _alert_value(alert, "watch_allowed")) else None,
+        "delivery_attempted_at": timestamp.isoformat() if _alert_value(alert, "phase3_delivery_attempted") else None,
+        "delivery_succeeded_at": timestamp.isoformat() if _alert_value(alert, "phase3_delivery_succeeded") else None,
         "interval_prices": {},
         "interval_moves_pct": {},
         "max_favorable_excursion_pct": None,
@@ -251,8 +279,32 @@ class PostAlertPerformanceTracker:
             with self.episode_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"canonical_episode_id": record.get("alert_id"), "episode_updated_at": record.get("last_updated_at"), **record}, sort_keys=True) + "\n")
 
+    @staticmethod
+    def _material_signature(record: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            record.get("alert_tier"), record.get("market_regime"), record.get("option_quality_at_alert"),
+            record.get("entry_timing_at_alert"), record.get("orchestrator_final_alert_type"),
+            record.get("delivery_requested"), record.get("delivery_attempted"), record.get("delivery_succeeded"),
+        )
+
     def register(self, alert: Any) -> Dict[str, Any]:
+        if is_context_only_setup(alert):
+            return {"registration_status": "CONTEXT_ONLY", "suppression_reason": "Mixed Signal is dashboard-only"}
         record = alert_tracking_record(alert, self.target_move_pct, self.meaningful_move_pct)
+        prior = self.pending.get(record["alert_id"])
+        if prior:
+            if self._material_signature(prior) == self._material_signature(record):
+                return {**prior, "registration_status": "SUPPRESSED_REPEAT", "suppression_reason": "No material canonical state change"}
+            record = {
+                **prior,
+                **{key: value for key, value in record.items() if value is not None},
+                "alert_timestamp": prior.get("alert_timestamp"),
+                "last_updated_at": record.get("last_updated_at"),
+                "canonical_update_type": "MATERIAL_CHANGE",
+            }
+        else:
+            record["canonical_update_type"] = "INITIAL"
+        record["registration_status"] = record["canonical_update_type"]
         self.pending[record["alert_id"]] = record
         self._log(record)
         self._save()

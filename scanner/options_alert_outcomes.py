@@ -2,12 +2,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
+import math
 from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
 
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 REGULAR_MARKET_CLOSE = datetime_time(16, 0)
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def _black_scholes_price(spot: float, strike: float, years: float, rate: float, volatility: float, option_type: str) -> Optional[float]:
+    if min(spot, strike, years, volatility) <= 0:
+        return None
+    root_t = math.sqrt(years)
+    d1 = (math.log(spot / strike) + (rate + volatility * volatility / 2.0) * years) / (volatility * root_t)
+    d2 = d1 - volatility * root_t
+    if option_type.upper() == "P":
+        return strike * math.exp(-rate * years) * _normal_cdf(-d2) - spot * _normal_cdf(-d1)
+    return spot * _normal_cdf(d1) - strike * math.exp(-rate * years) * _normal_cdf(d2)
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -230,6 +246,7 @@ def evaluate_option_price_outcome(
     slippage_fraction_of_spread: float = 0.10,
     min_slippage: float = 0.01,
     max_slippage_fraction_of_price: float = 0.05,
+    risk_free_rate: float = 0.043,
 ) -> Dict[str, Any]:
     candidate = _candidate(alert)
     detected_at = _parse_time(alert.get("timestamp") or alert.get("time_detected") or candidate.get("time_detected"))
@@ -238,6 +255,12 @@ def evaluate_option_price_outcome(
     reference_entry = _safe_float(candidate.get("contract_price_paid") or candidate.get("last") or candidate.get("midpoint"))
     entry_bid = _safe_float(candidate.get("bid"))
     entry_ask = _safe_float(candidate.get("ask"))
+    entry_mid = ((entry_bid + entry_ask) / 2.0) if entry_bid and entry_ask else reference_entry
+    entry_iv = _safe_float(candidate.get("implied_volatility") or candidate.get("impliedVolatility") or candidate.get("iv"))
+    underlying_entry = _safe_float(candidate.get("underlying_price") or alert.get("underlying_price"))
+    strike = _safe_float(candidate.get("strike"))
+    option_type = str(candidate.get("option_type") or "C").upper()[:1]
+    expiration = str(candidate.get("expiration") or "")
     if detected_at is None or reference_entry is None or reference_entry <= 0:
         return {"option_outcome_status": "missing_start_context", "option_position_side": side, "option_windows": []}
 
@@ -265,12 +288,38 @@ def evaluate_option_price_outcome(
         future_bid = _safe_float((quote or {}).get("bp") or (quote or {}).get("bid_price") or (quote or {}).get("bid"))
         future_ask = _safe_float((quote or {}).get("ap") or (quote or {}).get("ask_price") or (quote or {}).get("ask"))
         future_spread = max(0.0, future_ask - future_bid) if future_bid and future_ask else None
+        future_mid = ((future_bid + future_ask) / 2.0) if future_bid and future_ask else close
         exit_base = future_bid if side == "LONG" else future_ask if side == "SHORT" else None
         exit_slippage = min(max(min_slippage, (future_spread or 0) * slippage_fraction_of_spread), max_slippage_fraction_of_price * exit_base) if future_spread is not None and exit_base else None
         executable_exit = (future_bid - exit_slippage) if side == "LONG" and future_bid and exit_slippage is not None else (future_ask + exit_slippage) if side == "SHORT" and future_ask and exit_slippage is not None else None
         executable_return = None
         if executable_entry and executable_entry > 0 and executable_exit is not None:
             executable_return = ((executable_exit - executable_entry) / executable_entry * 100.0) if side == "LONG" else ((executable_entry - executable_exit) / executable_entry * 100.0)
+        midpoint_return = ((future_mid - entry_mid) / entry_mid * 100.0) if future_mid is not None and entry_mid else None
+        if side == "SHORT" and midpoint_return is not None:
+            midpoint_return = -midpoint_return
+        spread_cost = ((entry_ask - entry_mid) + (future_mid - future_bid)) / entry_mid * 100.0 if side == "LONG" and entry_bid and entry_ask and future_bid and future_ask and entry_mid else ((entry_mid - entry_bid) + (future_ask - future_mid)) / entry_mid * 100.0 if side == "SHORT" and entry_bid and entry_ask and future_bid and future_ask and entry_mid else None
+        slippage_cost = ((entry_slippage or 0) + (exit_slippage or 0)) / entry_mid * 100.0 if entry_mid and entry_slippage is not None and exit_slippage is not None else None
+        future_iv = _safe_float((quote or {}).get("implied_volatility") or (quote or {}).get("iv"))
+        future_spot = _safe_float((quote or {}).get("underlying_price")) or underlying_entry
+        iv_attr = decay_attr = None
+        attribution_source = "unavailable"
+        try:
+            expiry_dt = datetime.combine(datetime.fromisoformat(expiration).date(), datetime_time(16, 0), tzinfo=MARKET_TIMEZONE).astimezone(timezone.utc)
+            years_entry = max((expiry_dt - detected_at).total_seconds(), 60.0) / (365.0 * 86400.0)
+            years_future = max((expiry_dt - target).total_seconds(), 60.0) / (365.0 * 86400.0)
+            if entry_iv and underlying_entry and future_spot and strike and entry_mid:
+                base_model = _black_scholes_price(underlying_entry, strike, years_entry, risk_free_rate, entry_iv, option_type)
+                decay_model = _black_scholes_price(underlying_entry, strike, years_future, risk_free_rate, entry_iv, option_type)
+                iv_model = _black_scholes_price(underlying_entry, strike, years_future, risk_free_rate, future_iv or entry_iv, option_type)
+                if base_model is not None and decay_model is not None and iv_model is not None:
+                    sign = -1.0 if side == "SHORT" else 1.0
+                    decay_attr = sign * (decay_model - base_model) / entry_mid * 100.0
+                    iv_attr = sign * (iv_model - decay_model) / entry_mid * 100.0
+                    attribution_source = "observed_iv_black_scholes" if future_iv else "black_scholes_constant_iv_estimate"
+        except (TypeError, ValueError):
+            pass
+        residual = executable_return - sum(value or 0.0 for value in (iv_attr, decay_attr)) if executable_return is not None else None
         output_windows.append({
             "minutes": int(minutes), "status": "ok" if close is not None else "missing_bar",
             "reference_price": round(close, 4) if close is not None else None,
@@ -278,6 +327,13 @@ def evaluate_option_price_outcome(
             "future_bid": future_bid, "future_ask": future_ask,
             "estimated_executable_return_pct": round(executable_return, 4) if executable_return is not None else None,
             "executable_status": "ok" if executable_return is not None else "historical_quote_unavailable",
+            "raw_midpoint_return_pct": round(midpoint_return, 4) if midpoint_return is not None else None,
+            "bid_ask_spread_cost_pct": round(spread_cost, 4) if spread_cost is not None else None,
+            "slippage_cost_pct": round(slippage_cost, 4) if slippage_cost is not None else None,
+            "iv_attribution_pct": round(iv_attr, 4) if iv_attr is not None else None,
+            "time_decay_attribution_pct": round(decay_attr, 4) if decay_attr is not None else None,
+            "residual_market_price_return_pct": round(residual, 4) if residual is not None else None,
+            "attribution_source": attribution_source,
         })
     reference_values = [item["reference_return_pct"] for item in output_windows if item["reference_return_pct"] is not None]
     return {
@@ -287,6 +343,7 @@ def evaluate_option_price_outcome(
         "option_entry_executable_price": round(executable_entry, 4) if executable_entry is not None else None,
         "option_entry_bid": entry_bid, "option_entry_ask": entry_ask,
         "option_slippage_model": "max($0.01, 10% of spread), capped at 5% of option price",
+        "option_attribution_model": f"observed IV first; Black-Scholes fallback at risk-free rate {risk_free_rate:.4f}",
         "option_windows": output_windows,
         "option_max_favorable_return_pct": round(max(reference_values), 4) if reference_values else None,
         "option_max_adverse_return_pct": round(min(reference_values), 4) if reference_values else None,

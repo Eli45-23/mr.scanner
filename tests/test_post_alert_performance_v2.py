@@ -53,6 +53,16 @@ class PostAlertPerformanceV2Tests(unittest.TestCase):
         self.assertIn("stale_quote", rows[-1]["option_quality_reasons"])
         self.assertTrue(rows[-1]["useful_alert"])
 
+    def test_mixed_signal_is_context_only_and_repeat_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = PostAlertPerformanceTracker(Path(tmp) / "performance.jsonl", Path(tmp) / "pending.json", episode_path=Path(tmp) / "episodes.jsonl")
+            mixed = self.alert(setup_name="Mixed Signal", primary_setup="Mixed Signal")
+            self.assertEqual(tracker.register(mixed)["registration_status"], "CONTEXT_ONLY")
+            alert = self.alert(setup_name="VWAP Reclaim", primary_setup="VWAP Reclaim")
+            self.assertEqual(tracker.register(alert)["registration_status"], "INITIAL")
+            self.assertEqual(tracker.register(alert)["registration_status"], "SUPPRESSED_REPEAT")
+            self.assertEqual(len((Path(tmp) / "episodes.jsonl").read_text().splitlines()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,6 +67,16 @@ class OptionsAlertOutcomeTests(unittest.TestCase):
         self.assertIsNone(result["option_windows"][0]["estimated_executable_return_pct"])
         self.assertEqual(result["option_windows"][0]["executable_status"], "historical_quote_unavailable")
 
+    def test_option_return_cost_attribution_is_labeled_and_reconciles(self):
+        alert = {"timestamp": "2026-07-06T14:00:00+00:00", "aggression_side": "near_ask", "candidate": {"contract_price_paid": 2.05, "option_type": "CALL", "bid": 1.90, "ask": 2.10, "implied_volatility": 0.40, "underlying_price": 100, "strike": 100, "expiration": "2026-07-10"}}
+        bars = [{"t": "2026-07-06T14:15:00+00:00", "c": 2.30}]
+        quotes = [{"t": "2026-07-06T14:15:00+00:00", "bid": 2.20, "ask": 2.40, "implied_volatility": 0.42, "underlying_price": 100.5}]
+        result = evaluate_option_price_outcome(alert, bars, quotes, windows=(15,))
+        window = result["option_windows"][0]
+        self.assertEqual(window["attribution_source"], "observed_iv_black_scholes")
+        self.assertIsNotNone(window["bid_ask_spread_cost_pct"])
+        self.assertAlmostEqual(window["estimated_executable_return_pct"], window["iv_attribution_pct"] + window["time_decay_attribution_pct"] + window["residual_market_price_return_pct"], places=3)
+
     def test_put_flow_favorable_when_price_falls(self):
         start = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
         alert = {

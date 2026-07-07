@@ -701,6 +701,8 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
     buckets: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     score_totals: Dict[str, Dict[str, float]] = {}
     for row in latest_outcomes_by_key(outcomes).values():
+        if str(row.get("classification") or row.get("setup_type") or "").strip().upper() == "MIXED SIGNAL":
+            continue
         stamp = _parse_iso_time(row.get("detected_at") or row.get("reviewed_at"))
         if stamp and (now - stamp).days > history_days:
             continue

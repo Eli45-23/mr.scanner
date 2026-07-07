@@ -389,6 +389,18 @@ rotation_duration_max_seconds: 300
 option_bar_unavailable_warning_rate: 0.02
 ```
 
+### Quality analytics and background reviews
+
+Outcome reviews, next-day OI confirmation, and daily package generation run in a dedicated background worker so provider latency cannot delay the live options scan loop. Runtime and data-health APIs expose scan duration/cadence p50 and p95, overruns, missed cycles, worker errors, OI retry progress, plateau backoff, and option-bar failure categories.
+
+Mixed Signal remains dashboard context only. It is excluded from notification eligibility, canonical alert episodes, outcome calibration, and shadow-cohort promotion. Canonical episodes use the ET session, symbol, normalized setup, and direction; identical repeats are suppressed and only material state changes are appended.
+
+The Tier-1 evidence gates remain unchanged: at least 20 distinct sessions, 30 paired effective samples, a posterior +0.10% success rate of at least 30%, and a positive 15-minute executable-return rate of at least 50%. Shadow cohorts can become `promotion_ready`, but promotion always requires manual approval.
+
+New analytics endpoints include `/api/options-whales/regression`, `/api/options-whales/latency`, and the promotion queue in `/api/options-whales/reliability`. `/api/options-whales/data-health` includes scan-loop health, the OI waterfall/backoff state, and dimensioned option-bar failures.
+
+Executable option outcomes report midpoint return, spread and slippage costs, IV attribution, time-decay attribution, and residual market-price return. Observed IV is preferred; missing future IV uses a clearly labeled constant-IV Black-Scholes estimate at the configured analytics-only risk-free rate.
+
 Index/ETF 0DTE flow has stricter thresholds:
 
 ```text

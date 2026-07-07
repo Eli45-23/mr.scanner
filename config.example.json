@@ -85,13 +85,20 @@
     "notification_update_min_price_confirmation_gain": 2,
     "option_bar_unavailable_warning_rate": 0.02,
     "option_bar_retry_attempts": 3,
-    "option_bar_retry_delay_seconds": 0.25
+    "option_bar_retry_delay_seconds": 0.25,
+    "analytics_session_window": 5,
+    "option_attribution_risk_free_rate": 0.043,
+    "canonical_material_change_only": true,
+    "shadow_promotion_manual_only": true
   },
   "options_review_jobs": {
     "enabled": true,
     "outcomes_interval_seconds": 300,
+    "worker_poll_seconds": 30,
     "oi_time_et": "09:45",
     "oi_retry_interval_seconds": 900,
+    "oi_plateau_attempts": 2,
+    "oi_retry_max_seconds": 3600,
     "oi_retry_end_et": "12:00",
     "oi_minimum_coverage": 0.9,
     "package_time_et": "16:05",
