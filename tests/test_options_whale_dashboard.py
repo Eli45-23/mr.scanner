@@ -104,11 +104,25 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Shadow option-win rate", html)
         self.assertIn("Tier-1 session progress", html)
         self.assertIn("Tier-1 paired outcomes", html)
+        self.assertIn("Regime UNKNOWN alarm", html)
+        self.assertIn("Noise ratio", html)
 
     def test_missed_cycles_use_actual_cadence(self):
         cadence_missed, delay_missed, total = scanner_dashboard.calculate_missed_cycles(107.5, 0, 30)
         self.assertEqual((cadence_missed, delay_missed, total), (3, 0, 3))
         self.assertEqual(scanner_dashboard.calculate_missed_cycles(29.5, 0, 30)[2], 0)
+
+    def test_oi_job_persists_prior_session_selection_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "review_state.json"
+            config = {"options_review_jobs": {"enabled": True, "outcomes_interval_seconds": 999999, "oi_time_et": "09:45", "oi_retry_interval_seconds": 900, "oi_retry_end_et": "12:00", "package_time_et": "23:59"}}
+            result = {"complete": True, "source_session_date": "2026-07-09", "unique_contract_count": 10, "oi_coverage_rate": 1.0}
+            with mock.patch.object(scanner_dashboard, "OPTIONS_REVIEW_JOB_STATE_PATH", state_path), mock.patch("tools.review_options_alert_outcomes.review_alerts", return_value={}), mock.patch("tools.review_next_day_oi.review_from_live_contracts", return_value=result):
+                scanner_dashboard.run_options_review_jobs(config, datetime(2026, 7, 10, 10, 0, tzinfo=scanner_dashboard.ET))
+            state = json.loads(state_path.read_text())
+            self.assertEqual(state["oi_source_day"], "2026-07-09")
+            self.assertEqual(state["oi_source_selection"], "most_recent_prior_trading_session")
+            self.assertEqual(state["oi_review_day"], "2026-07-10")
 
     def test_whale_dashboard_debug_candidates_are_hidden_by_default(self):
         html = scanner_dashboard.WHALE_INDEX_HTML

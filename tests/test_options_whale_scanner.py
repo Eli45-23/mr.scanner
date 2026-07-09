@@ -7,6 +7,8 @@ from pathlib import Path
 from scanner.options_whale_scanner import (
     OptionsWhaleScanner,
     apply_index_0dte_noise_filter,
+    apply_bearish_flow_oversight,
+    apply_executable_edge_memory,
     apply_symbol_bias_memory,
     apply_reliability_adjustment,
     attach_flow_episode_context,
@@ -14,6 +16,7 @@ from scanner.options_whale_scanner import (
     attach_simple_follow_through,
     build_flow_episode_key,
     build_symbol_bias_memory,
+    build_executable_edge_memory,
     build_reliability_table,
     build_premium_display_fields,
     build_premium_pressure_fields,
@@ -200,8 +203,55 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             scanner = OptionsWhaleScanner({"options_whale_scanner": {"enabled": True, "max_contracts_per_scan": 1000, "scan_deadline_seconds": 25, "deadline_contract_safety_factor": .9, "deadline_min_contracts_per_scan": 10, "min_score": 99, "min_premium": 999999999}}, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
             result = scanner.scan()
             self.assertTrue(result["adaptive_contract_cap_applied"])
-            self.assertEqual(result["effective_contract_cap"], 375)
+            self.assertEqual(result["effective_contract_cap"], 250)
             self.assertEqual(result["contract_budget_waterfall"]["contracts_evaluated"], result["contracts_evaluated"])
+
+    def test_market_regime_falls_back_to_spy_qqq_bars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scanner = OptionsWhaleScanner({"options_whale_scanner": {"enabled": True}}, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
+            regime = scanner._latest_market_regime({
+                "SPY": [{"c": 100.0}, {"c": 100.2}],
+                "QQQ": [{"c": 200.0}, {"c": 200.4}],
+            })
+            self.assertEqual(regime, "TRENDING_UP")
+            self.assertEqual(scanner.last_market_regime_context["regime_source"], "derived_spy_qqq_bars")
+
+    def test_bearish_oversight_penalizes_weak_confirmation(self):
+        result = {
+            "whale_score": 86,
+            "direction_label": "Possible bearish put flow",
+            "flow_bias": "BEARISH",
+            "direction_confidence": "LOW",
+            "price_confirmation_score": 4,
+            "candidate": {"underlying_symbol": "AAPL"},
+        }
+        adjusted = apply_bearish_flow_oversight(result, {"bearish_dashboard_penalty": 8})
+        self.assertFalse(adjusted["bearish_oversight_passed"])
+        self.assertLess(adjusted["whale_score"], 86)
+
+    def test_executable_edge_memory_promotes_and_penalizes_symbol_bias(self):
+        outcomes = []
+        for idx in range(20):
+            outcomes.append({
+                "alert_key": f"good-{idx}",
+                "detected_at": "2026-07-09T14:00:00Z",
+                "underlying_symbol": "META",
+                "flow_bias": "BULLISH",
+                "option_windows": [{"minutes": 15, "status": "ok", "estimated_executable_return_pct": 2.0 if idx < 12 else .5}],
+            })
+            outcomes.append({
+                "alert_key": f"bad-{idx}",
+                "detected_at": "2026-07-09T14:00:00Z",
+                "underlying_symbol": "AAPL",
+                "flow_bias": "BEARISH",
+                "option_windows": [{"minutes": 15, "status": "ok", "estimated_executable_return_pct": 1.0 if idx < 3 else -2.0}],
+            })
+        memory = build_executable_edge_memory(outcomes, min_samples=20, strong_rate=.45, weak_rate=.30)
+        self.assertEqual(memory[("META", "BULLISH")]["executable_edge_label"], "promote_symbol_bias")
+        self.assertEqual(memory[("AAPL", "BEARISH")]["executable_edge_label"], "penalize_symbol_bias")
+        result = apply_executable_edge_memory({"whale_score": 80, "flow_bias": "BEARISH", "candidate": {"underlying_symbol": "AAPL"}}, memory, {"profitable_symbol_penalty": 6})
+        self.assertEqual(result["whale_score"], 74)
 
     def test_no_candidate_scan_returns_near_misses_and_rejection_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

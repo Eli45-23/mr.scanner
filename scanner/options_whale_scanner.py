@@ -88,7 +88,27 @@ def default_options_whale_config() -> Dict[str, Any]:
         "deadline_aware_contract_budget": True,
         "scan_deadline_seconds": 25,
         "deadline_contract_safety_factor": 0.90,
+        "cadence_overrun_contract_safety_factor": 0.60,
         "deadline_min_contracts_per_scan": 500,
+        "scan_cadence_target_seconds": 30,
+        "scan_cadence_overrun_multiplier": 1.50,
+        "profitable_symbol_priority_enabled": True,
+        "profitable_symbol_priority_min_samples": 20,
+        "profitable_symbol_priority_min_executable_rate": 0.45,
+        "profitable_symbol_penalty_rate": 0.30,
+        "profitable_symbol_priority_bonus": 4,
+        "profitable_symbol_penalty": 6,
+        "dashboard_min_score_after_noise": 75,
+        "dashboard_min_score_bearish": 82,
+        "bearish_dashboard_min_score": 82,
+        "bearish_dashboard_min_direction_confidence": "MEDIUM",
+        "bearish_dashboard_min_price_context": 8,
+        "bearish_dashboard_penalty": 8,
+        "minimum_executable_edge_rate": 0.45,
+        "minimum_executable_edge_samples": 20,
+        "minimum_executable_edge_penalty": 5,
+        "episode_noise_min_score": 75,
+        "episode_noise_min_premium": 100000,
         "active_episode_quote_minutes": 75,
         "active_episode_quote_limit": 500,
         "index_0dte_min_score": 85,
@@ -639,6 +659,93 @@ def build_symbol_bias_memory(outcomes: List[Dict[str, Any]], *, window_minutes: 
     return memory
 
 
+def build_executable_edge_memory(
+    outcomes: List[Dict[str, Any]],
+    *,
+    window_minutes: int = 15,
+    min_samples: int = 20,
+    strong_rate: float = 0.45,
+    weak_rate: float = 0.30,
+    half_life_sessions: float = 2.0,
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    buckets: Dict[tuple[str, str], Dict[str, Any]] = {}
+    latest_date = max(((_parse_iso_time(row.get("detected_at") or row.get("reviewed_at")) or datetime.min.replace(tzinfo=timezone.utc)).date() for row in outcomes), default=datetime.now(timezone.utc).date())
+    for row in latest_outcomes_by_key(outcomes).values():
+        symbol = str(row.get("underlying_symbol") or "").upper()
+        bias = str(row.get("flow_bias") or "UNKNOWN").upper()
+        if not symbol or bias == "UNKNOWN":
+            continue
+        option_window = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == int(window_minutes) and isinstance(item.get("estimated_executable_return_pct"), (int, float))), None)
+        if not option_window:
+            continue
+        stamp = _parse_iso_time(row.get("detected_at") or row.get("reviewed_at"))
+        age_days = max(0, (latest_date - stamp.date()).days) if stamp else 0
+        weight = 0.5 ** (age_days / max(0.1, float(half_life_sessions)))
+        bucket = buckets.setdefault((symbol, bias), {"samples": 0, "positive": 0, "weighted_samples": 0.0, "weighted_positive": 0.0, "returns": []})
+        value = float(option_window["estimated_executable_return_pct"])
+        bucket["samples"] += 1
+        bucket["weighted_samples"] += weight
+        bucket["returns"].append(value)
+        if value > 0:
+            bucket["positive"] += 1
+            bucket["weighted_positive"] += weight
+    memory: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for key, bucket in buckets.items():
+        samples = int(bucket["samples"])
+        rate = bucket["weighted_positive"] / bucket["weighted_samples"] if bucket["weighted_samples"] else 0.0
+        returns = bucket["returns"]
+        mean_return = sum(returns) / len(returns) if returns else None
+        if samples < int(min_samples):
+            label = "collecting_executable_edge"
+        elif rate >= float(strong_rate) and (mean_return or 0) >= 0:
+            label = "promote_symbol_bias"
+        elif rate <= float(weak_rate) or (mean_return is not None and mean_return < 0):
+            label = "penalize_symbol_bias"
+        else:
+            label = "neutral_symbol_bias"
+        memory[key] = {
+            "executable_edge_label": label,
+            "executable_edge_window": int(window_minutes),
+            "executable_edge_samples": samples,
+            "executable_edge_positive_rate": round(rate, 4),
+            "executable_edge_mean_return_pct": round(mean_return, 4) if mean_return is not None else None,
+            "executable_edge_effective_samples": round(bucket["weighted_samples"], 2),
+        }
+    return memory
+
+
+def apply_executable_edge_memory(result: Dict[str, Any], memory: Dict[tuple[str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    candidate = result.get("candidate") or {}
+    key = (str(candidate.get("underlying_symbol") or "").upper(), infer_direction_bias_label(result))
+    learned = memory.get(key)
+    if not learned:
+        result.update({"executable_edge_label": "no_executable_history", "executable_edge_score_adjustment": 0})
+        return result
+    result.update(learned)
+    label = str(learned.get("executable_edge_label") or "")
+    adjustment = 0
+    if label == "promote_symbol_bias":
+        adjustment = int(cfg.get("profitable_symbol_priority_bonus", 4))
+    elif label == "penalize_symbol_bias":
+        adjustment = -int(cfg.get("profitable_symbol_penalty", 6))
+    elif int(learned.get("executable_edge_samples") or 0) >= int(cfg.get("minimum_executable_edge_samples", 20)) and safe_float(learned.get("executable_edge_positive_rate")) < float(cfg.get("minimum_executable_edge_rate", 0.45)):
+        adjustment = -int(cfg.get("minimum_executable_edge_penalty", 5))
+        label = "minimum_executable_edge_failed"
+        result["executable_edge_label"] = label
+    if adjustment:
+        original = int(result.get("whale_score") or 0)
+        result["pre_executable_edge_whale_score"] = original
+        result["whale_score"] = max(0, min(100, original + adjustment))
+        result["noise_adjusted_score"] = result["whale_score"]
+        result["classification"] = classify_score(result["whale_score"])
+    result["executable_edge_score_adjustment"] = adjustment
+    result["executable_edge_reason"] = (
+        f"{key[0]} {key[1].lower()} {learned.get('executable_edge_window')}m executable option win rate "
+        f"{safe_float(learned.get('executable_edge_positive_rate')):.0%} over {learned.get('executable_edge_samples')} samples."
+    )
+    return result
+
+
 def apply_symbol_bias_memory(result: Dict[str, Any], memory: Dict[tuple[str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     candidate = result.get("candidate") or {}
     symbol = str(candidate.get("underlying_symbol") or "").upper()
@@ -704,7 +811,7 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
     history_days = max(1, int(cfg.get("reliability_history_days", 20)))
     half_life = max(0.1, float(cfg.get("reliability_half_life_days", 5)))
     buckets: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
-    score_totals: Dict[str, Dict[str, float]] = {}
+    score_totals: Dict[str, Dict[str, Dict[str, float]]] = {}
     for row in latest_outcomes_by_key(outcomes).values():
         if str(row.get("classification") or row.get("setup_type") or "").strip().upper() == "MIXED SIGNAL":
             continue
@@ -733,7 +840,8 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         bucket["raw_samples"] += 1
         if stamp:
             bucket["sessions"].add(stamp.date().isoformat())
-        score_total = score_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0, "executable_samples": 0.0, "executable_successes": 0.0})
+        direction_totals = score_totals.setdefault(key[4], {})
+        score_total = direction_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0, "executable_samples": 0.0, "executable_successes": 0.0})
         score_total["samples"] += weight
         if float(signed) >= 0.10:
             bucket["meaningful_successes"] += weight
@@ -746,13 +854,22 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
                 bucket["executable_successes"] += weight
                 score_total["executable_successes"] += weight
         bucket["effective_samples"] = min(bucket["meaningful_samples"], bucket["executable_samples"])
-    score_rates = {name: value["successes"] / value["samples"] for name, value in score_totals.items() if value["samples"]}
-    executable_score_rates = {name: value["executable_successes"] / value["executable_samples"] for name, value in score_totals.items() if value["executable_samples"]}
-    ordered = [name for name in ("75-79", "80-89", "90+") if name in score_rates and name in executable_score_rates]
-    meaningful_monotonic = len(ordered) >= 2 and all(score_rates[right] >= score_rates[left] for left, right in zip(ordered, ordered[1:]))
-    executable_monotonic = len(ordered) >= 2 and all(executable_score_rates[right] >= executable_score_rates[left] for left, right in zip(ordered, ordered[1:]))
-    guard_active = bool(len(ordered) >= 2 and not (meaningful_monotonic and executable_monotonic))
-    guard_reason = "Score buckets are not monotonic for both +0.10% outcomes and executable option returns." if guard_active else ""
+    direction_score_guards: Dict[str, Dict[str, Any]] = {}
+    for direction, totals in score_totals.items():
+        score_rates = {name: value["successes"] / value["samples"] for name, value in totals.items() if value["samples"]}
+        executable_score_rates = {name: value["executable_successes"] / value["executable_samples"] for name, value in totals.items() if value["executable_samples"]}
+        ordered = [name for name in ("75-79", "80-89", "90+") if name in score_rates and name in executable_score_rates]
+        meaningful_monotonic = len(ordered) >= 2 and all(score_rates[right] >= score_rates[left] for left, right in zip(ordered, ordered[1:]))
+        executable_monotonic = len(ordered) >= 2 and all(executable_score_rates[right] >= executable_score_rates[left] for left, right in zip(ordered, ordered[1:]))
+        guard_active = bool(len(ordered) >= 2 and not (meaningful_monotonic and executable_monotonic))
+        direction_score_guards[direction] = {
+            "directional_calibration_direction": direction,
+            "directional_score_rank_meaningful_monotonic": meaningful_monotonic,
+            "directional_score_rank_executable_monotonic": executable_monotonic,
+            "directional_score_rank_validation_passed": meaningful_monotonic and executable_monotonic,
+            "directional_calibration_guard_active": guard_active,
+            "directional_calibration_guard_reason": "Score buckets are not monotonic for this direction across +0.10% outcomes and executable option returns." if guard_active else "",
+        }
     table: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     prior_success = float(cfg.get("reliability_prior_successes", 10))
     prior_failure = float(cfg.get("reliability_prior_failures", 10))
@@ -768,13 +885,15 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         meaningful_passed = meaningful_posterior >= meaningful_threshold
         executable_passed = executable_posterior >= executable_threshold
         dual_metric_passed = qualified and meaningful_passed and executable_passed
+        direction_guard = direction_score_guards.get(key[4], {})
+        guard_active = bool(direction_guard.get("directional_calibration_guard_active"))
         if adjustment > 0 and (guard_active or not dual_metric_passed):
             adjustment = 0
         block_reasons = []
         if not qualified: block_reasons.append("insufficient sessions or paired effective samples")
         if not meaningful_passed: block_reasons.append("+0.10% meaningful-move rate below threshold")
         if not executable_passed: block_reasons.append("positive executable-return rate below threshold")
-        table[key] = {"reliability_rate": round(meaningful_posterior, 4), "reliability_meaningful_rate": round(meaningful_posterior, 4), "reliability_executable_positive_rate": round(executable_posterior, 4), "reliability_meaningful_effective_samples": round(bucket["meaningful_samples"], 2), "reliability_executable_effective_samples": round(bucket["executable_samples"], 2), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_meaningful_passed": meaningful_passed, "reliability_executable_passed": executable_passed, "reliability_dual_metric_passed": dual_metric_passed, "reliability_block_reasons": block_reasons, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason, "score_rank_meaningful_monotonic": meaningful_monotonic, "score_rank_executable_monotonic": executable_monotonic, "score_rank_validation_passed": meaningful_monotonic and executable_monotonic}
+        table[key] = {"reliability_rate": round(meaningful_posterior, 4), "reliability_meaningful_rate": round(meaningful_posterior, 4), "reliability_executable_positive_rate": round(executable_posterior, 4), "reliability_meaningful_effective_samples": round(bucket["meaningful_samples"], 2), "reliability_executable_effective_samples": round(bucket["executable_samples"], 2), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_meaningful_passed": meaningful_passed, "reliability_executable_passed": executable_passed, "reliability_dual_metric_passed": dual_metric_passed, "reliability_block_reasons": block_reasons, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": direction_guard.get("directional_calibration_guard_reason", ""), "score_rank_meaningful_monotonic": bool(direction_guard.get("directional_score_rank_meaningful_monotonic")), "score_rank_executable_monotonic": bool(direction_guard.get("directional_score_rank_executable_monotonic")), "score_rank_validation_passed": bool(direction_guard.get("directional_score_rank_validation_passed")), **direction_guard}
     return table
 
 
@@ -934,6 +1053,11 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
         return "Tier 2", False, "Possible multi-leg flow is dashboard-only until direction is clearer."
     if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
         return "Tier 2", False, "Direction confidence is below the Tier 1 requirement."
+    if bias == "BEARISH" and not result.get("bearish_oversight_passed", True):
+        result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + list(result.get("bearish_oversight_reasons") or [])))})
+        return "Tier 3", False, "Bearish flow requires stronger confirmation before high-rank dashboard promotion."
+    if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"}:
+        return "Tier 3", False, "Recent executable option-return edge is weak; dashboard-only watch until performance improves."
     if score >= int(cfg.get("tier1_min_score", 95)) and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= int(cfg.get("tier1_min_price_context", 8)):
         if cohort_reasons:
             result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": cohort_reasons})
@@ -1009,6 +1133,43 @@ def apply_index_0dte_noise_filter(result: Dict[str, Any], cfg: Dict[str, Any]) -
     }
 
 
+def apply_bearish_flow_oversight(result: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    if infer_direction_bias_label(result) != "BEARISH":
+        result["bearish_oversight_passed"] = True
+        return result
+    confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    required_confidence = str(cfg.get("bearish_dashboard_min_direction_confidence", "MEDIUM")).upper()
+    observed_confidence = str(result.get("direction_confidence") or (result.get("candidate") or {}).get("direction_confidence") or "LOW").upper()
+    price_score = safe_float(result.get("price_confirmation_score"))
+    min_price = int(cfg.get("bearish_dashboard_min_price_context", 8))
+    score = int(result.get("whale_score") or 0)
+    min_score = int(cfg.get("bearish_dashboard_min_score", 82))
+    reasons: List[str] = []
+    if score < min_score:
+        reasons.append("bearish score below dashboard oversight threshold")
+    if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
+        reasons.append("bearish direction confidence below oversight threshold")
+    if price_score < min_price:
+        reasons.append("bearish price confirmation below oversight threshold")
+    executable_rate = result.get("executable_edge_positive_rate")
+    executable_samples = int(result.get("executable_edge_samples") or 0)
+    if executable_samples >= int(cfg.get("minimum_executable_edge_samples", 20)) and safe_float(executable_rate) < float(cfg.get("minimum_executable_edge_rate", 0.45)):
+        reasons.append("bearish recent executable-return edge is weak")
+    result["bearish_oversight_passed"] = not reasons
+    result["bearish_oversight_reasons"] = reasons
+    if reasons:
+        original = int(result.get("whale_score") or 0)
+        penalty = int(cfg.get("bearish_dashboard_penalty", 8))
+        result["pre_bearish_oversight_whale_score"] = original
+        result["whale_score"] = max(0, original - penalty)
+        result["noise_adjusted_score"] = result["whale_score"]
+        result["classification"] = classify_score(result["whale_score"])
+        warnings = list(result.get("score_warnings") or [])
+        warnings.append("bearish oversight dashboard-only until stronger confirmation")
+        result["score_warnings"] = warnings
+    return result
+
+
 def format_whale_alert(result: Dict[str, Any]) -> str:
     candidate = result.get("candidate") or {}
     lines = [
@@ -1041,6 +1202,7 @@ class OptionsWhaleScanner:
         self.last_scan: Dict[str, Any] = {}
         self.latest_results: List[Dict[str, Any]] = []
         self.last_scan_order: Dict[str, Any] = {}
+        self.last_market_regime_context: Dict[str, Any] = {}
         self._contract_catalog: Dict[str, List[Dict[str, Any]]] = {}
         self._contract_catalog_refreshed_at: Dict[str, datetime] = {}
 
@@ -1158,7 +1320,11 @@ class OptionsWhaleScanner:
         prior_contracts = int(state.get("last_contracts_scanned") or configured_max_contracts)
         adaptive_contract_cap = configured_max_contracts
         if bool(self.whale.get("deadline_aware_contract_budget", True)) and prior_duration > budget_seconds:
-            adaptive_contract_cap = int(prior_contracts * budget_seconds / prior_duration * float(self.whale.get("deadline_contract_safety_factor", 0.90)))
+            safety_factor = float(self.whale.get("deadline_contract_safety_factor", 0.90))
+            cadence_target = max(1.0, float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))))
+            if prior_duration > cadence_target * float(self.whale.get("scan_cadence_overrun_multiplier", 1.50)):
+                safety_factor = min(safety_factor, float(self.whale.get("cadence_overrun_contract_safety_factor", 0.60)))
+            adaptive_contract_cap = int(prior_contracts * budget_seconds / prior_duration * safety_factor)
         min_contract_cap = max(1, int(self.whale.get("deadline_min_contracts_per_scan", 500)))
         max_contracts = min(configured_max_contracts, max(min_contract_cap, adaptive_contract_cap))
         last_scanned_at = state.setdefault("last_scanned_at", {})
@@ -1316,7 +1482,33 @@ class OptionsWhaleScanner:
             prices[symbol] = safe_float((rows[-1] if rows else {}).get("c") or (rows[-1] if rows else {}).get("close")) if rows else None
         return prices
 
-    def _latest_market_regime(self) -> str:
+    def _derive_market_regime_from_bars(self, stock_bars: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        moves: Dict[str, Optional[float]] = {}
+        for symbol in ("SPY", "QQQ"):
+            rows = stock_bars.get(symbol) or []
+            first = safe_float((rows[0] if rows else {}).get("c") or (rows[0] if rows else {}).get("close"))
+            last = safe_float((rows[-1] if rows else {}).get("c") or (rows[-1] if rows else {}).get("close"))
+            moves[symbol] = ((last - first) / first * 100.0) if first and last else None
+        available = [value for value in moves.values() if value is not None]
+        threshold = float(self.whale.get("fallback_regime_move_threshold_pct", 0.05))
+        regime = "UNKNOWN"
+        reason = "SPY/QQQ bars unavailable for fallback regime."
+        if len(available) == 2:
+            if all(value >= threshold for value in available):
+                regime = "TRENDING_UP"
+                reason = "Fallback regime from SPY/QQQ intraday bars: both above threshold."
+            elif all(value <= -threshold for value in available):
+                regime = "TRENDING_DOWN"
+                reason = "Fallback regime from SPY/QQQ intraday bars: both below threshold."
+            elif abs(sum(available) / len(available)) < threshold:
+                regime = "RANGE_BOUND"
+                reason = "Fallback regime from SPY/QQQ intraday bars: flat/mixed."
+            else:
+                regime = "CHOPPY"
+                reason = "Fallback regime from SPY/QQQ intraday bars: mixed direction."
+        return {"market_regime": regime, "regime_source": "derived_spy_qqq_bars", "regime_reason": reason, "regime_moves_pct": {symbol: round(value, 4) if value is not None else None for symbol, value in moves.items()}, "context_complete": len(available) == 2}
+
+    def _latest_market_regime(self, stock_bars: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> str:
         latest_path = self.root / "data" / "market_regime_latest.json"
         try:
             row = json.loads(latest_path.read_text(encoding="utf-8"))
@@ -1324,20 +1516,26 @@ class OptionsWhaleScanner:
             ages = row.get("source_bar_ages_seconds") or {}
             bars_fresh = all(ages.get(symbol) is not None and float(ages.get(symbol)) <= 90 for symbol in ("SPY", "QQQ"))
             if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 90 and row.get("context_complete") and bars_fresh:
+                self.last_market_regime_context = {"market_regime": str(row.get("market_regime") or "UNKNOWN").upper(), "regime_source": "market_regime_latest", "regime_reason": row.get("regime_reason") or row.get("reason") or "", "context_complete": True}
                 return str(row.get("market_regime") or "UNKNOWN").upper()
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             pass
         path = self.root / "logs" / "market_regime_heartbeat.jsonl"
-        if not path.exists():
-            return "UNKNOWN"
-        try:
-            for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
-                row = json.loads(line)
-                stamp = _parse_iso_time(row.get("timestamp"))
-                if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 90 and row.get("context_complete"):
-                    return str(row.get("market_regime") or row.get("regime") or "UNKNOWN").upper()
-        except (OSError, json.JSONDecodeError):
-            pass
+        if path.exists():
+            try:
+                for line in reversed(path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]):
+                    row = json.loads(line)
+                    stamp = _parse_iso_time(row.get("timestamp"))
+                    if stamp and (datetime.now(timezone.utc) - stamp).total_seconds() <= 90 and row.get("context_complete"):
+                        self.last_market_regime_context = {"market_regime": str(row.get("market_regime") or row.get("regime") or "UNKNOWN").upper(), "regime_source": "market_regime_heartbeat", "regime_reason": row.get("regime_reason") or row.get("reason") or "", "context_complete": True}
+                        return str(row.get("market_regime") or row.get("regime") or "UNKNOWN").upper()
+            except (OSError, json.JSONDecodeError):
+                pass
+        if stock_bars:
+            derived = self._derive_market_regime_from_bars(stock_bars)
+            self.last_market_regime_context = derived
+            return str(derived.get("market_regime") or "UNKNOWN").upper()
+        self.last_market_regime_context = {"market_regime": "UNKNOWN", "regime_source": "missing", "regime_reason": "No fresh market regime heartbeat and no fallback bars.", "context_complete": False}
         return "UNKNOWN"
 
     def _candidate_from_contract(self, contract: Dict[str, Any], snapshot: Dict[str, Any], prices: Dict[str, Optional[float]], now: datetime) -> OptionFlowCandidate:
@@ -1520,7 +1718,7 @@ class OptionsWhaleScanner:
         stock_bars = self.client.get_stock_bars(underlyings[:50], start=end - timedelta(minutes=90), end=end) if self.whale.get("enable_price_action_context", True) else {}
         baseline_records = self.baseline.load_records()
         recent_outcomes = self.storage.latest_episode_outcomes(limit=5000) or self.storage.latest_outcomes(limit=5000)
-        market_regime = self._latest_market_regime()
+        market_regime = self._latest_market_regime(stock_bars)
         reliability_table = build_reliability_table(recent_outcomes, effective_cfg) if bool(effective_cfg.get("reliability_calibration_enabled", True)) else {}
         symbol_bias_memory = build_symbol_bias_memory(
             recent_outcomes,
@@ -1530,6 +1728,14 @@ class OptionsWhaleScanner:
             strong_rate=float(effective_cfg.get("symbol_bias_memory_strong_rate", 0.55)),
             half_life_sessions=float(effective_cfg.get("symbol_bias_memory_half_life_sessions", 2)),
         ) if bool(effective_cfg.get("symbol_bias_memory_enabled", True)) else {}
+        executable_edge_memory = build_executable_edge_memory(
+            recent_outcomes,
+            window_minutes=int(effective_cfg.get("symbol_bias_memory_window_minutes", 15)),
+            min_samples=int(effective_cfg.get("profitable_symbol_priority_min_samples", 20)),
+            strong_rate=float(effective_cfg.get("profitable_symbol_priority_min_executable_rate", 0.45)),
+            weak_rate=float(effective_cfg.get("profitable_symbol_penalty_rate", 0.30)),
+            half_life_sessions=float(effective_cfg.get("symbol_bias_memory_half_life_sessions", 2)),
+        ) if bool(effective_cfg.get("profitable_symbol_priority_enabled", True)) else {}
         raw_candidates: List[Dict[str, Any]] = []
         evaluated: List[Dict[str, Any]] = []
         skipped_reasons: Dict[str, int] = {}
@@ -1635,6 +1841,11 @@ class OptionsWhaleScanner:
                 result = apply_reliability_adjustment(result, reliability_table, effective_cfg)
             else:
                 result.update({"reliability_status": "no_history", "reliability_score_adjustment": 0})
+            if executable_edge_memory:
+                result = apply_executable_edge_memory(result, executable_edge_memory, effective_cfg)
+            else:
+                result.update({"executable_edge_label": "disabled_or_no_history", "executable_edge_score_adjustment": 0})
+            result = apply_bearish_flow_oversight(result, effective_cfg)
             if int(result.get("whale_score") or 0) < int(effective_cfg.get("min_score", 75)):
                 continue
             result.update({
@@ -1694,6 +1905,28 @@ class OptionsWhaleScanner:
         results = dedupe_whale_prints(results)
         results = attach_flow_episode_context(results, int(effective_cfg.get("flow_episode_bucket_minutes", 5)))
         results = attach_outcome_completeness(results, recent_outcomes)
+        eligible_results: List[Dict[str, Any]] = []
+        suppressed_noise_count = 0
+        for item in results:
+            score = int(item.get("whale_score") or 0)
+            candidate = item.get("candidate") or {}
+            noise_reasons: List[str] = []
+            episode_min_score = min(int(effective_cfg.get("episode_noise_min_score", 75)), int(effective_cfg.get("min_score", 75)))
+            if score < episode_min_score:
+                noise_reasons.append("score below episode registration threshold")
+            if safe_float(candidate.get("estimated_premium")) < float(effective_cfg.get("episode_noise_min_premium", 100000)):
+                noise_reasons.append("premium below episode registration threshold")
+            if infer_direction_bias_label(item) == "BEARISH" and not item.get("bearish_oversight_passed", True):
+                noise_reasons.extend(item.get("bearish_oversight_reasons") or ["bearish oversight did not pass"])
+            if str(item.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"} and score < int(effective_cfg.get("dashboard_min_score_after_noise", 75)) + 5:
+                noise_reasons.append("recent executable option edge is too weak for episode registration")
+            item["episode_registration_eligible"] = not noise_reasons
+            item["episode_noise_reasons"] = list(dict.fromkeys(noise_reasons))
+            if noise_reasons:
+                suppressed_noise_count += 1
+            else:
+                eligible_results.append(item)
+        results = eligible_results
         duplicate_results_count = raw_results_count - len(results)
         fresh_results_count = sum(1 for item in results if not is_stale_whale_print(item))
         stale_results_count = len(results) - fresh_results_count
@@ -1728,9 +1961,17 @@ class OptionsWhaleScanner:
             ),
             "scan_session_state": scan_session_state,
             "scan_session_warning": "Options market is closed; treat this scan as after-hours/stale context." if scan_session_state != "regular" else "",
+            "market_regime": market_regime,
             "debug_loose_mode": debug_loose,
             "debug_label": "DEBUG LOOSE MODE — not alert quality" if debug_loose else "",
             "debug_loose_mode_warning": "DEBUG LOOSE MODE — results are not alert quality and notifications are disabled." if debug_loose else "",
+            "market_regime_source": self.last_market_regime_context.get("regime_source"),
+            "market_regime_reason": self.last_market_regime_context.get("regime_reason"),
+            "market_regime_context": self.last_market_regime_context,
+            "market_regime_missing_alarm": market_regime == "UNKNOWN",
+            "market_regime_missing_reason": "Options outcomes would be stamped UNKNOWN; heartbeat/fallback regime unavailable." if market_regime == "UNKNOWN" else "",
+            "episode_noise_suppressed_count": suppressed_noise_count,
+            "dashboard_episode_noise_ratio": round((len(results) + suppressed_noise_count) / max(1, len(results)), 4) if results else float(suppressed_noise_count),
             **self.last_scan_order,
             "skipped_contracts_count": sum(skipped_reasons.values()),
             "skipped_reasons_summary": skipped_reasons,

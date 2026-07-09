@@ -744,6 +744,8 @@ def run_options_review_jobs(config: Dict[str, Any], now: Optional[datetime] = No
             state["oi_attempt_day"] = current.date().isoformat()
             state["oi_attempt_count"] = int(state.get("oi_attempt_count") or 0) + 1
             state["oi_source_day"] = results["oi"].get("source_session_date")
+            state["oi_source_selection"] = "most_recent_prior_trading_session"
+            state["oi_review_day"] = current.date().isoformat()
             state["oi_contract_count"] = results["oi"].get("unique_contract_count")
             state["oi_coverage_rate"] = results["oi"].get("oi_coverage_rate")
             state["oi_values_found"] = results["oi"].get("oi_values_found")
@@ -970,6 +972,12 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
         "failures_by_symbol": dict(__import__("collections").Counter(str(row.get("underlying_symbol") or "UNKNOWN") for row in option_bar_failures)),
         "failures_by_endpoint": dict(__import__("collections").Counter(str(row.get("endpoint") or "unknown") for row in option_bar_failures)),
     }
+    unknown_regime_count = sum(str(row.get("market_regime") or "UNKNOWN").upper() == "UNKNOWN" for row in day_rows)
+    regime_missing_alarm = bool(day_rows and unknown_regime_count / len(day_rows) > float(scanner.whale.get("regime_missing_warning_rate", 0.05)))
+    outcome_health["regime_unknown_count"] = unknown_regime_count
+    outcome_health["regime_unknown_rate"] = round(unknown_regime_count / len(day_rows), 4) if day_rows else 0.0
+    outcome_health["regime_missing_alarm"] = regime_missing_alarm
+    outcome_health["regime_missing_alarm_reason"] = "Options episodes are being stamped UNKNOWN; Tier logic cannot learn regime-qualified cohorts." if regime_missing_alarm else ""
     oi_progress = _read_review_job_state()
     canonical_rows = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=10000)
     canonical_latest = {str(row.get("canonical_episode_id") or row.get("alert_id") or ""): row for row in canonical_rows if row.get("canonical_episode_id") or row.get("alert_id")}
@@ -977,11 +985,14 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "option_api": scanner.client.data_health(),
         "market_regime_heartbeat": heartbeat,
+        "market_regime_missing_alarm": {"warning": regime_missing_alarm, "unknown_count": unknown_regime_count, "total_episodes": len(day_rows), "reason": outcome_health["regime_missing_alarm_reason"]},
         "coverage": options_whales_coverage(),
         "last_scan_error": latest.get("error") or STATE.options_whale_last_scan_error,
         "option_outcome_health": outcome_health,
         "oi_review_progress": {
             "source_session_date": oi_progress.get("oi_source_day"),
+            "source_selection": oi_progress.get("oi_source_selection") or "most_recent_prior_trading_session",
+            "review_day": oi_progress.get("oi_review_day"),
             "last_attempt": oi_progress.get("oi_last_attempt"),
             "attempt_count": int(oi_progress.get("oi_attempt_count") or 0),
             "contract_count": oi_progress.get("oi_contract_count"),
@@ -1239,7 +1250,7 @@ def _latest_outcome_rows() -> List[Dict[str, Any]]:
 def options_whales_quality_analytics() -> Dict[str, Any]:
     rows = [row for row in _latest_outcome_rows() if str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
     groups: Dict[tuple[str, str], Dict[str, Any]] = {}
-    score_groups: Dict[str, Dict[str, Any]] = {}
+    score_groups: Dict[tuple[str, str], Dict[str, Any]] = {}
     for row in rows:
         option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
@@ -1252,22 +1263,36 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
                 if isinstance(option.get(source), (int, float)): group[target].append(float(option[source]))
         score = int(float(row.get("whale_score") or 0))
         bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
-        score_group = score_groups.setdefault(bucket, {"bucket": bucket, "underlying": [], "executable": []})
+        score_group = score_groups.setdefault((direction, bucket), {"direction": direction, "bucket": bucket, "underlying": [], "executable": []})
         if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
         if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
     calibration = []
     for group in groups.values():
         calibration.append({"direction": group["direction"], "dte_bucket": group["dte_bucket"], "sample_count": group["samples"], **{f"mean_{name}_pct": round(sum(values) / len(values), 4) if values else None for name, values in ((key, group[key]) for key in ("midpoint", "spread", "slippage", "iv", "decay", "residual", "executable"))}, "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
-    bucket_order = [name for name in ("75-79", "80-89", "90+") if name in score_groups]
     score_rows = []
-    for name in bucket_order:
-        group = score_groups[name]
-        score_rows.append({"bucket": name, "underlying_samples": len(group["underlying"]), "meaningful_0_10_rate": round(sum(value >= .10 for value in group["underlying"]) / len(group["underlying"]), 4) if group["underlying"] else None, "executable_samples": len(group["executable"]), "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
-    def monotonic(field: str) -> bool:
-        values = [row[field] for row in score_rows if row.get(field) is not None]
+    for direction in sorted({key[0] for key in score_groups}):
+        for name in ("75-79", "80-89", "90+"):
+            group = score_groups.get((direction, name))
+            if not group:
+                continue
+            score_rows.append({"direction": direction, "bucket": name, "underlying_samples": len(group["underlying"]), "meaningful_0_10_rate": round(sum(value >= .10 for value in group["underlying"]) / len(group["underlying"]), 4) if group["underlying"] else None, "executable_samples": len(group["executable"]), "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
+    def monotonic(field: str, direction: Optional[str] = None) -> bool:
+        subset = [row for row in score_rows if direction is None or row.get("direction") == direction]
+        values = [row[field] for row in subset if row.get(field) is not None]
         return len(values) >= 2 and all(right >= left for left, right in zip(values, values[1:]))
+    directional = {
+        direction: {
+            "meaningful_monotonic": monotonic("meaningful_0_10_rate", direction),
+            "executable_monotonic": monotonic("executable_positive_rate", direction),
+            "passed": monotonic("meaningful_0_10_rate", direction) and monotonic("executable_positive_rate", direction),
+        }
+        for direction in sorted({row.get("direction") for row in score_rows})
+    }
     latest_scan = read_latest_options_whale_scan()
-    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": {"rows": score_rows, "meaningful_monotonic": monotonic("meaningful_0_10_rate"), "executable_monotonic": monotonic("executable_positive_rate"), "passed": monotonic("meaningful_0_10_rate") and monotonic("executable_positive_rate"), "positive_score_bonus_allowed": monotonic("meaningful_0_10_rate") and monotonic("executable_positive_rate")}, "contract_budget_waterfall": latest_scan.get("contract_budget_waterfall") or {}, "tier1_gate_unchanged": True}
+    actionable = sum(1 for item in latest_scan.get("results") or [] if item.get("should_notify") or item.get("alert_tier") == "Tier 1")
+    dashboard_episodes = int(latest_scan.get("results_count") or len(latest_scan.get("results") or []))
+    noise_ratio = dashboard_episodes / max(1, actionable)
+    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": {"rows": score_rows, "directional": directional, "meaningful_monotonic": all(item["meaningful_monotonic"] for item in directional.values()) if directional else False, "executable_monotonic": all(item["executable_monotonic"] for item in directional.values()) if directional else False, "passed": all(item["passed"] for item in directional.values()) if directional else False, "positive_score_bonus_allowed": all(item["passed"] for item in directional.values()) if directional else False}, "contract_budget_waterfall": latest_scan.get("contract_budget_waterfall") or {}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
 
 
 def canonical_episode_audit() -> Dict[str, Any]:
@@ -4905,6 +4930,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Tier-1 paired outcomes', `${reliability.shadow_tier1?.paired_sample_count ?? 0} / ${reliability.shadow_tier1?.required_paired_samples ?? 30}`, (reliability.shadow_tier1?.paired_samples_remaining ?? 1) ? 'warn' : 'good'),
         card('Option-bar unavailable', `${dataHealth.option_outcome_health?.option_bars_unavailable_count ?? 0} / ${dataHealth.option_outcome_health?.total_episodes ?? 0}`, dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
         card('Executable return coverage', dataHealth.option_outcome_health?.executable_window_coverage !== null && dataHealth.option_outcome_health?.executable_window_coverage !== undefined ? `${Math.round(dataHealth.option_outcome_health.executable_window_coverage * 100)}%` : 'Unknown', dataHealth.option_outcome_health?.warning ? 'warn' : 'good'),
+        card('Regime UNKNOWN alarm', dataHealth.market_regime_missing_alarm?.warning ? `${dataHealth.market_regime_missing_alarm.unknown_count} / ${dataHealth.market_regime_missing_alarm.total_episodes}` : 'OK', dataHealth.market_regime_missing_alarm?.warning ? 'warn' : 'good'),
         card('OI confirmation coverage', dataHealth.oi_review_progress?.coverage_rate !== null && dataHealth.oi_review_progress?.coverage_rate !== undefined ? `${Math.round(dataHealth.oi_review_progress.coverage_rate * 100)}%` : 'Not started', dataHealth.oi_review_progress?.complete ? 'good' : 'warn'),
         card('OI retry attempts', dataHealth.oi_review_progress?.attempt_count ?? 0),
         card('OI unresolved', dataHealth.oi_review_progress?.unresolved_count ?? 0, (dataHealth.oi_review_progress?.unresolved_count ?? 0) ? 'warn' : 'good'),
@@ -4913,6 +4939,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Scan cadence p95', dataHealth.scan_loop_health?.cadence_p95_seconds !== null && dataHealth.scan_loop_health?.cadence_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.cadence_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
         card('Promotion-ready cohorts', (reliability.promotion_queue || []).filter(row => row.status === 'promotion_ready').length),
         card('Score rank validation', qualityAnalytics.score_rank_validation?.passed ? 'Passed' : 'Blocked', qualityAnalytics.score_rank_validation?.passed ? 'good' : 'warn'),
+        card('Noise ratio', `${qualityAnalytics.noise_ratio?.dashboard_episodes ?? 0} : ${qualityAnalytics.noise_ratio?.actionable_or_tier1 ?? 0}`, (qualityAnalytics.noise_ratio?.ratio ?? 0) > 10 ? 'warn' : 'good'),
         card('Contract budget', `${qualityAnalytics.contract_budget_waterfall?.contracts_evaluated ?? 0} / ${qualityAnalytics.contract_budget_waterfall?.selected_contracts ?? 0} evaluated`),
         card('Canonical complete', `${canonicalAudit.complete_count ?? 0} / ${canonicalAudit.episode_count ?? 0}`),
         card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),
@@ -4920,7 +4947,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.costCalibrationRows.innerHTML = (qualityAnalytics.net_cost_calibration || []).map(row => `<tr><td>${esc(row.direction)}</td><td>${esc(row.dte_bucket)}</td><td>${esc(row.sample_count)}</td><td>${num(row.mean_midpoint_pct, '%')}</td><td>${num(row.mean_spread_pct, '%')}</td><td>${num(row.mean_slippage_pct, '%')}</td><td>${num(row.mean_iv_pct, '%')}</td><td>${num(row.mean_decay_pct, '%')}</td><td>${num(row.mean_executable_pct, '%')}</td><td>${row.executable_positive_rate !== null && row.executable_positive_rate !== undefined ? `${Math.round(row.executable_positive_rate * 100)}%` : '—'}</td></tr>`).join('') || '<tr><td colspan="10" class="muted">No completed option outcomes yet.</td></tr>';
       els.canonicalAuditRows.innerHTML = (canonicalAudit.rows || []).slice(0, 20).map(row => `<tr><td>${formatMarketTime(row.alert_timestamp)}</td><td>${esc(row.symbol)}</td><td>${esc(row.setup)}</td><td>${esc(row.direction)}</td><td>${esc(row.authoritative_status)}</td><td>${esc(row.decision || '—')}</td><td>${row.delivery_eligible ? 'Yes' : 'No'}</td><td>${row.delivery_attempted ? 'Yes' : 'No'}</td><td>${row.delivery_succeeded ? 'Yes' : 'No'}</td><td>${row.useful_alert === null || row.useful_alert === undefined ? '—' : row.useful_alert ? 'Yes' : 'No'}</td><td>${row.block_next_time === null || row.block_next_time === undefined ? '—' : row.block_next_time ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td colspan="11" class="muted">No canonical alert episodes yet.</td></tr>';
       const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
-      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning].filter(Boolean);
+      const regimeHealthWarning = dataHealth.market_regime_missing_alarm?.warning ? dataHealth.market_regime_missing_alarm.reason : '';
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning, regimeHealthWarning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }

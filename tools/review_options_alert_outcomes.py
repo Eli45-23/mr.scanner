@@ -284,6 +284,17 @@ def review_alerts(
             option_quotes = storage.option_quote_observations(option_symbol, limit=10000)
         option_outcome = evaluate_option_price_outcome(row, option_bars, option_quotes, windows=OUTCOME_WINDOWS, risk_free_rate=float(whale_config.get("option_attribution_risk_free_rate", 0.043)))
         option_data_diagnostics = client.data_health().get("request_diagnostics", {}) if hasattr(client, "data_health") else {}
+        if not option_symbol:
+            option_failure_disposition = "malformed_contract"
+        elif option_bar_attempts and not option_bars:
+            option_failure_disposition = "retry_exhausted"
+        elif option_bar_attempts and option_bars and option_outcome.get("option_outcome_status") == "option_bars_unavailable":
+            option_failure_disposition = "insufficient_bar_coverage"
+        elif option_bar_attempts:
+            option_failure_disposition = ""
+        else:
+            option_failure_disposition = "not_requested"
+        option_failure_category = (option_bar_attempts[-1].get("error_category") if option_bar_attempts else None) or ("malformed_contract" if not option_symbol else "empty_response" if option_bar_attempts and not option_bars else "insufficient_coverage" if option_failure_disposition == "insufficient_bar_coverage" else "not_requested")
         reviewed_row = {
             "reviewed_at": datetime.now(timezone.utc).isoformat(),
             "alert_key": key,
@@ -328,11 +339,11 @@ def review_alerts(
                 "requested_start": start.isoformat(),
                 "requested_end": end.isoformat(),
                 "http_status": (option_bar_attempts[-1].get("http_status") if option_bar_attempts else None),
-                "provider_category": (option_bar_attempts[-1].get("error_category") if option_bar_attempts else None) or ("malformed_contract" if not option_symbol else "empty_response" if option_bar_attempts else "not_requested"),
+                "provider_category": option_failure_category,
                 "attempt_count": len(option_bar_attempts),
                 "attempts": option_bar_attempts,
                 "last_error": (option_bar_attempts[-1].get("error") if option_bar_attempts else ""),
-                "final_disposition": "retry_exhausted" if option_bar_attempts and not option_bars else "malformed_contract" if not option_symbol else "not_requested",
+                "final_disposition": option_failure_disposition,
             } if option_outcome.get("option_outcome_status") == "option_bars_unavailable" or (option_symbol and option_bar_attempts and not option_bars) else None),
             **build_outcome_diagnostics(
                 bars=bars,

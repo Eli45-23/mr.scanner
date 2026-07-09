@@ -120,6 +120,25 @@ class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
         self.assertEqual(failure["attempt_count"], 3)
         self.assertEqual(failure["final_disposition"], "retry_exhausted")
 
+    def test_partial_option_bars_are_labeled_insufficient_coverage(self):
+        detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
+        class PartialOptionClient(FakeBarsClient):
+            def get_option_bars(self, symbols, *, start, end):
+                return {symbols[0]: [{"t": detected.isoformat(), "o": 1, "h": 1, "l": 1, "c": 1}]}
+        client = PartialOptionClient({"ADBE": self.bars(detected, [0, 5, 15, 30, 60])})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            payload = self.latest_payload()
+            payload["results"][0]["candidate"].update({"contract_price_paid": 1.0, "bid": 0.99, "ask": 1.01})
+            original = self.latest_payload
+            self.latest_payload = lambda: payload
+            try:
+                result = self.run_review(Path(temp_dir), client)
+            finally:
+                self.latest_payload = original
+        failure = result["reviewed"][0]["option_bar_failure"]
+        self.assertEqual(failure["provider_category"], "insufficient_coverage")
+        self.assertEqual(failure["final_disposition"], "insufficient_bar_coverage")
+
     def test_duplicate_pending_reviews_are_not_appended_repeatedly(self):
         detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
         fake_client = FakeBarsClient({"ADBE": self.bars(detected, [0, 1])})

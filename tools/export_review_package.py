@@ -740,7 +740,7 @@ def export_review_package(
         latest_scan_payload = {}
     (analytics_out / "contract_budget_waterfall.json").write_text(json.dumps(latest_scan_payload.get("contract_budget_waterfall") or {}, indent=2, sort_keys=True), encoding="utf-8")
     cost_rows: Dict[tuple[str, str], Dict[str, Any]] = {}
-    score_rows: Dict[str, Dict[str, Any]] = {}
+    score_rows: Dict[tuple[str, str], Dict[str, Any]] = {}
     for row in all_outcomes:
         option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
@@ -750,15 +750,28 @@ def export_review_package(
         if option:
             for source, target in (("estimated_executable_return_pct", "executable"), ("raw_midpoint_return_pct", "midpoint"), ("bid_ask_spread_cost_pct", "spread"), ("slippage_cost_pct", "slippage"), ("iv_attribution_pct", "iv"), ("time_decay_attribution_pct", "decay"), ("residual_market_price_return_pct", "residual")):
                 if isinstance(option.get(source), (int, float)): group[target].append(float(option[source]))
+        direction = str(row.get("flow_bias") or "UNKNOWN").upper()
         score = int(float(row.get("whale_score") or 0)); bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
-        score_group = score_rows.setdefault(bucket, {"bucket": bucket, "underlying": [], "executable": []})
+        score_group = score_rows.setdefault((direction, bucket), {"direction": direction, "bucket": bucket, "underlying": [], "executable": []})
         if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
         if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
     cost_output = [{"direction": group["direction"], "dte_bucket": group["dte_bucket"], "sample_count": group["samples"], **{f"mean_{name}_pct": round(sum(values) / len(values), 4) if values else None for name, values in ((field, group[field]) for field in ("executable", "midpoint", "spread", "slippage", "iv", "decay", "residual"))}} for group in cost_rows.values()]
     (analytics_out / "net_cost_calibration.json").write_text(json.dumps(cost_output, indent=2, sort_keys=True), encoding="utf-8")
-    score_output = [{"bucket": bucket, "meaningful_0_10_rate": round(sum(value >= .10 for value in score_rows[bucket]["underlying"]) / len(score_rows[bucket]["underlying"]), 4) if score_rows[bucket]["underlying"] else None, "executable_positive_rate": round(sum(value > 0 for value in score_rows[bucket]["executable"]) / len(score_rows[bucket]["executable"]), 4) if score_rows[bucket]["executable"] else None} for bucket in ("75-79", "80-89", "90+") if bucket in score_rows]
-    meaningful_values = [row["meaningful_0_10_rate"] for row in score_output if row["meaningful_0_10_rate"] is not None]; executable_values = [row["executable_positive_rate"] for row in score_output if row["executable_positive_rate"] is not None]
-    score_validation = {"rows": score_output, "meaningful_monotonic": len(meaningful_values) >= 2 and all(right >= left for left, right in zip(meaningful_values, meaningful_values[1:])), "executable_monotonic": len(executable_values) >= 2 and all(right >= left for left, right in zip(executable_values, executable_values[1:]))}
+    score_output = []
+    for direction in sorted({key[0] for key in score_rows}):
+        for bucket in ("75-79", "80-89", "90+"):
+            group = score_rows.get((direction, bucket))
+            if not group:
+                continue
+            score_output.append({"direction": direction, "bucket": bucket, "meaningful_0_10_rate": round(sum(value >= .10 for value in group["underlying"]) / len(group["underlying"]), 4) if group["underlying"] else None, "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
+    directional = {}
+    for direction in sorted({row["direction"] for row in score_output}):
+        rows_for_direction = [row for row in score_output if row["direction"] == direction]
+        meaningful_values = [row["meaningful_0_10_rate"] for row in rows_for_direction if row["meaningful_0_10_rate"] is not None]
+        executable_values = [row["executable_positive_rate"] for row in rows_for_direction if row["executable_positive_rate"] is not None]
+        directional[direction] = {"meaningful_monotonic": len(meaningful_values) >= 2 and all(right >= left for left, right in zip(meaningful_values, meaningful_values[1:])), "executable_monotonic": len(executable_values) >= 2 and all(right >= left for left, right in zip(executable_values, executable_values[1:]))}
+        directional[direction]["passed"] = directional[direction]["meaningful_monotonic"] and directional[direction]["executable_monotonic"]
+    score_validation = {"rows": score_output, "directional": directional, "meaningful_monotonic": all(item["meaningful_monotonic"] for item in directional.values()) if directional else False, "executable_monotonic": all(item["executable_monotonic"] for item in directional.values()) if directional else False}
     score_validation["passed"] = score_validation["meaningful_monotonic"] and score_validation["executable_monotonic"]
     (analytics_out / "score_rank_validation.json").write_text(json.dumps(score_validation, indent=2, sort_keys=True), encoding="utf-8")
 
