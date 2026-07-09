@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import json
 import re
+import time
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -84,6 +85,10 @@ def default_options_whale_config() -> Dict[str, Any]:
         "contract_catalog_refresh_seconds": 900,
         "contract_catalog_max_per_symbol": 5000,
         "coverage_warning_age_seconds": 300,
+        "deadline_aware_contract_budget": True,
+        "scan_deadline_seconds": 25,
+        "deadline_contract_safety_factor": 0.90,
+        "deadline_min_contracts_per_scan": 500,
         "active_episode_quote_minutes": 75,
         "active_episode_quote_limit": 500,
         "index_0dte_min_score": 85,
@@ -728,7 +733,7 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         bucket["raw_samples"] += 1
         if stamp:
             bucket["sessions"].add(stamp.date().isoformat())
-        score_total = score_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0})
+        score_total = score_totals.setdefault(key[0], {"samples": 0.0, "successes": 0.0, "executable_samples": 0.0, "executable_successes": 0.0})
         score_total["samples"] += weight
         if float(signed) >= 0.10:
             bucket["meaningful_successes"] += weight
@@ -736,12 +741,18 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         executable_return = option_window.get("estimated_executable_return_pct") if option_window else None
         if isinstance(executable_return, (int, float)):
             bucket["executable_samples"] += weight
+            score_total["executable_samples"] += weight
             if float(executable_return) > 0:
                 bucket["executable_successes"] += weight
+                score_total["executable_successes"] += weight
         bucket["effective_samples"] = min(bucket["meaningful_samples"], bucket["executable_samples"])
     score_rates = {name: value["successes"] / value["samples"] for name, value in score_totals.items() if value["samples"]}
-    guard_active = bool(score_rates.get("90+") is not None and score_rates.get("80-89") is not None and score_rates["90+"] <= score_rates["80-89"])
-    guard_reason = "90+ score outcomes do not outperform 80-89 outcomes." if guard_active else ""
+    executable_score_rates = {name: value["executable_successes"] / value["executable_samples"] for name, value in score_totals.items() if value["executable_samples"]}
+    ordered = [name for name in ("75-79", "80-89", "90+") if name in score_rates and name in executable_score_rates]
+    meaningful_monotonic = len(ordered) >= 2 and all(score_rates[right] >= score_rates[left] for left, right in zip(ordered, ordered[1:]))
+    executable_monotonic = len(ordered) >= 2 and all(executable_score_rates[right] >= executable_score_rates[left] for left, right in zip(ordered, ordered[1:]))
+    guard_active = bool(len(ordered) >= 2 and not (meaningful_monotonic and executable_monotonic))
+    guard_reason = "Score buckets are not monotonic for both +0.10% outcomes and executable option returns." if guard_active else ""
     table: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     prior_success = float(cfg.get("reliability_prior_successes", 10))
     prior_failure = float(cfg.get("reliability_prior_failures", 10))
@@ -763,7 +774,7 @@ def build_reliability_table(outcomes: List[Dict[str, Any]], cfg: Dict[str, Any])
         if not qualified: block_reasons.append("insufficient sessions or paired effective samples")
         if not meaningful_passed: block_reasons.append("+0.10% meaningful-move rate below threshold")
         if not executable_passed: block_reasons.append("positive executable-return rate below threshold")
-        table[key] = {"reliability_rate": round(meaningful_posterior, 4), "reliability_meaningful_rate": round(meaningful_posterior, 4), "reliability_executable_positive_rate": round(executable_posterior, 4), "reliability_meaningful_effective_samples": round(bucket["meaningful_samples"], 2), "reliability_executable_effective_samples": round(bucket["executable_samples"], 2), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_meaningful_passed": meaningful_passed, "reliability_executable_passed": executable_passed, "reliability_dual_metric_passed": dual_metric_passed, "reliability_block_reasons": block_reasons, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason}
+        table[key] = {"reliability_rate": round(meaningful_posterior, 4), "reliability_meaningful_rate": round(meaningful_posterior, 4), "reliability_executable_positive_rate": round(executable_posterior, 4), "reliability_meaningful_effective_samples": round(bucket["meaningful_samples"], 2), "reliability_executable_effective_samples": round(bucket["executable_samples"], 2), "reliability_effective_samples": round(bucket["effective_samples"], 2), "reliability_raw_samples": int(bucket["raw_samples"]), "reliability_session_count": session_count, "reliability_qualified": qualified, "reliability_meaningful_passed": meaningful_passed, "reliability_executable_passed": executable_passed, "reliability_dual_metric_passed": dual_metric_passed, "reliability_block_reasons": block_reasons, "reliability_score_adjustment": adjustment, "calibration_guard_active": guard_active, "calibration_guard_reason": guard_reason, "score_rank_meaningful_monotonic": meaningful_monotonic, "score_rank_executable_monotonic": executable_monotonic, "score_rank_validation_passed": meaningful_monotonic and executable_monotonic}
     return table
 
 
@@ -1129,11 +1140,11 @@ class OptionsWhaleScanner:
                 seen.add(symbol)
         return ordered
 
-    def _contracts(self) -> List[Dict[str, Any]]:
+    def _contracts(self, *, deadline_monotonic: Optional[float] = None) -> List[Dict[str, Any]]:
         cache = load_universe_cache(self.universe_path)
         today = datetime.now(timezone.utc).date()
         max_dte = int(self.whale.get("max_dte", 7))
-        max_contracts = int(self.whale.get("max_contracts_per_scan", 10000))
+        configured_max_contracts = int(self.whale.get("max_contracts_per_scan", 10000))
         entries = [entry for entry in cache.get("entries", []) if entry.get("underlying_symbol")]
         if not entries:
             universe = self.rebuild_universe()
@@ -1142,6 +1153,14 @@ class OptionsWhaleScanner:
         core = [symbol for symbol in self._always_scan_symbols() if symbol in set(underlyings)]
         rotating = [symbol for symbol in underlyings if symbol not in set(core)]
         state = self._load_scan_state()
+        budget_seconds = max(5.0, float(self.whale.get("scan_deadline_seconds", 25)))
+        prior_duration = safe_float(state.get("last_scan_duration_seconds"))
+        prior_contracts = int(state.get("last_contracts_scanned") or configured_max_contracts)
+        adaptive_contract_cap = configured_max_contracts
+        if bool(self.whale.get("deadline_aware_contract_budget", True)) and prior_duration > budget_seconds:
+            adaptive_contract_cap = int(prior_contracts * budget_seconds / prior_duration * float(self.whale.get("deadline_contract_safety_factor", 0.90)))
+        min_contract_cap = max(1, int(self.whale.get("deadline_min_contracts_per_scan", 500)))
+        max_contracts = min(configured_max_contracts, max(min_contract_cap, adaptive_contract_cap))
         last_scanned_at = state.setdefault("last_scanned_at", {})
         now_priority = datetime.now(timezone.utc)
         pre_scan_ages: Dict[str, float] = {}
@@ -1200,9 +1219,14 @@ class OptionsWhaleScanner:
         catalog_counts: Dict[str, int] = {}
         selected_counts: Dict[str, int] = {}
         failures: Dict[str, str] = {}
+        deadline_skipped_symbols: List[str] = []
         now_iso = utc_now_iso()
-        for underlying in selected_underlyings:
+        for index, underlying in enumerate(selected_underlyings):
             if len(contracts) >= max_contracts:
+                deadline_skipped_symbols.extend(selected_underlyings[index:])
+                break
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                deadline_skipped_symbols.extend(selected_underlyings[index:])
                 break
             quota = core_quota if underlying in core else rotation_quota
             try:
@@ -1263,6 +1287,24 @@ class OptionsWhaleScanner:
             "coverage_catalog_counts": catalog_counts,
             "coverage_selected_counts": selected_counts,
             "coverage_fetch_failures": failures,
+            "scan_deadline_seconds": budget_seconds,
+            "deadline_aware_contract_budget": bool(self.whale.get("deadline_aware_contract_budget", True)),
+            "configured_contract_cap": configured_max_contracts,
+            "effective_contract_cap": max_contracts,
+            "adaptive_contract_cap_applied": max_contracts < configured_max_contracts,
+            "prior_scan_duration_seconds": prior_duration or None,
+            "deadline_reached_during_contract_selection": bool(deadline_skipped_symbols and deadline_monotonic is not None and time.monotonic() >= deadline_monotonic),
+            "deadline_skipped_symbols": deadline_skipped_symbols,
+            "deadline_skipped_symbol_count": len(deadline_skipped_symbols),
+            "contract_budget_waterfall": {
+                "universe_symbols": len(underlyings),
+                "selected_symbols": len(selected_underlyings),
+                "scanned_symbols": len(scanned_underlyings),
+                "skipped_symbols": len(deadline_skipped_symbols),
+                "catalog_contracts": sum(catalog_counts.values()),
+                "requested_contracts": sum(selected_counts.values()),
+                "selected_contracts": len(contracts),
+            },
         })
         return contracts
 
@@ -1439,12 +1481,14 @@ class OptionsWhaleScanner:
 
     def scan(self) -> Dict[str, Any]:
         start = datetime.now(timezone.utc)
+        scan_started_monotonic = time.monotonic()
         scan_session_state = options_market_session_state(start)
         if not self.whale.get("enabled", True):
             return {"enabled": False, "results": [], "message": "Options Whale Scanner disabled."}
         effective_cfg = self._effective_whale_config()
         debug_loose = bool(self.whale.get("debug_loose_mode", False))
-        contracts = self._contracts()
+        deadline_seconds = max(5.0, float(self.whale.get("scan_deadline_seconds", 25)))
+        contracts = self._contracts(deadline_monotonic=scan_started_monotonic + deadline_seconds)
         option_symbols = [_contract_symbol(c) for c in contracts if _contract_symbol(c)]
         max_contracts = int(self.whale.get("max_contracts_per_scan", 10000))
         active_cutoff = start - timedelta(minutes=max(5, int(effective_cfg.get("active_episode_quote_minutes", 75))))
@@ -1465,10 +1509,11 @@ class OptionsWhaleScanner:
         for symbol in active_symbols:
             snapshot = snapshots.get(symbol) or {}
             quote, trade = _snapshot_quote(snapshot), _snapshot_trade(snapshot)
+            greeks = snapshot.get("greeks") or {}
             bid = safe_float(quote.get("bp") or quote.get("bid_price") or quote.get("bid")) or None
             ask = safe_float(quote.get("ap") or quote.get("ask_price") or quote.get("ask")) or None
             if bid or ask:
-                self.storage.append_quote_observation({"timestamp": utc_now_iso(), "option_symbol": symbol, "bid": bid, "ask": ask, "last": safe_float(trade.get("p") or trade.get("price")) or None, "quote_time": quote.get("t") or quote.get("timestamp"), "data_source": snapshot.get("data_source") or "alpaca", "observation_type": "active_episode_nbbo"})
+                self.storage.append_quote_observation({"timestamp": utc_now_iso(), "option_symbol": symbol, "bid": bid, "ask": ask, "last": safe_float(trade.get("p") or trade.get("price")) or None, "quote_time": quote.get("t") or quote.get("timestamp"), "implied_volatility": safe_float(snapshot.get("impliedVolatility") or snapshot.get("implied_volatility") or snapshot.get("iv")) or None, "delta": safe_float(greeks.get("delta")) if greeks else None, "gamma": safe_float(greeks.get("gamma")) if greeks else None, "theta": safe_float(greeks.get("theta")) if greeks else None, "vega": safe_float(greeks.get("vega")) if greeks else None, "underlying_price": safe_float(snapshot.get("underlying_price") or snapshot.get("underlyingPrice")) or None, "data_source": snapshot.get("data_source") or "alpaca", "observation_type": "active_episode_nbbo"})
         underlyings = sorted({_contract_underlying(c) for c in contracts if _contract_underlying(c)})
         prices = self._underlying_prices(underlyings[:500])
         end = datetime.now(timezone.utc)
@@ -1608,7 +1653,7 @@ class OptionsWhaleScanner:
             results.append(result)
             candidate_for_quote = result.get("candidate") or {}
             if candidate_for_quote.get("bid") or candidate_for_quote.get("ask"):
-                self.storage.append_quote_observation({"timestamp": candidate_for_quote.get("time_detected") or utc_now_iso(), "option_symbol": candidate_for_quote.get("option_symbol"), "bid": candidate_for_quote.get("bid"), "ask": candidate_for_quote.get("ask"), "last": candidate_for_quote.get("last"), "quote_time": candidate_for_quote.get("quote_time"), "data_source": candidate_for_quote.get("data_source"), "observation_type": "episode_entry_nbbo"})
+                self.storage.append_quote_observation({"timestamp": candidate_for_quote.get("time_detected") or utc_now_iso(), "option_symbol": candidate_for_quote.get("option_symbol"), "bid": candidate_for_quote.get("bid"), "ask": candidate_for_quote.get("ask"), "last": candidate_for_quote.get("last"), "quote_time": candidate_for_quote.get("quote_time"), "implied_volatility": candidate_for_quote.get("implied_volatility"), "delta": candidate_for_quote.get("delta"), "gamma": candidate_for_quote.get("gamma"), "theta": candidate_for_quote.get("theta"), "vega": candidate_for_quote.get("vega"), "underlying_price": candidate_for_quote.get("underlying_price"), "data_source": candidate_for_quote.get("data_source"), "observation_type": "episode_entry_nbbo"})
         results.sort(key=lambda item: int(item.get("whale_score") or 0), reverse=True)
         results = results[: int(effective_cfg.get("max_results", 100))]
         results = attach_simple_follow_through(results, self.storage.latest_alerts(limit=500))
@@ -1696,6 +1741,20 @@ class OptionsWhaleScanner:
             "snapshot_field_diagnostics": snapshot_field_diagnostics,
             "results": results,
         }
+        waterfall = dict(scan_record.get("contract_budget_waterfall") or {})
+        waterfall.update({
+            "snapshot_contracts_requested": len(snapshot_symbols),
+            "snapshots_received": len(snapshots),
+            "contracts_evaluated": contracts_evaluated,
+            "qualified_candidates": passed_filter_count,
+            "result_contracts": len(results),
+            "flow_episodes": len({str(item.get("flow_episode_id") or "") for item in results if item.get("flow_episode_id")}),
+        })
+        scan_record["contract_budget_waterfall"] = waterfall
+        state = self._load_scan_state()
+        state["last_scan_duration_seconds"] = scan_record["duration_seconds"]
+        state["last_contracts_scanned"] = len(option_symbols)
+        self._save_scan_state(state)
         self.last_scan = scan_record
         self.latest_results = results
         self.storage.append_scan({k: v for k, v in scan_record.items() if k != "results"})

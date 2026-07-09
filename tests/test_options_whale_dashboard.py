@@ -105,6 +105,11 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Tier-1 session progress", html)
         self.assertIn("Tier-1 paired outcomes", html)
 
+    def test_missed_cycles_use_actual_cadence(self):
+        cadence_missed, delay_missed, total = scanner_dashboard.calculate_missed_cycles(107.5, 0, 30)
+        self.assertEqual((cadence_missed, delay_missed, total), (3, 0, 3))
+        self.assertEqual(scanner_dashboard.calculate_missed_cycles(29.5, 0, 30)[2], 0)
+
     def test_whale_dashboard_debug_candidates_are_hidden_by_default(self):
         html = scanner_dashboard.WHALE_INDEX_HTML
         self.assertIn("Debug Candidates — Not Alerts", html)

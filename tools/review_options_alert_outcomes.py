@@ -71,7 +71,9 @@ def load_finalized_keys(path: Optional[Path] = None) -> set[str]:
     return {
         key
         for key, row in latest_by_key.items()
-        if str(row.get("outcome_status") or "") in FINAL_OUTCOME_STATUSES and is_clean_completed(row)
+        if str(row.get("outcome_status") or "") in FINAL_OUTCOME_STATUSES
+        and is_clean_completed(row)
+        and (str(row.get("option_outcome_status") or "") == "ok" or isinstance(row.get("option_bar_failure"), dict) or not row.get("option_symbol"))
     }
 
 
@@ -114,6 +116,10 @@ def should_append_outcome(new_row: Dict[str, Any], previous: Optional[Dict[str, 
     previous_status = str(previous.get("outcome_status") or "")
     new_status = str(new_row.get("outcome_status") or "")
     if previous_status == "pending" and new_status not in {"pending", ""}:
+        return True
+    if not isinstance(previous.get("option_bar_failure"), dict) and isinstance(new_row.get("option_bar_failure"), dict):
+        return True
+    if str(previous.get("option_outcome_status") or "") == "option_bars_unavailable" and str(new_row.get("option_outcome_status") or "") == "ok":
         return True
     return False
 
@@ -319,11 +325,15 @@ def review_alerts(
                 "expiration": c.get("expiration"),
                 "dte": c.get("dte"),
                 "endpoint": "historical_option_bars",
+                "requested_start": start.isoformat(),
+                "requested_end": end.isoformat(),
                 "http_status": (option_bar_attempts[-1].get("http_status") if option_bar_attempts else None),
-                "provider_category": (option_bar_attempts[-1].get("error_category") if option_bar_attempts else None) or ("empty_response" if option_bar_attempts else "not_requested"),
+                "provider_category": (option_bar_attempts[-1].get("error_category") if option_bar_attempts else None) or ("malformed_contract" if not option_symbol else "empty_response" if option_bar_attempts else "not_requested"),
                 "attempt_count": len(option_bar_attempts),
-                "final_disposition": "retry_exhausted" if option_bar_attempts and not option_bars else "not_requested",
-            } if option_symbol and not option_bars else None),
+                "attempts": option_bar_attempts,
+                "last_error": (option_bar_attempts[-1].get("error") if option_bar_attempts else ""),
+                "final_disposition": "retry_exhausted" if option_bar_attempts and not option_bars else "malformed_contract" if not option_symbol else "not_requested",
+            } if option_outcome.get("option_outcome_status") == "option_bars_unavailable" or (option_symbol and option_bar_attempts and not option_bars) else None),
             **build_outcome_diagnostics(
                 bars=bars,
                 start=start,

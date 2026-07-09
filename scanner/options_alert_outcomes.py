@@ -301,6 +301,7 @@ def evaluate_option_price_outcome(
         spread_cost = ((entry_ask - entry_mid) + (future_mid - future_bid)) / entry_mid * 100.0 if side == "LONG" and entry_bid and entry_ask and future_bid and future_ask and entry_mid else ((entry_mid - entry_bid) + (future_ask - future_mid)) / entry_mid * 100.0 if side == "SHORT" and entry_bid and entry_ask and future_bid and future_ask and entry_mid else None
         slippage_cost = ((entry_slippage or 0) + (exit_slippage or 0)) / entry_mid * 100.0 if entry_mid and entry_slippage is not None and exit_slippage is not None else None
         future_iv = _safe_float((quote or {}).get("implied_volatility") or (quote or {}).get("iv"))
+        future_greeks = {name: _safe_float((quote or {}).get(name)) for name in ("delta", "gamma", "theta", "vega")}
         future_spot = _safe_float((quote or {}).get("underlying_price")) or underlying_entry
         iv_attr = decay_attr = None
         attribution_source = "unavailable"
@@ -334,6 +335,11 @@ def evaluate_option_price_outcome(
             "time_decay_attribution_pct": round(decay_attr, 4) if decay_attr is not None else None,
             "residual_market_price_return_pct": round(residual, 4) if residual is not None else None,
             "attribution_source": attribution_source,
+            "entry_implied_volatility": entry_iv,
+            "future_implied_volatility": future_iv,
+            "future_greeks": future_greeks,
+            "observed_iv_available": bool(entry_iv and future_iv),
+            "observed_greeks_available": any(value is not None for value in future_greeks.values()),
         })
     reference_values = [item["reference_return_pct"] for item in output_windows if item["reference_return_pct"] is not None]
     return {

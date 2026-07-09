@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -631,7 +632,8 @@ def options_whale_auto_scan_loop() -> None:
                 if STATE.options_scan_telemetry:
                     row = STATE.options_scan_telemetry[-1]
                     row["timestamp"] = row.get("started_at")
-                    row.update({"scheduled_interval_seconds": interval, "actual_cadence_seconds": round(cadence, 3) if cadence is not None else None, "start_delay_seconds": round(start_delay, 3), "overrun_seconds": round(max(0.0, float(row.get("duration_seconds") or 0) - interval), 3), "missed_cycle_count": int(start_delay // interval), "warning": bool(float(row.get("duration_seconds") or 0) > interval or (cadence is not None and cadence > interval * 1.5))})
+                    cadence_missed, delay_missed, missed_cycles = calculate_missed_cycles(cadence, start_delay, interval)
+                    row.update({"scheduled_interval_seconds": interval, "actual_cadence_seconds": round(cadence, 3) if cadence is not None else None, "start_delay_seconds": round(start_delay, 3), "overrun_seconds": round(max(0.0, float(row.get("duration_seconds") or 0) - interval), 3), "missed_cycle_count": missed_cycles, "missed_cycle_basis": "actual_cadence", "duration_overrun": bool(float(row.get("duration_seconds") or 0) > interval), "cadence_overrun": bool(cadence is not None and cadence > interval * 1.5), "warning": bool(float(row.get("duration_seconds") or 0) > interval or (cadence is not None and cadence > interval * 1.5))})
                     try:
                         SCAN_LOOP_TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
                         temporary = SCAN_LOOP_TELEMETRY_PATH.with_suffix(".tmp")
@@ -645,6 +647,13 @@ def options_whale_auto_scan_loop() -> None:
         next_due += interval
         if next_due < time.monotonic() - interval:
             next_due = time.monotonic()
+
+
+def calculate_missed_cycles(cadence_seconds: Optional[float], start_delay_seconds: float, interval_seconds: int) -> tuple[int, int, int]:
+    interval = max(1, int(interval_seconds))
+    cadence_missed = max(0, math.ceil(float(cadence_seconds) / interval) - 1) if cadence_seconds is not None else 0
+    delay_missed = max(0, int(max(0.0, start_delay_seconds) // interval))
+    return cadence_missed, delay_missed, max(cadence_missed, delay_missed)
 
 
 def options_review_worker_loop() -> None:
@@ -842,6 +851,8 @@ def options_whale_scan_runtime_status(latest: Optional[Dict[str, Any]] = None) -
         "cadence_p50_seconds": round(_percentile(cadences, .50), 3) if cadences else None,
         "cadence_p95_seconds": round(_percentile(cadences, .95), 3) if cadences else None,
         "overrun_count": sum(bool(row.get("overrun_seconds")) for row in telemetry),
+        "duration_overrun_rate": round(sum(bool(row.get("duration_overrun") or row.get("overrun_seconds")) for row in telemetry) / len(telemetry), 4) if telemetry else None,
+        "cadence_overrun_rate": round(sum(bool(row.get("cadence_overrun") or (isinstance(row.get("actual_cadence_seconds"), (int, float)) and float(row.get("actual_cadence_seconds")) > interval * 1.5)) for row in telemetry) / len(telemetry), 4) if telemetry else None,
         "missed_cycle_count": sum(int(row.get("missed_cycle_count") or 0) for row in telemetry),
         "warning": any(bool(row.get("warning")) for row in telemetry[-10:]), "latest": telemetry[-1] if telemetry else {},
     }
@@ -923,6 +934,9 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
     for row in day_rows:
         if isinstance(row.get("option_bar_failure"), dict):
             option_bar_failures.append(row["option_bar_failure"])
+        elif str(row.get("option_outcome_status") or "") == "option_bars_unavailable":
+            attempts = list(row.get("option_bar_fetch_attempts") or [])
+            option_bar_failures.append({"underlying_symbol": row.get("underlying_symbol"), "option_symbol": row.get("option_symbol"), "expiration": row.get("expiration"), "dte": row.get("dte"), "endpoint": "historical_option_bars", "http_status": attempts[-1].get("http_status") if attempts else None, "provider_category": "legacy_unclassified", "attempt_count": len(attempts), "final_disposition": "diagnostic_backfill_required"})
         for item in row.get("option_windows") or []:
             if item.get("status") == "ok":
                 executable_total += 1
@@ -948,6 +962,9 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
         "endpoint_errors": endpoint_errors[:10],
         "warning": unavailable_rate > warning_rate or bool(endpoint_errors),
         "failure_count": len(option_bar_failures),
+        "failure_record_coverage": round(len(option_bar_failures) / unavailable, 4) if unavailable else 1.0,
+        "failure_diagnostic_coverage": round(sum(str(row.get("provider_category")) != "legacy_unclassified" for row in option_bar_failures) / unavailable, 4) if unavailable else 1.0,
+        "fully_categorized_failure_count": sum(str(row.get("provider_category")) != "legacy_unclassified" for row in option_bar_failures),
         "failures": option_bar_failures[:100],
         "failures_by_category": dict(__import__("collections").Counter(str(row.get("provider_category") or "unknown") for row in option_bar_failures)),
         "failures_by_symbol": dict(__import__("collections").Counter(str(row.get("underlying_symbol") or "UNKNOWN") for row in option_bar_failures)),
@@ -1153,10 +1170,11 @@ def options_whales_reliability(filters: Optional[Dict[str, str]] = None) -> Dict
     for row in rows:
         qualified = bool(row.get("reliability_qualified") and row.get("reliability_dual_metric_passed"))
         status = "promotion_ready" if qualified else "blocked" if row.get("reliability_session_count", 0) >= min_sessions else "collecting"
-        promotion_queue.append({**row, "status": status, "manual_approval_required": True, "production_gate_changed": False})
+        bearish = row.get("bucket", "").upper().endswith("|BEARISH")
+        promotion_queue.append({**row, "status": status, "manual_approval_required": True, "production_gate_changed": False, "bearish_oversight": bearish, "bearish_requires_score": int(cfg.get("bearish_tier1_min_score", 90)) if bearish else None, "bearish_requires_price_confirmation": int(cfg.get("bearish_tier1_min_price_context", 8)) if bearish else None})
     filters = filters or {}
     promotion_queue = [row for row in promotion_queue if (not filters.get("cohort_status") or row["status"] == filters["cohort_status"]) and (not filters.get("direction") or row["bucket"].upper().endswith("|" + filters["direction"].upper())) and (not filters.get("dte") or f"|{filters['dte'].upper()}|" in row["bucket"].upper()) and (not filters.get("regime") or f"|{filters['regime'].upper()}|" in row["bucket"].upper())]
-    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows, "shadow_tier1": shadow_summary, "promotion_queue": promotion_queue, "filters": filters}
+    return {"outcome_count": len(outcomes), "bucket_count": len(rows), "rows": rows, "shadow_tier1": shadow_summary, "promotion_queue": promotion_queue, "filters": filters, "bearish_oversight": {"enabled": True, "production_requirements_unchanged": True, "min_score": int(cfg.get("bearish_tier1_min_score", 90)), "min_price_confirmation": int(cfg.get("bearish_tier1_min_price_context", 8)), "cohort_count": sum(bool(row.get("bearish_oversight")) for row in promotion_queue)}}
 
 
 def options_whales_regression(filters: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -1207,6 +1225,67 @@ def options_whales_latency_timeline(filters: Optional[Dict[str, str]] = None) ->
     filters = filters or {}
     rows = [row for row in rows if (not filters.get("symbol") or str(row.get("symbol") or "").upper() == filters["symbol"].upper()) and (not filters.get("direction") or str(row.get("direction") or "").upper() == filters["direction"].upper()) and (not filters.get("setup") or filters["setup"].upper() in str(row.get("setup") or "").upper())]
     return {"episode_count": len(rows), "rows": rows, "filters": filters}
+
+
+def _latest_outcome_rows() -> List[Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=50000):
+        key = str(row.get("alert_key") or row.get("episode_id") or "")
+        if key:
+            latest[key] = row
+    return list(latest.values())
+
+
+def options_whales_quality_analytics() -> Dict[str, Any]:
+    rows = [row for row in _latest_outcome_rows() if str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
+    groups: Dict[tuple[str, str], Dict[str, Any]] = {}
+    score_groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        direction = str(row.get("flow_bias") or "UNKNOWN").upper()
+        dte = str(row.get("dte_bucket") or "UNKNOWN")
+        group = groups.setdefault((direction, dte), {"direction": direction, "dte_bucket": dte, "samples": 0, "midpoint": [], "spread": [], "slippage": [], "iv": [], "decay": [], "residual": [], "executable": []})
+        group["samples"] += 1
+        if option:
+            for source, target in (("raw_midpoint_return_pct", "midpoint"), ("bid_ask_spread_cost_pct", "spread"), ("slippage_cost_pct", "slippage"), ("iv_attribution_pct", "iv"), ("time_decay_attribution_pct", "decay"), ("residual_market_price_return_pct", "residual"), ("estimated_executable_return_pct", "executable")):
+                if isinstance(option.get(source), (int, float)): group[target].append(float(option[source]))
+        score = int(float(row.get("whale_score") or 0))
+        bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
+        score_group = score_groups.setdefault(bucket, {"bucket": bucket, "underlying": [], "executable": []})
+        if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
+        if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
+    calibration = []
+    for group in groups.values():
+        calibration.append({"direction": group["direction"], "dte_bucket": group["dte_bucket"], "sample_count": group["samples"], **{f"mean_{name}_pct": round(sum(values) / len(values), 4) if values else None for name, values in ((key, group[key]) for key in ("midpoint", "spread", "slippage", "iv", "decay", "residual", "executable"))}, "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
+    bucket_order = [name for name in ("75-79", "80-89", "90+") if name in score_groups]
+    score_rows = []
+    for name in bucket_order:
+        group = score_groups[name]
+        score_rows.append({"bucket": name, "underlying_samples": len(group["underlying"]), "meaningful_0_10_rate": round(sum(value >= .10 for value in group["underlying"]) / len(group["underlying"]), 4) if group["underlying"] else None, "executable_samples": len(group["executable"]), "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
+    def monotonic(field: str) -> bool:
+        values = [row[field] for row in score_rows if row.get(field) is not None]
+        return len(values) >= 2 and all(right >= left for left, right in zip(values, values[1:]))
+    latest_scan = read_latest_options_whale_scan()
+    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": {"rows": score_rows, "meaningful_monotonic": monotonic("meaningful_0_10_rate"), "executable_monotonic": monotonic("executable_positive_rate"), "passed": monotonic("meaningful_0_10_rate") and monotonic("executable_positive_rate"), "positive_score_bonus_allowed": monotonic("meaningful_0_10_rate") and monotonic("executable_positive_rate")}, "contract_budget_waterfall": latest_scan.get("contract_budget_waterfall") or {}, "tier1_gate_unchanged": True}
+
+
+def canonical_episode_audit() -> Dict[str, Any]:
+    sources = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=50000) + read_jsonl(APP_DIR / "logs" / "post_alert_performance.jsonl", limit=50000)
+    latest: Dict[str, Dict[str, Any]] = {}
+    for row in sources:
+        key = str(row.get("canonical_episode_id") or row.get("alert_id") or "")
+        if not key:
+            continue
+        current = parse_scan_timestamp(row.get("last_updated_at") or row.get("episode_updated_at") or row.get("alert_timestamp"))
+        prior = latest.get(key)
+        previous = parse_scan_timestamp((prior or {}).get("last_updated_at") or (prior or {}).get("episode_updated_at") or (prior or {}).get("alert_timestamp"))
+        if prior is None or previous is None or (current is not None and current >= previous): latest[key] = row
+    rows = []
+    for key, row in latest.items():
+        rows.append({"canonical_episode_id": key, "authoritative_status": row.get("status"), "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "alert_timestamp": row.get("alert_timestamp"), "last_updated_at": row.get("last_updated_at"), "decision": row.get("orchestrator_final_alert_type"), "delivery_eligible": bool(row.get("delivery_requested")), "delivery_attempted": bool(row.get("delivery_attempted")), "delivery_succeeded": bool(row.get("delivery_succeeded")), "outcome_complete": row.get("status") == "COMPLETE", "useful_alert": row.get("useful_alert"), "block_next_time": row.get("should_be_blocked_next_time"), "interval_prices": row.get("interval_prices") or {}, "source": "latest_timestamp_across_alert_episodes_and_performance"})
+    rows.sort(key=lambda row: str(row.get("alert_timestamp") or ""), reverse=True)
+    return {"episode_count": len(rows), "complete_count": sum(row["outcome_complete"] for row in rows), "pending_count": sum(not row["outcome_complete"] for row in rows), "rows": rows}
 
 
 def options_whales_filters() -> Dict[str, Any]:
@@ -4534,6 +4613,18 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     </section>
 
     <section>
+      <h2>Quality Analytics</h2>
+      <div class="muted">Net option-return cost attribution by direction and DTE. Analytics only; production Tier-1 gates are unchanged.</div>
+      <div class="table-wrap"><table><thead><tr><th>Direction</th><th>DTE</th><th>Samples</th><th>Midpoint %</th><th>Spread cost %</th><th>Slippage %</th><th>IV %</th><th>Decay %</th><th>Executable %</th><th>Win rate</th></tr></thead><tbody id="costCalibrationRows"></tbody></table></div>
+    </section>
+
+    <section>
+      <h2>Canonical Episode Audit</h2>
+      <div class="muted">One authoritative row per alert episode, joining decision, delivery, and outcome state.</div>
+      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Setup</th><th>Direction</th><th>Status</th><th>Decision</th><th>Eligible</th><th>Attempted</th><th>Delivered</th><th>Useful</th><th>Block next</th></tr></thead><tbody id="canonicalAuditRows"></tbody></table></div>
+    </section>
+
+    <section>
       <h2>Controls</h2>
       <div class="controls">
         <button class="primary" id="runScanBtn">Run Whale Scan Now</button>
@@ -4624,6 +4715,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       maxResults: document.getElementById('maxResults'),
       debugLoose: document.getElementById('debugLoose'),
       symbolSearch: document.getElementById('symbolSearch'),
+      costCalibrationRows: document.getElementById('costCalibrationRows'),
+      canonicalAuditRows: document.getElementById('canonicalAuditRows'),
     };
     let latestRows = [];
     let soundEnabled = localStorage.getItem('optionsWhaleSoundEnabled') === 'true';
@@ -4781,7 +4874,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     function optionFollowText(item) {
       return String(item.option_price_follow_through_status || item.follow_through_status || 'pending').replaceAll('_', ' ');
     }
-    function renderStatus(status, latest, universe, coverage, reliability, dataHealth) {
+    function renderStatus(status, latest, universe, coverage, reliability, dataHealth, qualityAnalytics, canonicalAudit) {
       const scan = latest.last_scan || {};
       const auto = status.auto_scan_enabled ? (status.auto_scan_paused ? 'Paused' : 'Running') : 'Disabled';
       const current = status.scan_running ? 'Running' : 'Idle';
@@ -4819,8 +4912,13 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Scan duration p95', dataHealth.scan_loop_health?.duration_p95_seconds !== null && dataHealth.scan_loop_health?.duration_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.duration_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
         card('Scan cadence p95', dataHealth.scan_loop_health?.cadence_p95_seconds !== null && dataHealth.scan_loop_health?.cadence_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.cadence_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
         card('Promotion-ready cohorts', (reliability.promotion_queue || []).filter(row => row.status === 'promotion_ready').length),
+        card('Score rank validation', qualityAnalytics.score_rank_validation?.passed ? 'Passed' : 'Blocked', qualityAnalytics.score_rank_validation?.passed ? 'good' : 'warn'),
+        card('Contract budget', `${qualityAnalytics.contract_budget_waterfall?.contracts_evaluated ?? 0} / ${qualityAnalytics.contract_budget_waterfall?.selected_contracts ?? 0} evaluated`),
+        card('Canonical complete', `${canonicalAudit.complete_count ?? 0} / ${canonicalAudit.episode_count ?? 0}`),
         card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),
       ].join('');
+      els.costCalibrationRows.innerHTML = (qualityAnalytics.net_cost_calibration || []).map(row => `<tr><td>${esc(row.direction)}</td><td>${esc(row.dte_bucket)}</td><td>${esc(row.sample_count)}</td><td>${num(row.mean_midpoint_pct, '%')}</td><td>${num(row.mean_spread_pct, '%')}</td><td>${num(row.mean_slippage_pct, '%')}</td><td>${num(row.mean_iv_pct, '%')}</td><td>${num(row.mean_decay_pct, '%')}</td><td>${num(row.mean_executable_pct, '%')}</td><td>${row.executable_positive_rate !== null && row.executable_positive_rate !== undefined ? `${Math.round(row.executable_positive_rate * 100)}%` : '—'}</td></tr>`).join('') || '<tr><td colspan="10" class="muted">No completed option outcomes yet.</td></tr>';
+      els.canonicalAuditRows.innerHTML = (canonicalAudit.rows || []).slice(0, 20).map(row => `<tr><td>${formatMarketTime(row.alert_timestamp)}</td><td>${esc(row.symbol)}</td><td>${esc(row.setup)}</td><td>${esc(row.direction)}</td><td>${esc(row.authoritative_status)}</td><td>${esc(row.decision || '—')}</td><td>${row.delivery_eligible ? 'Yes' : 'No'}</td><td>${row.delivery_attempted ? 'Yes' : 'No'}</td><td>${row.delivery_succeeded ? 'Yes' : 'No'}</td><td>${row.useful_alert === null || row.useful_alert === undefined ? '—' : row.useful_alert ? 'Yes' : 'No'}</td><td>${row.block_next_time === null || row.block_next_time === undefined ? '—' : row.block_next_time ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td colspan="11" class="muted">No canonical alert episodes yet.</td></tr>';
       const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
       const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
@@ -4946,15 +5044,17 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     }
     async function refresh() {
       try {
-        const [status, latest, universe, coverage, reliability, dataHealth] = await Promise.all([
+        const [status, latest, universe, coverage, reliability, dataHealth, qualityAnalytics, canonicalAudit] = await Promise.all([
           api('/api/options-whales/status'),
           api('/api/options-whales/latest'),
           api('/api/options-whales/universe/status'),
           api('/api/options-whales/coverage'),
           api('/api/options-whales/reliability'),
-          api('/api/options-whales/data-health')
+          api('/api/options-whales/data-health'),
+          api('/api/options-whales/quality-analytics'),
+          api('/api/options-whales/canonical-audit')
         ]);
-        renderStatus(status, latest, universe, coverage, reliability, dataHealth);
+        renderStatus(status, latest, universe, coverage, reliability, dataHealth, qualityAnalytics, canonicalAudit);
         renderRows(latest);
         maybePlayUpdateSound(status, latest);
       } catch (err) {
@@ -5124,6 +5224,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/options-whales/latency":
                 query = parse_qs(parsed.query)
                 self.send_json(options_whales_latency_timeline({key: values[0] for key, values in query.items() if values}))
+            elif parsed.path == "/api/options-whales/quality-analytics":
+                self.send_json(options_whales_quality_analytics())
+            elif parsed.path == "/api/options-whales/canonical-audit":
+                self.send_json(canonical_episode_audit())
             elif parsed.path == "/api/options-whales/export.json":
                 self.send_json(options_whales_export_json())
             elif parsed.path == "/api/options-whales/export.csv":

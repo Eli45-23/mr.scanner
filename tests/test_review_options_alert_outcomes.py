@@ -107,6 +107,19 @@ class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
         self.assertEqual(client.option_calls, 2)
         self.assertEqual([item["rows"] for item in result["reviewed"][0]["option_bar_fetch_attempts"]], [0, 1])
 
+    def test_unavailable_option_bars_always_have_detailed_failure(self):
+        detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
+        class EmptyOptionClient(FakeBarsClient):
+            def get_option_bars(self, symbols, *, start, end): return {}
+        client = EmptyOptionClient({"ADBE": self.bars(detected, [0, 5, 15, 30, 60])})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_review(Path(temp_dir), client)
+        failure = result["reviewed"][0]["option_bar_failure"]
+        self.assertEqual(failure["option_symbol"], "ADBETESTC")
+        self.assertEqual(failure["endpoint"], "historical_option_bars")
+        self.assertEqual(failure["attempt_count"], 3)
+        self.assertEqual(failure["final_disposition"], "retry_exhausted")
+
     def test_duplicate_pending_reviews_are_not_appended_repeatedly(self):
         detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
         fake_client = FakeBarsClient({"ADBE": self.bars(detected, [0, 1])})

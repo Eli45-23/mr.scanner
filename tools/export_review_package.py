@@ -84,6 +84,25 @@ def parse_record_time(record: Dict[str, Any]) -> Optional[datetime]:
     return parsed.astimezone(ET)
 
 
+def latest_records_by_key(records: Iterable[Dict[str, Any]], *key_fields: str) -> Dict[str, Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        key = next((str(record.get(field)) for field in key_fields if record.get(field)), "")
+        if not key:
+            continue
+        prior = latest.get(key)
+        current = parse_record_time({"timestamp": record.get("last_updated_at") or record.get("reviewed_at") or record.get("episode_updated_at") or record.get("timestamp")})
+        previous = parse_record_time({"timestamp": (prior or {}).get("last_updated_at") or (prior or {}).get("reviewed_at") or (prior or {}).get("episode_updated_at") or (prior or {}).get("timestamp")})
+        if prior is None or previous is None or (current is not None and current >= previous):
+            latest[key] = record
+    return latest
+
+
+def reconcile_canonical_records(alert_episode_rows: Iterable[Dict[str, Any]], performance_rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest = latest_records_by_key([*alert_episode_rows, *performance_rows], "canonical_episode_id", "alert_id")
+    return sorted(({"canonical_episode_id": episode_id, "authoritative_status": row.get("status"), "canonical_source": "latest_timestamp_across_alert_episodes_and_performance", **row} for episode_id, row in latest.items()), key=lambda row: str(row.get("alert_timestamp") or ""))
+
+
 def redact_payload(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: Dict[str, Any] = {}
@@ -693,9 +712,11 @@ def export_review_package(
     except (OSError, json.JSONDecodeError):
         review_state = {}
     (analytics_out / "oi_coverage_waterfall.json").write_text(json.dumps({"source_session_date": review_state.get("oi_source_day"), "coverage_waterfall": review_state.get("oi_waterfall") or {}, "coverage_history": review_state.get("oi_coverage_history") or [], "plateau_detected": review_state.get("oi_plateau_detected")}, indent=2, sort_keys=True), encoding="utf-8")
-    timeline_rows = [{"canonical_episode_id": row.get("canonical_episode_id") or row.get("alert_id"), "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "market_observation": row.get("market_observation_at") or row.get("alert_timestamp"), "detection": row.get("alert_timestamp"), "decision": row.get("decision_timestamp"), "eligibility": row.get("notification_eligible_at"), "delivery_attempt": row.get("delivery_attempted_at"), "delivery_success": row.get("delivery_succeeded_at"), "outcome_review": row.get("last_updated_at"), "oi_confirmation": row.get("oi_confirmed_at")} for row in alert_episodes]
+    canonical_audit = reconcile_canonical_records(alert_episodes, post_alert_performance)
+    (analytics_out / "canonical_episode_audit.json").write_text(json.dumps(canonical_audit, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    timeline_rows = [{"canonical_episode_id": row.get("canonical_episode_id") or row.get("alert_id"), "authoritative_status": row.get("authoritative_status") or row.get("status"), "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "market_observation": row.get("market_observation_at") or row.get("alert_timestamp"), "detection": row.get("alert_timestamp"), "decision": row.get("decision_timestamp"), "eligibility": row.get("notification_eligible_at"), "delivery_attempt": row.get("delivery_attempted_at"), "delivery_success": row.get("delivery_succeeded_at"), "outcome_review": row.get("last_updated_at") if row.get("interval_prices") else None, "oi_confirmation": row.get("oi_confirmed_at")} for row in canonical_audit]
     (analytics_out / "detection_delivery_latency_timeline.json").write_text(json.dumps(timeline_rows, indent=2, sort_keys=True, default=str), encoding="utf-8")
-    all_outcomes = read_jsonl(outcome_sources["outcomes"])
+    all_outcomes = list(latest_records_by_key(read_jsonl(outcome_sources["outcomes"]), "alert_key", "episode_id").values())
     session_rows: Dict[str, List[Dict[str, Any]]] = {}
     for row in all_outcomes:
         stamp = parse_record_time(row)
@@ -709,8 +730,37 @@ def export_review_package(
         values = [float(w["signed_move_pct"]) for w in windows if w and isinstance(w.get("signed_move_pct"), (int, float))]
         regression.append({"session": session, "sample_count": len(rows_for_session), "underlying_coverage": round(len(values) / len(rows_for_session), 4) if rows_for_session else None, "meaningful_0_10_rate": round(sum(v >= .10 for v in values) / len(values), 4) if values else None, "mean_signed_move_pct": round(sum(values) / len(values), 4) if values else None})
     (analytics_out / "five_session_regression.json").write_text(json.dumps({"sessions": last_sessions, "rows": regression}, indent=2, sort_keys=True), encoding="utf-8")
-    promotion = [{"bucket": row.get("reliability_bucket"), "session_count": row.get("reliability_session_count"), "effective_samples": row.get("reliability_effective_samples"), "meaningful_rate": row.get("reliability_meaningful_rate"), "executable_positive_rate": row.get("reliability_executable_positive_rate"), "status": "promotion_ready" if row.get("reliability_qualified") and row.get("reliability_dual_metric_passed") else "collecting", "manual_approval_required": True} for row in all_outcomes if row.get("reliability_bucket") and str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
+    promotion_latest = latest_records_by_key((row for row in all_outcomes if row.get("reliability_bucket") and str(row.get("classification") or "").upper() != "MIXED SIGNAL"), "reliability_bucket")
+    promotion = [{"bucket": row.get("reliability_bucket"), "session_count": row.get("reliability_session_count"), "effective_samples": row.get("reliability_effective_samples"), "meaningful_rate": row.get("reliability_meaningful_rate"), "executable_positive_rate": row.get("reliability_executable_positive_rate"), "status": "promotion_ready" if row.get("reliability_qualified") and row.get("reliability_dual_metric_passed") else "collecting", "manual_approval_required": True} for row in promotion_latest.values()]
     (analytics_out / "shadow_cohort_promotion_queue.json").write_text(json.dumps(promotion, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    latest_scan_path = data_dir / "options_whale_latest.json"
+    try:
+        latest_scan_payload = json.loads(latest_scan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        latest_scan_payload = {}
+    (analytics_out / "contract_budget_waterfall.json").write_text(json.dumps(latest_scan_payload.get("contract_budget_waterfall") or {}, indent=2, sort_keys=True), encoding="utf-8")
+    cost_rows: Dict[tuple[str, str], Dict[str, Any]] = {}
+    score_rows: Dict[str, Dict[str, Any]] = {}
+    for row in all_outcomes:
+        option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        key = (str(row.get("flow_bias") or "UNKNOWN"), str(row.get("dte_bucket") or "UNKNOWN"))
+        group = cost_rows.setdefault(key, {"direction": key[0], "dte_bucket": key[1], "samples": 0, "executable": [], "midpoint": [], "spread": [], "slippage": [], "iv": [], "decay": [], "residual": []})
+        group["samples"] += 1
+        if option:
+            for source, target in (("estimated_executable_return_pct", "executable"), ("raw_midpoint_return_pct", "midpoint"), ("bid_ask_spread_cost_pct", "spread"), ("slippage_cost_pct", "slippage"), ("iv_attribution_pct", "iv"), ("time_decay_attribution_pct", "decay"), ("residual_market_price_return_pct", "residual")):
+                if isinstance(option.get(source), (int, float)): group[target].append(float(option[source]))
+        score = int(float(row.get("whale_score") or 0)); bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
+        score_group = score_rows.setdefault(bucket, {"bucket": bucket, "underlying": [], "executable": []})
+        if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
+        if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
+    cost_output = [{"direction": group["direction"], "dte_bucket": group["dte_bucket"], "sample_count": group["samples"], **{f"mean_{name}_pct": round(sum(values) / len(values), 4) if values else None for name, values in ((field, group[field]) for field in ("executable", "midpoint", "spread", "slippage", "iv", "decay", "residual"))}} for group in cost_rows.values()]
+    (analytics_out / "net_cost_calibration.json").write_text(json.dumps(cost_output, indent=2, sort_keys=True), encoding="utf-8")
+    score_output = [{"bucket": bucket, "meaningful_0_10_rate": round(sum(value >= .10 for value in score_rows[bucket]["underlying"]) / len(score_rows[bucket]["underlying"]), 4) if score_rows[bucket]["underlying"] else None, "executable_positive_rate": round(sum(value > 0 for value in score_rows[bucket]["executable"]) / len(score_rows[bucket]["executable"]), 4) if score_rows[bucket]["executable"] else None} for bucket in ("75-79", "80-89", "90+") if bucket in score_rows]
+    meaningful_values = [row["meaningful_0_10_rate"] for row in score_output if row["meaningful_0_10_rate"] is not None]; executable_values = [row["executable_positive_rate"] for row in score_output if row["executable_positive_rate"] is not None]
+    score_validation = {"rows": score_output, "meaningful_monotonic": len(meaningful_values) >= 2 and all(right >= left for left, right in zip(meaningful_values, meaningful_values[1:])), "executable_monotonic": len(executable_values) >= 2 and all(right >= left for left, right in zip(executable_values, executable_values[1:]))}
+    score_validation["passed"] = score_validation["meaningful_monotonic"] and score_validation["executable_monotonic"]
+    (analytics_out / "score_rank_validation.json").write_text(json.dumps(score_validation, indent=2, sort_keys=True), encoding="utf-8")
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)
@@ -811,11 +861,7 @@ def export_review_package(
     copy_redacted_file(snapshot_dir / "dashboard_snapshot_latest.json", package_dir / "dashboard_snapshot_latest.json", notes)
     copy_redacted_file(config_example, package_dir / "config.example.json", notes)
     performance_report = package_dir / f"alert_performance_{day_text}.md"
-    latest_performance = {
-        str(record.get("alert_id")): record
-        for record in post_alert_performance
-        if record.get("alert_id")
-    }
+    latest_performance = {str(record.get("canonical_episode_id") or record.get("alert_id")): record for record in canonical_audit if record.get("canonical_episode_id") or record.get("alert_id")}
     performance_report.write_text(
         build_performance_report(day_text, list(latest_performance.values())),
         encoding="utf-8",

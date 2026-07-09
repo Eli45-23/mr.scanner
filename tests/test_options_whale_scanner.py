@@ -65,8 +65,9 @@ class FakeWhaleClient:
                 "latestQuote": {"bp": 1.9, "ap": 2.0, "t": datetime.now(timezone.utc).isoformat()},
                 "latestTrade": {"p": 2.0, "t": datetime.now(timezone.utc).isoformat()},
                 "dailyBar": {"v": 1000, "c": 2.0},
+                "impliedVolatility": 0.35,
                 "trade_count": 3,
-                "greeks": {"delta": 0.5},
+                "greeks": {"delta": 0.5, "gamma": 0.04, "theta": -0.03, "vega": 0.12},
             }
             for symbol in symbols
         }
@@ -107,6 +108,9 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertTrue(candidate["low_sample_warning"])
             self.assertEqual(result["results"][0]["next_day_oi_status"], "pending")
             self.assertIsNone(result["results"][0]["learned_quality_score"])
+            observations = OptionsWhaleStorage(Path(tmp)).option_quote_observations(candidate["option_symbol"])
+            self.assertEqual(observations[-1]["implied_volatility"], 0.35)
+            self.assertEqual(observations[-1]["theta"], -0.03)
 
     def test_priority_seed_symbols_scan_before_obscure_names_and_continue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -186,6 +190,18 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             result = scanner.scan()
             self.assertEqual(result["coverage_rotation_page"][0], "BBB")
             self.assertIn("BBB", result["coverage_stale_symbols_prioritized"])
+
+    def test_deadline_budget_adapts_contract_cap_from_prior_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_universe(root, [{"underlying_symbol": symbol, "contract_count": 100} for symbol in ("AAPL", "AAA", "BBB")])
+            state_path = root / "data" / "options_whale_scan_state.json"
+            state_path.write_text(json.dumps({"last_scan_duration_seconds": 60, "last_contracts_scanned": 1000, "last_scanned_at": {}, "contract_cursors": {}}), encoding="utf-8")
+            scanner = OptionsWhaleScanner({"options_whale_scanner": {"enabled": True, "max_contracts_per_scan": 1000, "scan_deadline_seconds": 25, "deadline_contract_safety_factor": .9, "deadline_min_contracts_per_scan": 10, "min_score": 99, "min_premium": 999999999}}, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
+            result = scanner.scan()
+            self.assertTrue(result["adaptive_contract_cap_applied"])
+            self.assertEqual(result["effective_contract_cap"], 375)
+            self.assertEqual(result["contract_budget_waterfall"]["contracts_evaluated"], result["contracts_evaluated"])
 
     def test_no_candidate_scan_returns_near_misses_and_rejection_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

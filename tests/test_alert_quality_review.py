@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.export_review_package import export_review_package
+from tools.export_review_package import export_review_package, latest_records_by_key, reconcile_canonical_records
 from tools.review_alert_quality import build_alert_quality_review, write_alert_quality_review
 
 
@@ -25,6 +25,22 @@ def test_review_handles_missing_logs_and_writes_valid_outputs(tmp_path: Path):
     paths = write_alert_quality_review(DAY, tmp_path / "logs", tmp_path / "exports")
     assert json.loads(paths["json"].read_text())["date"] == DAY
     assert "Alert Volume Summary" in paths["markdown"].read_text()
+
+
+def test_latest_episode_grain_and_canonical_status_are_reconciled():
+    outcomes = [
+        {"alert_key": "ep-1", "reviewed_at": "2026-07-08T10:00:00Z", "status": "pending"},
+        {"alert_key": "ep-1", "reviewed_at": "2026-07-08T10:15:00Z", "status": "ok"},
+    ]
+    self_latest = latest_records_by_key(outcomes, "alert_key")
+    assert len(self_latest) == 1
+    assert self_latest["ep-1"]["status"] == "ok"
+    canonical = reconcile_canonical_records(
+        [{"alert_id": "a-1", "last_updated_at": "2026-07-08T10:00:00Z", "status": "PENDING"}],
+        [{"alert_id": "a-1", "last_updated_at": "2026-07-08T10:15:00Z", "status": "COMPLETE"}],
+    )
+    assert len(canonical) == 1
+    assert canonical[0]["authoritative_status"] == "COMPLETE"
 
 
 def test_review_counts_channels_tiers_and_flags_noisy_day(tmp_path: Path):
