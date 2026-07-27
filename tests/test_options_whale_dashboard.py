@@ -107,6 +107,19 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Regime UNKNOWN alarm", html)
         self.assertIn("Noise ratio", html)
 
+    def test_whale_dashboard_uses_light_theme(self):
+        html = scanner_dashboard.WHALE_INDEX_HTML
+        self.assertIn("color-scheme: light", html)
+        self.assertIn("--bg:#f5f7f9", html)
+        self.assertIn("--panel:#ffffff", html)
+        self.assertIn("--text:#182026", html)
+        self.assertNotIn("color-scheme: dark", html)
+        self.assertNotIn("--bg:#0b0f14", html)
+        self.assertNotIn("--panel:#111821", html)
+        self.assertNotIn("background:#0d141d", html)
+        self.assertNotIn("background:#162233", html)
+        self.assertNotIn("background:#15202e", html)
+
     def test_missed_cycles_use_actual_cadence(self):
         cadence_missed, delay_missed, total = scanner_dashboard.calculate_missed_cycles(107.5, 0, 30)
         self.assertEqual((cadence_missed, delay_missed, total), (3, 0, 3))

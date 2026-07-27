@@ -4583,7 +4583,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Options Whale Scanner</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b0f14; --panel:#111821; --muted:#8fa1b3; --text:#e8f0f8; --line:#223042; --good:#40d48a; --warn:#f1c84b; --bad:#ff6b6b; --accent:#5db7ff; }
+    :root { color-scheme: light; --bg:#f5f7f9; --panel:#ffffff; --muted:#66727d; --text:#182026; --line:#d9e0e6; --good:#0b7a44; --warn:#9a6700; --bad:#b3261e; --accent:#087f8c; --soft:#fbfcfd; --hover:#eef4f7; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
     header { padding:18px 22px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:16px; }
@@ -4600,22 +4600,22 @@ WHALE_INDEX_HTML = r"""<!doctype html>
     .bad { color:var(--bad); }
     .good { color:var(--good); }
     .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-    button, a.button { border:1px solid var(--line); background:#162233; color:var(--text); border-radius:6px; padding:9px 11px; cursor:pointer; text-decoration:none; font-size:13px; }
-    button.primary { background:#16466d; border-color:#266b9e; }
+    button, a.button { border:1px solid var(--line); background:#ffffff; color:var(--text); border-radius:6px; padding:9px 11px; cursor:pointer; text-decoration:none; font-size:13px; }
+    button.primary { background:#087f8c; color:#ffffff; border-color:#087f8c; }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .filters { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px; }
     .field label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
-    input, select { width:100%; background:#0d141d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; }
+    input, select { width:100%; background:#ffffff; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
     th, td { border-bottom:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; }
     th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
     tr.clickable { cursor:pointer; }
-    tr.clickable:hover { background:#15202e; }
+    tr.clickable:hover { background:var(--hover); }
     .table-wrap { overflow:auto; max-height:520px; border:1px solid var(--line); border-radius:6px; }
     .score { font-weight:800; color:var(--accent); }
-    .notice { border:1px solid var(--line); border-radius:6px; padding:10px; background:#0d141d; margin-top:10px; }
+    .notice { border:1px solid var(--line); border-radius:6px; padding:10px; background:var(--soft); margin-top:10px; }
     .detail-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
-    pre { white-space:pre-wrap; word-break:break-word; background:#0d141d; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:300px; overflow:auto; }
+    pre { white-space:pre-wrap; word-break:break-word; background:var(--soft); border:1px solid var(--line); border-radius:6px; padding:10px; max-height:300px; overflow:auto; }
     .topbar { display:flex; justify-content:space-between; gap:16px; align-items:center; }
   </style>
 </head>
