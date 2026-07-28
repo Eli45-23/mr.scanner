@@ -89,26 +89,35 @@ def default_options_whale_config() -> Dict[str, Any]:
         "scan_deadline_seconds": 25,
         "deadline_contract_safety_factor": 0.90,
         "cadence_overrun_contract_safety_factor": 0.60,
+        "cadence_p95_contract_safety_factor": 0.45,
+        "cadence_p95_window": 20,
         "deadline_min_contracts_per_scan": 500,
         "scan_cadence_target_seconds": 30,
         "scan_cadence_overrun_multiplier": 1.50,
         "profitable_symbol_priority_enabled": True,
-        "profitable_symbol_priority_min_samples": 20,
-        "profitable_symbol_priority_min_executable_rate": 0.45,
-        "profitable_symbol_penalty_rate": 0.30,
+        "profitable_symbol_priority_min_samples": 30,
+        "profitable_symbol_priority_min_executable_rate": 0.50,
+        "profitable_symbol_penalty_rate": 0.40,
         "profitable_symbol_priority_bonus": 4,
-        "profitable_symbol_penalty": 6,
+        "profitable_symbol_penalty": 8,
         "dashboard_min_score_after_noise": 75,
         "dashboard_min_score_bearish": 82,
         "bearish_dashboard_min_score": 82,
         "bearish_dashboard_min_direction_confidence": "MEDIUM",
         "bearish_dashboard_min_price_context": 8,
         "bearish_dashboard_penalty": 8,
+        "range_choppy_dashboard_penalty": 10,
         "minimum_executable_edge_rate": 0.45,
         "minimum_executable_edge_samples": 20,
         "minimum_executable_edge_penalty": 5,
-        "episode_noise_min_score": 75,
+        "episode_noise_min_score": 80,
         "episode_noise_min_premium": 100000,
+        "episode_noise_min_volume": 1000,
+        "episode_noise_max_spread_percent": 12,
+        "episode_noise_require_fresh_quote": True,
+        "episode_noise_require_aligned_regime": True,
+        "episode_noise_block_regimes": ["CHOPPY", "RANGE_BOUND"],
+        "episode_noise_min_price_confirmation_score": 6,
         "active_episode_quote_minutes": 75,
         "active_episode_quote_limit": 500,
         "index_0dte_min_score": 85,
@@ -1038,6 +1047,8 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if meaningful_rate < float(cfg.get("strict_cohort_min_meaningful_rate", 0.30)): cohort_reasons.append("+0.10% meaningful-move reliability is below the Tier 1 threshold")
     if executable_rate < float(cfg.get("strict_cohort_min_executable_positive_rate", 0.50)): cohort_reasons.append("positive executable-return reliability is below the Tier 1 threshold")
     if not result.get("reliability_dual_metric_passed"): cohort_reasons.append("dual-metric Tier 1 proof is incomplete")
+    if result.get("score_rank_validation_passed") is False:
+        cohort_reasons.append("score-rank calibration is not monotonic across +0.10% outcomes and executable option returns")
     if bias == "BEARISH":
         if score < int(cfg.get("bearish_tier1_min_score", 90)): cohort_reasons.append("bearish score below Tier 1 threshold")
         if safe_float(result.get("price_confirmation_score")) < int(cfg.get("bearish_tier1_min_price_context", 8)): cohort_reasons.append("bearish price confirmation below Tier 1 threshold")
@@ -1053,6 +1064,9 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
         return "Tier 2", False, "Possible multi-leg flow is dashboard-only until direction is clearer."
     if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
         return "Tier 2", False, "Direction confidence is below the Tier 1 requirement."
+    if regime in {"CHOPPY", "RANGE_BOUND"}:
+        result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + [f"{regime} regime remains dashboard-only"]))})
+        return "Tier 3", False, f"{regime} regime is dashboard-only until score and executable-return calibration improve."
     if bias == "BEARISH" and not result.get("bearish_oversight_passed", True):
         result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + list(result.get("bearish_oversight_reasons") or [])))})
         return "Tier 3", False, "Bearish flow requires stronger confirmation before high-rank dashboard promotion."
@@ -1069,6 +1083,51 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if score >= 75:
         return "Tier 3", False, "Unusual but unclear; watch only."
     return "Ignore", False, "Below whale-flow threshold."
+
+
+def _aligned_regime_for_episode(result: Dict[str, Any]) -> bool:
+    bias = infer_direction_bias_label(result)
+    regime = str(result.get("market_regime") or "UNKNOWN").upper()
+    if bias == "BULLISH":
+        return regime in {"TRENDING_UP", "OPENING_DRIVE_UP", "BULL_TREND"}
+    if bias == "BEARISH":
+        return regime in {"TRENDING_DOWN", "OPENING_DRIVE_DOWN", "BEAR_TREND"}
+    return False
+
+
+def dashboard_episode_noise_reasons(result: Dict[str, Any], cfg: Dict[str, Any]) -> List[str]:
+    candidate = result.get("candidate") or {}
+    reasons: List[str] = []
+    score = int(result.get("whale_score") or 0)
+    episode_min_score = min(int(cfg.get("episode_noise_min_score", 80)), int(cfg.get("min_score", 75)) + 10)
+    if score < episode_min_score:
+        reasons.append("score below episode registration threshold")
+    if safe_float(candidate.get("estimated_premium")) < float(cfg.get("episode_noise_min_premium", 100000)):
+        reasons.append("premium below episode registration threshold")
+    if safe_float(candidate.get("volume")) < float(cfg.get("episode_noise_min_volume", 1000)):
+        reasons.append("volume below episode registration threshold")
+    spread = candidate.get("spread_percent")
+    if spread is None or safe_float(spread) > float(cfg.get("episode_noise_max_spread_percent", cfg.get("max_spread_percent", 15))):
+        reasons.append("spread too wide or unavailable for episode registration")
+    if bool(cfg.get("episode_noise_require_fresh_quote", True)):
+        if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
+            reasons.append("stale or delayed premium print")
+        if candidate.get("quote_stale_warning") or "stale quote" in " ".join(str(w).lower() for w in candidate.get("warnings") or []):
+            reasons.append("stale quote")
+    regime = str(result.get("market_regime") or "UNKNOWN").upper()
+    if regime in {str(item).upper() for item in cfg.get("episode_noise_block_regimes", ["CHOPPY", "RANGE_BOUND"])}:
+        reasons.append(f"{regime} regime is dashboard-context only")
+    if bool(cfg.get("episode_noise_require_aligned_regime", True)) and not _aligned_regime_for_episode(result):
+        reasons.append("regime is not aligned with flow direction")
+    if safe_float(result.get("price_confirmation_score")) < float(cfg.get("episode_noise_min_price_confirmation_score", 6)):
+        reasons.append("price confirmation below episode registration threshold")
+    if infer_direction_bias_label(result) == "BEARISH" and not result.get("bearish_oversight_passed", True):
+        reasons.extend(result.get("bearish_oversight_reasons") or ["bearish oversight did not pass"])
+    if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"}:
+        reasons.append("recent executable option edge is too weak for episode registration")
+    if result.get("score_rank_validation_passed") is False:
+        reasons.append("score-rank validation failed; keep out of canonical learning")
+    return list(dict.fromkeys(reasons))
 
 
 def _unusualness_bucket(score: Any) -> str:
@@ -1318,13 +1377,31 @@ class OptionsWhaleScanner:
         budget_seconds = max(5.0, float(self.whale.get("scan_deadline_seconds", 25)))
         prior_duration = safe_float(state.get("last_scan_duration_seconds"))
         prior_contracts = int(state.get("last_contracts_scanned") or configured_max_contracts)
+        telemetry_path = self.root / "state" / "options_scan_loop_telemetry.json"
+        duration_p95: Optional[float] = None
+        try:
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+            if isinstance(telemetry, list):
+                recent_durations = sorted(
+                    float(row["duration_seconds"])
+                    for row in telemetry[-int(self.whale.get("cadence_p95_window", 20)):]
+                    if isinstance(row, dict) and isinstance(row.get("duration_seconds"), (int, float))
+                )
+                if recent_durations:
+                    index = min(len(recent_durations) - 1, max(0, math.ceil(0.95 * len(recent_durations)) - 1))
+                    duration_p95 = recent_durations[index]
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            duration_p95 = None
         adaptive_contract_cap = configured_max_contracts
-        if bool(self.whale.get("deadline_aware_contract_budget", True)) and prior_duration > budget_seconds:
+        pressure_duration = max(prior_duration, duration_p95 or 0.0)
+        if bool(self.whale.get("deadline_aware_contract_budget", True)) and pressure_duration > budget_seconds:
             safety_factor = float(self.whale.get("deadline_contract_safety_factor", 0.90))
             cadence_target = max(1.0, float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))))
-            if prior_duration > cadence_target * float(self.whale.get("scan_cadence_overrun_multiplier", 1.50)):
+            if duration_p95 is not None and duration_p95 > cadence_target:
+                safety_factor = min(safety_factor, float(self.whale.get("cadence_p95_contract_safety_factor", 0.45)))
+            if pressure_duration > cadence_target * float(self.whale.get("scan_cadence_overrun_multiplier", 1.50)):
                 safety_factor = min(safety_factor, float(self.whale.get("cadence_overrun_contract_safety_factor", 0.60)))
-            adaptive_contract_cap = int(prior_contracts * budget_seconds / prior_duration * safety_factor)
+            adaptive_contract_cap = int(prior_contracts * budget_seconds / pressure_duration * safety_factor)
         min_contract_cap = max(1, int(self.whale.get("deadline_min_contracts_per_scan", 500)))
         max_contracts = min(configured_max_contracts, max(min_contract_cap, adaptive_contract_cap))
         last_scanned_at = state.setdefault("last_scanned_at", {})
@@ -1459,6 +1536,9 @@ class OptionsWhaleScanner:
             "effective_contract_cap": max_contracts,
             "adaptive_contract_cap_applied": max_contracts < configured_max_contracts,
             "prior_scan_duration_seconds": prior_duration or None,
+            "scan_budget_pressure_duration_p95_seconds": round(duration_p95, 2) if duration_p95 is not None else None,
+            "scan_budget_pressure_duration_seconds": round(pressure_duration, 2) if pressure_duration else None,
+            "scan_budget_pressure_throttle_state": "p95_over_target" if duration_p95 is not None and duration_p95 > float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))) else "last_scan_over_deadline" if prior_duration > budget_seconds else "normal",
             "deadline_reached_during_contract_selection": bool(deadline_skipped_symbols and deadline_monotonic is not None and time.monotonic() >= deadline_monotonic),
             "deadline_skipped_symbols": deadline_skipped_symbols,
             "deadline_skipped_symbol_count": len(deadline_skipped_symbols),
@@ -1846,6 +1926,15 @@ class OptionsWhaleScanner:
             else:
                 result.update({"executable_edge_label": "disabled_or_no_history", "executable_edge_score_adjustment": 0})
             result = apply_bearish_flow_oversight(result, effective_cfg)
+            if str(result.get("market_regime") or "").upper() in {"CHOPPY", "RANGE_BOUND"}:
+                original_regime_score = int(result.get("whale_score") or 0)
+                regime_penalty = int(effective_cfg.get("range_choppy_dashboard_penalty", 10))
+                result["pre_regime_whale_score"] = original_regime_score
+                result["regime_score_adjustment"] = -regime_penalty
+                result["whale_score"] = max(0, original_regime_score - regime_penalty)
+                result["noise_adjusted_score"] = result["whale_score"]
+                result["classification"] = classify_score(result["whale_score"])
+                result["regime_dashboard_only_reason"] = f"{result.get('market_regime')} regime has weak recent executable follow-through; score reduced by {regime_penalty} and kept dashboard-only."
             if int(result.get("whale_score") or 0) < int(effective_cfg.get("min_score", 75)):
                 continue
             result.update({
@@ -1907,23 +1996,14 @@ class OptionsWhaleScanner:
         results = attach_outcome_completeness(results, recent_outcomes)
         eligible_results: List[Dict[str, Any]] = []
         suppressed_noise_count = 0
+        suppressed_noise_results: List[Dict[str, Any]] = []
         for item in results:
-            score = int(item.get("whale_score") or 0)
-            candidate = item.get("candidate") or {}
-            noise_reasons: List[str] = []
-            episode_min_score = min(int(effective_cfg.get("episode_noise_min_score", 75)), int(effective_cfg.get("min_score", 75)))
-            if score < episode_min_score:
-                noise_reasons.append("score below episode registration threshold")
-            if safe_float(candidate.get("estimated_premium")) < float(effective_cfg.get("episode_noise_min_premium", 100000)):
-                noise_reasons.append("premium below episode registration threshold")
-            if infer_direction_bias_label(item) == "BEARISH" and not item.get("bearish_oversight_passed", True):
-                noise_reasons.extend(item.get("bearish_oversight_reasons") or ["bearish oversight did not pass"])
-            if str(item.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"} and score < int(effective_cfg.get("dashboard_min_score_after_noise", 75)) + 5:
-                noise_reasons.append("recent executable option edge is too weak for episode registration")
+            noise_reasons = [] if debug_loose else dashboard_episode_noise_reasons(item, effective_cfg)
             item["episode_registration_eligible"] = not noise_reasons
             item["episode_noise_reasons"] = list(dict.fromkeys(noise_reasons))
             if noise_reasons:
                 suppressed_noise_count += 1
+                suppressed_noise_results.append(item)
             else:
                 eligible_results.append(item)
         results = eligible_results
@@ -1971,6 +2051,18 @@ class OptionsWhaleScanner:
             "market_regime_missing_alarm": market_regime == "UNKNOWN",
             "market_regime_missing_reason": "Options outcomes would be stamped UNKNOWN; heartbeat/fallback regime unavailable." if market_regime == "UNKNOWN" else "",
             "episode_noise_suppressed_count": suppressed_noise_count,
+            "episode_noise_suppressed_preview": [
+                {
+                    "underlying_symbol": _key_value(item, "underlying_symbol"),
+                    "option_symbol": _key_value(item, "option_symbol"),
+                    "market_regime": item.get("market_regime"),
+                    "flow_bias": infer_direction_bias_label(item),
+                    "whale_score": item.get("whale_score"),
+                    "alert_tier": item.get("alert_tier"),
+                    "episode_noise_reasons": item.get("episode_noise_reasons") or [],
+                }
+                for item in suppressed_noise_results[:20]
+            ],
             "dashboard_episode_noise_ratio": round((len(results) + suppressed_noise_count) / max(1, len(results)), 4) if results else float(suppressed_noise_count),
             **self.last_scan_order,
             "skipped_contracts_count": sum(skipped_reasons.values()),

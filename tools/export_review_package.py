@@ -439,6 +439,70 @@ def build_review_summary(
     repeated_range_periods = sum(1 for record in liquidity_sweep_records if record.get("repeated_range_sweeps"))
     orchestrator_types = [str(record.get("final_alert_type") or "") for record in orchestrator_records]
     notes_text = "\n".join(f"- {note}" for note in notes) if notes else "- No export issues noted."
+    unique_whale_outcomes = list(latest_records_by_key(whale_outcomes, "alert_key", "episode_id").values())
+    repeated_outcome_rows = max(0, len(whale_outcomes) - len(unique_whale_outcomes))
+    outcome_15m = []
+    option_15m = []
+    for row in unique_whale_outcomes:
+        underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+            outcome_15m.append(float(underlying["signed_move_pct"]))
+        if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+            option_15m.append(float(option["estimated_executable_return_pct"]))
+    latest_oi_source = str((whale_oi[-1] if whale_oi else {}).get("original_session_date") or (whale_oi[-1] if whale_oi else {}).get("source_session_date") or "")
+    oi_due_status = "not_due_yet" if unique_whale_outcomes and not whale_oi else "confirmed_or_reviewed" if whale_oi and (not latest_oi_source or latest_oi_source == day_text) else "previous_session_carryover" if whale_oi else "not_started"
+    oi_due_reason = (
+        f"Next-day OI for {day_text} is due on the next trading session; no same-day OI failure is inferred."
+        if oi_due_status == "not_due_yet"
+        else f"OI records in this package refer to previous session {latest_oi_source}; keep separate from {day_text}."
+        if oi_due_status == "previous_session_carryover"
+        else "OI records are included for the requested session." if whale_oi else "No OI records available."
+    )
+    stock_record_count = len(alert_window) + len(scenario_window) + len(heads_up_window) + len(option_window)
+    hide_legacy_stock_sections = bool(whale_scans or whale_episodes or whale_outcomes) and stock_record_count == 0
+    legacy_focus_summary = (
+        "## Legacy Stock/AAPL Review\n"
+        "_No stock/AAPL scenario records were found in this window, so the legacy stock sections are hidden. Today's active evidence is Options Whale scanner data._\n"
+        if hide_legacy_stock_sections
+        else f"""## Focused Summary
+- Premarket scenario records: {len(premarket)}
+- Market-open scenario records (9:30–10:00 ET): {len(market_open)}
+- Phase 3 heads-up decisions: {len(heads_up_window)}
+- Phase 3 heads-up messages sent: {sum(1 for record in heads_up_window if record.get("phase3_heads_up_sent"))}
+- GOOD_POSITION scenario records: {len(good_position)}
+- LATE / DO_NOT_CHASE records: {len(late_or_chase)}
+"""
+    )
+    legacy_stock_sections = (
+        ""
+        if hide_legacy_stock_sections
+        else f"""
+### Premarket
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(premarket))}
+
+### Market Open
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(market_open))}
+
+### Phase 3 Heads-Up Alerts
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Scenario", "Stock", "Confirm", "Eligible", "Sent", "Block Reason"], heads_up_summary_rows(heads_up_window))}
+
+### GOOD_POSITION Setups
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(good_position))}
+
+### LATE / DO_NOT_CHASE Warnings
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(late_or_chase))}
+
+## Window Alert Records
+{markdown_table(["Time", "Symbol", "Dir", "Setup", "Strategy", "Confirm", "Risk", "Entry", "Stage", "Tier", "Would SMS", "Block Reason"], alert_rows)}
+
+## Window Scenario Records
+{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_rows)}
+
+## Window Option Decisions
+{markdown_table(["Time", "Symbol", "Feed", "Option Score", "Stock Valid", "Option Tradable", "Dashboard", "Final SMS", "Block Reason"], option_rows)}
+"""
+    )
     return f"""# Bot Review Package — {day_text}
 
 ## Market Data Status
@@ -479,19 +543,19 @@ def build_review_summary(
 - Full redacted day logs are included where available.
 - Window-filtered JSONL files are included for alerts, scenario engine records, Phase 3 heads-up decisions, option decisions, and market-data status.
 
-## Focused Summary
-- Premarket scenario records: {len(premarket)}
-- Market-open scenario records (9:30–10:00 ET): {len(market_open)}
-- Phase 3 heads-up decisions: {len(heads_up_window)}
-- Phase 3 heads-up messages sent: {sum(1 for record in heads_up_window if record.get("phase3_heads_up_sent"))}
-- GOOD_POSITION scenario records: {len(good_position)}
-- LATE / DO_NOT_CHASE records: {len(late_or_chase)}
+{legacy_focus_summary}
 
 ## Options Whale Data Quality
 - Scan passes: {len(whale_scans)}
 - Canonical flow episodes: {len(whale_episodes)}
-- Episode outcomes: {len(whale_outcomes)}
+- Episode outcomes: {len(unique_whale_outcomes)} unique episodes / {len(whale_outcomes)} rows
+- Repeated outcome update rows: {repeated_outcome_rows}
+- 15m +0.10% underlying hit rate: {round(sum(value >= .10 for value in outcome_15m) / len(outcome_15m), 4) if outcome_15m else "unavailable"}
+- 15m executable option positive rate: {round(sum(value > 0 for value in option_15m) / len(option_15m), 4) if option_15m else "unavailable"}
+- 15m average executable option return: {round(sum(option_15m) / len(option_15m), 4) if option_15m else "unavailable"}%
 - Next-day OI reviews: {len(whale_oi)}
+- OI due status: {oi_due_status}
+- OI due reason: {oi_due_reason}
 - Scan passes with coverage warnings: {len(coverage_warnings)}
 - Latest coverage warning: {(coverage_warnings[-1].get("coverage_warning") or (coverage_warnings[-1].get("diagnostics") or {}).get("coverage_warning")) if coverage_warnings else "None"}
 
@@ -554,29 +618,7 @@ def build_review_summary(
 - Sweeps near 5m supply/demand: {supply_demand_sweeps}
 - Sweeps inside chop range: {sum(1 for record in liquidity_sweep_records if record.get("inside_chop_range"))}
 
-### Premarket
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(premarket))}
-
-### Market Open
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(market_open))}
-
-### Phase 3 Heads-Up Alerts
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Scenario", "Stock", "Confirm", "Eligible", "Sent", "Block Reason"], heads_up_summary_rows(heads_up_window))}
-
-### GOOD_POSITION Setups
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(good_position))}
-
-### LATE / DO_NOT_CHASE Warnings
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_summary_rows(late_or_chase))}
-
-## Window Alert Records
-{markdown_table(["Time", "Symbol", "Dir", "Setup", "Strategy", "Confirm", "Risk", "Entry", "Stage", "Tier", "Would SMS", "Block Reason"], alert_rows)}
-
-## Window Scenario Records
-{markdown_table(["Time", "Symbol", "Top Scenario", "Stage", "Score", "Stock", "Confirm", "Tier", "Would SMS", "Block Reason"], scenario_rows)}
-
-## Window Option Decisions
-{markdown_table(["Time", "Symbol", "Feed", "Option Score", "Stock Valid", "Option Tradable", "Dashboard", "Final SMS", "Block Reason"], option_rows)}
+{legacy_stock_sections}
 
 ## Included Files
 - `logs/alerts.jsonl`
@@ -711,7 +753,30 @@ def export_review_package(
         review_state = json.loads(review_state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         review_state = {}
-    (analytics_out / "oi_coverage_waterfall.json").write_text(json.dumps({"source_session_date": review_state.get("oi_source_day"), "coverage_waterfall": review_state.get("oi_waterfall") or {}, "coverage_history": review_state.get("oi_coverage_history") or [], "plateau_detected": review_state.get("oi_plateau_detected")}, indent=2, sort_keys=True), encoding="utf-8")
+    review_source_day = str(review_state.get("oi_source_day") or "")
+    if review_source_day and review_source_day != day_text:
+        oi_waterfall_export = {
+            "source_session_date": review_source_day,
+            "requested_review_date": day_text,
+            "due_status": "previous_session_carryover",
+            "due_reason": f"Stored OI waterfall belongs to {review_source_day}; it is labeled as carryover and is not counted as {day_text} coverage.",
+            "coverage_waterfall": {},
+            "carryover_coverage_waterfall": review_state.get("oi_waterfall") or {},
+            "coverage_history": [],
+            "carryover_coverage_history": review_state.get("oi_coverage_history") or [],
+            "plateau_detected": bool(review_state.get("oi_plateau_detected")),
+        }
+    else:
+        oi_waterfall_export = {
+            "source_session_date": review_source_day or day_text if whale_records.get("outcomes") else review_source_day,
+            "requested_review_date": day_text,
+            "due_status": "pending_next_day" if whale_records.get("outcomes") and not review_state.get("oi_day") else "confirmed_or_reviewed" if review_state.get("oi_day") else "not_started",
+            "due_reason": f"Next-day OI for {day_text} is due on the next trading session; same-day unresolved OI is not inferred." if whale_records.get("outcomes") and not review_state.get("oi_day") else "",
+            "coverage_waterfall": review_state.get("oi_waterfall") or {},
+            "coverage_history": review_state.get("oi_coverage_history") or [],
+            "plateau_detected": bool(review_state.get("oi_plateau_detected")),
+        }
+    (analytics_out / "oi_coverage_waterfall.json").write_text(json.dumps(oi_waterfall_export, indent=2, sort_keys=True), encoding="utf-8")
     canonical_audit = reconcile_canonical_records(alert_episodes, post_alert_performance)
     (analytics_out / "canonical_episode_audit.json").write_text(json.dumps(canonical_audit, indent=2, sort_keys=True, default=str), encoding="utf-8")
     timeline_rows = [{"canonical_episode_id": row.get("canonical_episode_id") or row.get("alert_id"), "authoritative_status": row.get("authoritative_status") or row.get("status"), "symbol": row.get("symbol"), "setup": row.get("setup_type"), "direction": row.get("direction"), "market_observation": row.get("market_observation_at") or row.get("alert_timestamp"), "detection": row.get("alert_timestamp"), "decision": row.get("decision_timestamp"), "eligibility": row.get("notification_eligible_at"), "delivery_attempt": row.get("delivery_attempted_at"), "delivery_success": row.get("delivery_succeeded_at"), "outcome_review": row.get("last_updated_at") if row.get("interval_prices") else None, "oi_confirmation": row.get("oi_confirmed_at")} for row in canonical_audit]
@@ -773,7 +838,48 @@ def export_review_package(
         directional[direction]["passed"] = directional[direction]["meaningful_monotonic"] and directional[direction]["executable_monotonic"]
     score_validation = {"rows": score_output, "directional": directional, "meaningful_monotonic": all(item["meaningful_monotonic"] for item in directional.values()) if directional else False, "executable_monotonic": all(item["executable_monotonic"] for item in directional.values()) if directional else False}
     score_validation["passed"] = score_validation["meaningful_monotonic"] and score_validation["executable_monotonic"]
+    score_validation["warning"] = "" if score_validation["passed"] else "Score rank failed: higher score buckets are not reliably better on +0.10% moves and executable option returns."
     (analytics_out / "score_rank_validation.json").write_text(json.dumps(score_validation, indent=2, sort_keys=True), encoding="utf-8")
+    requested_outcome_rows = whale_records.get("outcomes", [])
+    unique_requested_outcomes = list(latest_records_by_key(requested_outcome_rows, "alert_key", "episode_id").values())
+    (analytics_out / "outcome_row_analytics.json").write_text(json.dumps({
+        "headline_grain": "unique_episode",
+        "raw_outcome_rows": len(requested_outcome_rows),
+        "unique_episode_rows": len(unique_requested_outcomes),
+        "repeated_update_rows": max(0, len(requested_outcome_rows) - len(unique_requested_outcomes)),
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    symbol_groups: Dict[str, Dict[str, Any]] = {}
+    regime_groups: Dict[str, Dict[str, Any]] = {}
+    for row in unique_requested_outcomes:
+        option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        symbol = str(row.get("underlying_symbol") or "UNKNOWN").upper()
+        regime = str(row.get("market_regime") or "UNKNOWN").upper()
+        for groups_map, key_name in ((symbol_groups, symbol), (regime_groups, regime)):
+            bucket = groups_map.setdefault(key_name, {"key": key_name, "unique_episodes": 0, "underlying": [], "meaningful": [], "executable": []})
+            bucket["unique_episodes"] += 1
+            if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                value = float(underlying["signed_move_pct"])
+                bucket["underlying"].append(value)
+                bucket["meaningful"].append(value >= .10)
+            if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                bucket["executable"].append(float(option["estimated_executable_return_pct"]))
+    symbol_output = []
+    for symbol, group in symbol_groups.items():
+        executable = group["executable"]
+        positive_rate = sum(value > 0 for value in executable) / len(executable) if executable else None
+        mean_return = round(sum(executable) / len(executable), 4) if executable else None
+        status = "collecting"
+        if len(executable) >= 4:
+            status = "allow_watch" if positive_rate is not None and positive_rate >= .50 and (mean_return or 0) >= 0 else "penalty_watch"
+        symbol_output.append({"symbol": symbol, "unique_episodes": group["unique_episodes"], "underlying_15m_samples": len(group["underlying"]), "meaningful_0_10_rate": round(sum(group["meaningful"]) / len(group["meaningful"]), 4) if group["meaningful"] else None, "executable_samples": len(executable), "executable_positive_rate": round(positive_rate, 4) if positive_rate is not None else None, "mean_executable_return_pct": mean_return, "status": status})
+    (analytics_out / "symbol_allow_penalty.json").write_text(json.dumps(sorted(symbol_output, key=lambda row: (row["status"] != "penalty_watch", -(row["executable_samples"] or 0), row["symbol"])), indent=2, sort_keys=True), encoding="utf-8")
+    regime_output = []
+    for regime, group in regime_groups.items():
+        executable = group["executable"]
+        regime_output.append({"regime": regime, "unique_episodes": group["unique_episodes"], "meaningful_0_10_rate": round(sum(group["meaningful"]) / len(group["meaningful"]), 4) if group["meaningful"] else None, "executable_samples": len(executable), "executable_positive_rate": round(sum(value > 0 for value in executable) / len(executable), 4) if executable else None, "mean_executable_return_pct": round(sum(executable) / len(executable), 4) if executable else None, "dashboard_only": regime in {"CHOPPY", "RANGE_BOUND"}})
+    (analytics_out / "regime_performance.json").write_text(json.dumps(sorted(regime_output, key=lambda row: row["regime"]), indent=2, sort_keys=True), encoding="utf-8")
+    (analytics_out / "noise_ratio.json").write_text(json.dumps({"dashboard_episodes": len(whale_records.get("episodes", [])), "unique_dashboard_episodes": len({str(row.get("episode_id") or row.get("flow_episode_id") or "") for row in whale_records.get("episodes", []) if row.get("episode_id") or row.get("flow_episode_id")}), "actionable_or_tier1": len([row for row in whale_records.get("alerts", []) if row.get("should_notify") or row.get("alert_tier") == "Tier 1"]), "headline_grain": "unique_episode"}, indent=2, sort_keys=True), encoding="utf-8")
 
     write_jsonl(logs_out / "alerts.jsonl", alerts)
     write_jsonl(logs_out / "scenario_engine.jsonl", scenarios)

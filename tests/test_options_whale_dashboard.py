@@ -106,6 +106,11 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Tier-1 paired outcomes", html)
         self.assertIn("Regime UNKNOWN alarm", html)
         self.assertIn("Noise ratio", html)
+        self.assertIn("Score rank warning", html)
+        self.assertIn("Outcome grain", html)
+        self.assertIn("Penalty symbols", html)
+        self.assertIn("Budget pressure", html)
+        self.assertIn("OI due status", html)
 
     def test_whale_dashboard_uses_light_theme(self):
         html = scanner_dashboard.WHALE_INDEX_HTML

@@ -22,6 +22,7 @@ from scanner.options_whale_scanner import (
     build_premium_pressure_fields,
     build_premium_timing_fields,
     build_whale_print_key,
+    dashboard_episode_noise_reasons,
     dedupe_whale_prints,
     format_whale_alert,
     result_alert_tier,
@@ -97,7 +98,7 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.write_universe(Path(tmp), [{"underlying_symbol": "AAPL", "contract_count": 10}])
             scanner = OptionsWhaleScanner({
-                "options_whale_scanner": {"enabled": True, "max_contracts_per_scan": 10, "min_score": 60, "min_premium": 100000, "min_volume": 500, "min_volume_oi_ratio": 2.0},
+                "options_whale_scanner": {"enabled": True, "max_contracts_per_scan": 10, "min_score": 60, "min_premium": 100000, "min_volume": 500, "min_volume_oi_ratio": 2.0, "episode_noise_min_score": 60, "episode_noise_require_aligned_regime": False, "episode_noise_min_price_confirmation_score": 0},
                 "market_data": {"stock_feed": "sip"},
                 "options": {"feed": "opra"},
             }, FakeWhaleClient(), OptionsWhaleStorage(Path(tmp)), root=Path(tmp))
@@ -595,6 +596,20 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         self.assertEqual(tier, "Tier 1")
         self.assertTrue(notify)
 
+    def test_tier1_gate_blocks_failed_score_rank_calibration(self):
+        result = {
+            "candidate": {"dte": 1, "option_type": "CALL", "estimated_premium": 500000, "spread_percent": 3, "warnings": [], "fresh_flow_label": "Fresh premium print"},
+            "whale_score": 98, "direction_confidence": "HIGH", "market_regime": "TRENDING_UP",
+            "aggression_side": "near_ask", "price_context_score": 9, "price_confirmation_score": 9,
+            "reliability_qualified": True, "reliability_meaningful_rate": 0.50,
+            "reliability_executable_positive_rate": 0.60, "reliability_dual_metric_passed": True,
+            "score_rank_validation_passed": False,
+        }
+        tier, notify, reason = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
+        self.assertEqual(tier, "Tier 2")
+        self.assertFalse(notify)
+        self.assertIn("score-rank", reason)
+
     def test_universal_tier1_gate_blocks_misaligned_bullish_flow(self):
         result = {
             "candidate": {"dte": 2, "option_type": "CALL", "estimated_premium": 500000, "spread_percent": 3, "warnings": [], "fresh_flow_label": "Fresh premium print"},
@@ -604,9 +619,30 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             "reliability_executable_positive_rate": 0.60, "reliability_dual_metric_passed": True,
         }
         tier, notify, reason = result_alert_tier(result, {"tier1_min_score": 95, "tier1_min_price_context": 8, "min_premium": 100000, "max_spread_percent": 15})
-        self.assertEqual(tier, "Tier 2")
+        self.assertEqual(tier, "Tier 3")
         self.assertFalse(notify)
-        self.assertIn("aligned", reason)
+        self.assertIn("dashboard-only", reason)
+
+    def test_dashboard_episode_noise_gate_blocks_choppy_weak_flow(self):
+        result = {
+            "candidate": {
+                "estimated_premium": 75000,
+                "volume": 300,
+                "spread_percent": 18,
+                "fresh_flow_label": "old trade print",
+                "stale_trade_print": True,
+                "warnings": ["stale quote"],
+            },
+            "whale_score": 78,
+            "market_regime": "CHOPPY",
+            "flow_bias": "BULLISH",
+            "price_confirmation_score": 3,
+            "score_rank_validation_passed": False,
+        }
+        reasons = dashboard_episode_noise_reasons(result, {})
+        self.assertIn("CHOPPY regime is dashboard-context only", reasons)
+        self.assertIn("score-rank validation failed; keep out of canonical learning", reasons)
+        self.assertIn("premium below episode registration threshold", reasons)
 
     def test_notification_state_update_requires_premium_and_quality_improvement(self):
         prior = {"candidate": {"option_symbol": "AAPL1", "option_type": "CALL", "estimated_premium": 100000, "time_detected": "2026-07-01T14:00:00Z"}, "flow_bias": "BULLISH", "whale_score": 90, "price_confirmation_score": 7, "aggression_confidence": "MEDIUM", "market_regime": "CHOPPY"}

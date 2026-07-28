@@ -979,6 +979,27 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
     outcome_health["regime_missing_alarm"] = regime_missing_alarm
     outcome_health["regime_missing_alarm_reason"] = "Options episodes are being stamped UNKNOWN; Tier logic cannot learn regime-qualified cohorts." if regime_missing_alarm else ""
     oi_progress = _read_review_job_state()
+    today_et = datetime.now(ET).date()
+    oi_source_day = str(oi_progress.get("oi_source_day") or "")
+    latest_detection_day = latest_day.isoformat() if latest_day else None
+    oi_due_status = "not_started"
+    oi_due_reason = "No options outcome session is available yet."
+    if latest_day:
+        next_due = latest_day + timedelta(days=1)
+        while next_due.weekday() >= 5:
+            next_due += timedelta(days=1)
+        if oi_progress.get("oi_day") == today_et.isoformat() and oi_source_day == latest_detection_day:
+            oi_due_status = "confirmed" if oi_progress.get("oi_coverage_rate") else "expired_unresolved"
+            oi_due_reason = "OI review state belongs to the latest detected session."
+        elif oi_source_day and oi_source_day != latest_detection_day:
+            oi_due_status = "previous_session_carryover"
+            oi_due_reason = f"Stored OI waterfall belongs to {oi_source_day}; latest detected session is {latest_detection_day}."
+        elif today_et < next_due:
+            oi_due_status = "not_due_yet"
+            oi_due_reason = f"Next-day OI for {latest_detection_day} is due on {next_due.isoformat()}."
+        else:
+            oi_due_status = "pending_next_day"
+            oi_due_reason = f"Next-day OI for {latest_detection_day} should be retried until coverage is found or the noon cutoff is reached."
     canonical_rows = read_jsonl(APP_DIR / "logs" / "alert_episodes.jsonl", limit=10000)
     canonical_latest = {str(row.get("canonical_episode_id") or row.get("alert_id") or ""): row for row in canonical_rows if row.get("canonical_episode_id") or row.get("alert_id")}
     return {
@@ -992,6 +1013,9 @@ def options_whales_data_health(filters: Optional[Dict[str, str]] = None) -> Dict
         "oi_review_progress": {
             "source_session_date": oi_progress.get("oi_source_day"),
             "source_selection": oi_progress.get("oi_source_selection") or "most_recent_prior_trading_session",
+            "latest_detection_date": latest_detection_day,
+            "due_status": oi_due_status,
+            "due_reason": oi_due_reason,
             "review_day": oi_progress.get("oi_review_day"),
             "last_attempt": oi_progress.get("oi_last_attempt"),
             "attempt_count": int(oi_progress.get("oi_attempt_count") or 0),
@@ -1247,10 +1271,17 @@ def _latest_outcome_rows() -> List[Dict[str, Any]]:
     return list(latest.values())
 
 
+def _avg(values: List[float]) -> Optional[float]:
+    return round(sum(values) / len(values), 4) if values else None
+
+
 def options_whales_quality_analytics() -> Dict[str, Any]:
+    raw_rows = [row for row in OptionsWhaleStorage(APP_DIR).latest_episode_outcomes(limit=50000) if str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
     rows = [row for row in _latest_outcome_rows() if str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
     groups: Dict[tuple[str, str], Dict[str, Any]] = {}
     score_groups: Dict[tuple[str, str], Dict[str, Any]] = {}
+    symbol_groups: Dict[str, Dict[str, Any]] = {}
+    regime_groups: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
@@ -1266,6 +1297,17 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
         score_group = score_groups.setdefault((direction, bucket), {"direction": direction, "bucket": bucket, "underlying": [], "executable": []})
         if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
         if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
+        symbol = str(row.get("underlying_symbol") or "UNKNOWN").upper()
+        regime = str(row.get("market_regime") or "UNKNOWN").upper()
+        for collection, key in ((symbol_groups, symbol), (regime_groups, regime)):
+            bucket_row = collection.setdefault(key, {"key": key, "episodes": 0, "underlying": [], "meaningful_0_10": [], "executable": []})
+            bucket_row["episodes"] += 1
+            if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                signed = float(underlying["signed_move_pct"])
+                bucket_row["underlying"].append(signed)
+                bucket_row["meaningful_0_10"].append(signed >= 0.10)
+            if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                bucket_row["executable"].append(float(option["estimated_executable_return_pct"]))
     calibration = []
     for group in groups.values():
         calibration.append({"direction": group["direction"], "dte_bucket": group["dte_bucket"], "sample_count": group["samples"], **{f"mean_{name}_pct": round(sum(values) / len(values), 4) if values else None for name, values in ((key, group[key]) for key in ("midpoint", "spread", "slippage", "iv", "decay", "residual", "executable"))}, "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None})
@@ -1292,7 +1334,52 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
     actionable = sum(1 for item in latest_scan.get("results") or [] if item.get("should_notify") or item.get("alert_tier") == "Tier 1")
     dashboard_episodes = int(latest_scan.get("results_count") or len(latest_scan.get("results") or []))
     noise_ratio = dashboard_episodes / max(1, actionable)
-    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": {"rows": score_rows, "directional": directional, "meaningful_monotonic": all(item["meaningful_monotonic"] for item in directional.values()) if directional else False, "executable_monotonic": all(item["executable_monotonic"] for item in directional.values()) if directional else False, "passed": all(item["passed"] for item in directional.values()) if directional else False, "positive_score_bonus_allowed": all(item["passed"] for item in directional.values()) if directional else False}, "contract_budget_waterfall": latest_scan.get("contract_budget_waterfall") or {}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
+    def symbol_output() -> List[Dict[str, Any]]:
+        output = []
+        for symbol, group in symbol_groups.items():
+            executable = group["executable"]
+            positive_rate = sum(value > 0 for value in executable) / len(executable) if executable else None
+            status = "collecting"
+            if len(executable) >= 4 and positive_rate is not None:
+                status = "allow_watch" if positive_rate >= 0.50 and (_avg(executable) or 0) >= 0 else "penalty_watch"
+            output.append({
+                "symbol": symbol,
+                "unique_episodes": group["episodes"],
+                "underlying_15m_samples": len(group["underlying"]),
+                "meaningful_0_10_rate": round(sum(group["meaningful_0_10"]) / len(group["meaningful_0_10"]), 4) if group["meaningful_0_10"] else None,
+                "executable_samples": len(executable),
+                "executable_positive_rate": round(positive_rate, 4) if positive_rate is not None else None,
+                "mean_executable_return_pct": _avg(executable),
+                "status": status,
+            })
+        return sorted(output, key=lambda row: (row["status"] != "penalty_watch", -(row["executable_samples"] or 0), row["symbol"]))
+    def regime_output() -> List[Dict[str, Any]]:
+        output = []
+        for regime, group in regime_groups.items():
+            executable = group["executable"]
+            output.append({
+                "regime": regime,
+                "unique_episodes": group["episodes"],
+                "meaningful_0_10_rate": round(sum(group["meaningful_0_10"]) / len(group["meaningful_0_10"]), 4) if group["meaningful_0_10"] else None,
+                "executable_samples": len(executable),
+                "executable_positive_rate": round(sum(value > 0 for value in executable) / len(executable), 4) if executable else None,
+                "mean_executable_return_pct": _avg(executable),
+                "dashboard_only": regime in {"CHOPPY", "RANGE_BOUND"},
+            })
+        return sorted(output, key=lambda row: row["regime"])
+    score_validation = {"rows": score_rows, "directional": directional, "meaningful_monotonic": all(item["meaningful_monotonic"] for item in directional.values()) if directional else False, "executable_monotonic": all(item["executable_monotonic"] for item in directional.values()) if directional else False, "passed": all(item["passed"] for item in directional.values()) if directional else False, "positive_score_bonus_allowed": all(item["passed"] for item in directional.values()) if directional else False}
+    score_validation["warning"] = "" if score_validation["passed"] else "Score rank failed: higher score buckets are not reliably better on +0.10% moves and executable option returns."
+    waterfall = latest_scan.get("contract_budget_waterfall") or {}
+    scan_budget_pressure = {
+        "duration_p95_seconds": latest_scan.get("scan_budget_pressure_duration_p95_seconds"),
+        "pressure_duration_seconds": latest_scan.get("scan_budget_pressure_duration_seconds"),
+        "effective_contract_cap": latest_scan.get("effective_contract_cap"),
+        "configured_contract_cap": latest_scan.get("configured_contract_cap"),
+        "stale_symbol_count": len(latest_scan.get("coverage_stale_symbols") or []),
+        "throttle_state": latest_scan.get("scan_budget_pressure_throttle_state") or "unknown",
+        "waterfall": waterfall,
+    }
+    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": score_validation, "contract_budget_waterfall": waterfall, "scan_budget_pressure": scan_budget_pressure, "symbol_allow_penalty": symbol_output(), "regime_performance": regime_output(), "outcome_row_analytics": {"raw_outcome_rows": len(raw_rows), "unique_episode_rows": len(rows), "repeated_update_rows": max(0, len(raw_rows) - len(rows)), "headline_grain": "unique_episode"}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "unique_dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
 
 
 def canonical_episode_audit() -> Dict[str, Any]:
@@ -4933,13 +5020,19 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Regime UNKNOWN alarm', dataHealth.market_regime_missing_alarm?.warning ? `${dataHealth.market_regime_missing_alarm.unknown_count} / ${dataHealth.market_regime_missing_alarm.total_episodes}` : 'OK', dataHealth.market_regime_missing_alarm?.warning ? 'warn' : 'good'),
         card('OI confirmation coverage', dataHealth.oi_review_progress?.coverage_rate !== null && dataHealth.oi_review_progress?.coverage_rate !== undefined ? `${Math.round(dataHealth.oi_review_progress.coverage_rate * 100)}%` : 'Not started', dataHealth.oi_review_progress?.complete ? 'good' : 'warn'),
         card('OI retry attempts', dataHealth.oi_review_progress?.attempt_count ?? 0),
+        card('OI due status', dataHealth.oi_review_progress?.due_status ?? 'unknown', dataHealth.oi_review_progress?.due_status === 'confirmed' || dataHealth.oi_review_progress?.due_status === 'not_due_yet' ? 'good' : 'warn'),
         card('OI unresolved', dataHealth.oi_review_progress?.unresolved_count ?? 0, (dataHealth.oi_review_progress?.unresolved_count ?? 0) ? 'warn' : 'good'),
         card('OI plateau', dataHealth.oi_review_progress?.plateau_detected ? `Yes — ${dataHealth.oi_review_progress.current_retry_interval_seconds ?? 0}s backoff` : 'No', dataHealth.oi_review_progress?.plateau_detected ? 'warn' : 'good'),
         card('Scan duration p95', dataHealth.scan_loop_health?.duration_p95_seconds !== null && dataHealth.scan_loop_health?.duration_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.duration_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
         card('Scan cadence p95', dataHealth.scan_loop_health?.cadence_p95_seconds !== null && dataHealth.scan_loop_health?.cadence_p95_seconds !== undefined ? `${dataHealth.scan_loop_health.cadence_p95_seconds}s` : 'No data', dataHealth.scan_loop_health?.warning ? 'warn' : 'good'),
         card('Promotion-ready cohorts', (reliability.promotion_queue || []).filter(row => row.status === 'promotion_ready').length),
         card('Score rank validation', qualityAnalytics.score_rank_validation?.passed ? 'Passed' : 'Blocked', qualityAnalytics.score_rank_validation?.passed ? 'good' : 'warn'),
+        card('Score rank warning', qualityAnalytics.score_rank_validation?.warning ? 'Failed' : 'OK', qualityAnalytics.score_rank_validation?.warning ? 'warn' : 'good'),
         card('Noise ratio', `${qualityAnalytics.noise_ratio?.dashboard_episodes ?? 0} : ${qualityAnalytics.noise_ratio?.actionable_or_tier1 ?? 0}`, (qualityAnalytics.noise_ratio?.ratio ?? 0) > 10 ? 'warn' : 'good'),
+        card('Outcome grain', `${qualityAnalytics.outcome_row_analytics?.unique_episode_rows ?? 0} unique / ${qualityAnalytics.outcome_row_analytics?.raw_outcome_rows ?? 0} rows`, (qualityAnalytics.outcome_row_analytics?.repeated_update_rows ?? 0) ? 'warn' : 'good'),
+        card('Penalty symbols', (qualityAnalytics.symbol_allow_penalty || []).filter(row => row.status === 'penalty_watch').length, (qualityAnalytics.symbol_allow_penalty || []).some(row => row.status === 'penalty_watch') ? 'warn' : 'good'),
+        card('CHOP/RANGE weak', (qualityAnalytics.regime_performance || []).filter(row => row.dashboard_only && ((row.meaningful_0_10_rate ?? 1) < 0.3 || (row.executable_positive_rate ?? 1) < 0.5)).length, 'warn'),
+        card('Budget pressure', `${qualityAnalytics.scan_budget_pressure?.throttle_state ?? 'unknown'} | cap ${qualityAnalytics.scan_budget_pressure?.effective_contract_cap ?? '—'}`, qualityAnalytics.scan_budget_pressure?.throttle_state === 'normal' ? 'good' : 'warn'),
         card('Contract budget', `${qualityAnalytics.contract_budget_waterfall?.contracts_evaluated ?? 0} / ${qualityAnalytics.contract_budget_waterfall?.selected_contracts ?? 0} evaluated`),
         card('Canonical complete', `${canonicalAudit.complete_count ?? 0} / ${canonicalAudit.episode_count ?? 0}`),
         card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),
@@ -4948,7 +5041,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.canonicalAuditRows.innerHTML = (canonicalAudit.rows || []).slice(0, 20).map(row => `<tr><td>${formatMarketTime(row.alert_timestamp)}</td><td>${esc(row.symbol)}</td><td>${esc(row.setup)}</td><td>${esc(row.direction)}</td><td>${esc(row.authoritative_status)}</td><td>${esc(row.decision || '—')}</td><td>${row.delivery_eligible ? 'Yes' : 'No'}</td><td>${row.delivery_attempted ? 'Yes' : 'No'}</td><td>${row.delivery_succeeded ? 'Yes' : 'No'}</td><td>${row.useful_alert === null || row.useful_alert === undefined ? '—' : row.useful_alert ? 'Yes' : 'No'}</td><td>${row.block_next_time === null || row.block_next_time === undefined ? '—' : row.block_next_time ? 'Yes' : 'No'}</td></tr>`).join('') || '<tr><td colspan="11" class="muted">No canonical alert episodes yet.</td></tr>';
       const outcomeHealthWarning = dataHealth.option_outcome_health?.warning ? `Option outcome telemetry warning: ${dataHealth.option_outcome_health.option_bars_unavailable_count} unavailable bars; ${dataHealth.option_outcome_health.endpoint_error_count} endpoint errors.` : '';
       const regimeHealthWarning = dataHealth.market_regime_missing_alarm?.warning ? dataHealth.market_regime_missing_alarm.reason : '';
-      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning, regimeHealthWarning].filter(Boolean);
+      const scoreRankWarning = qualityAnalytics.score_rank_validation?.warning || '';
+      const warnings = [status.data_plan_warning, status.last_error, status.last_scan_error, status.scan_session_warning, latest.stale_warning, latest.message, coverage.coverage_warning, outcomeHealthWarning, regimeHealthWarning, scoreRankWarning].filter(Boolean);
       els.warnings.innerHTML = warnings.map((w) => `<div class="notice warn">${esc(w)}</div>`).join('');
       els.pollStatus.textContent = `Auto scan: ${auto} | Current scan: ${current}`;
     }

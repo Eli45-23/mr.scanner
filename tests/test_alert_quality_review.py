@@ -100,7 +100,11 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     write_jsonl(logs / "options_whale_scans.jsonl", [record(coverage_warning="AAPL coverage is stale")])
     write_jsonl(logs / "options_whale_episodes.jsonl", [record(episode_id="ep-1")])
     write_jsonl(logs / "options_oi_reviews.jsonl", [record(episode_id="ep-1", status="confirmed_opening", original_time=f"{DAY}T10:00:00-04:00"), record(episode_id="wrong-oi", original_time="2026-06-11T10:00:00-04:00")])
-    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [record(episode_id="ep-1", detected_at=f"{DAY}T10:00:00-04:00"), record(episode_id="wrong-outcome", detected_at="2026-06-11T10:00:00-04:00")])
+    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [
+        record(alert_key="ep-1", episode_id="ep-1", detected_at=f"{DAY}T10:00:00-04:00", reviewed_at=f"{DAY}T10:05:00-04:00"),
+        record(alert_key="ep-1", episode_id="ep-1", detected_at=f"{DAY}T10:00:00-04:00", reviewed_at=f"{DAY}T10:15:00-04:00"),
+        record(episode_id="wrong-outcome", detected_at="2026-06-11T10:00:00-04:00"),
+    ])
     result = export_review_package(
         day_text=DAY,
         start_text="09:30",
@@ -118,6 +122,40 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     assert (package / "logs" / "options_whale_episodes.jsonl").exists()
     assert (package / "logs" / "options_oi_reviews.jsonl").exists()
     assert (package / "data" / "options_whale_episode_outcomes.jsonl").exists()
+    assert (package / "analytics" / "outcome_row_analytics.json").exists()
+    assert (package / "analytics" / "symbol_allow_penalty.json").exists()
+    assert (package / "analytics" / "regime_performance.json").exists()
+    assert (package / "analytics" / "noise_ratio.json").exists()
     assert "wrong-oi" not in (package / "logs" / "options_oi_reviews.jsonl").read_text()
     assert "wrong-outcome" not in (package / "data" / "options_whale_episode_outcomes.jsonl").read_text()
     assert "Scan passes with coverage warnings: 1" in result["summary"].read_text()
+    assert "Episode outcomes: 1 unique episodes / 2 rows" in result["summary"].read_text()
+    assert json.loads((package / "analytics" / "outcome_row_analytics.json").read_text())["repeated_update_rows"] == 1
+
+
+def test_review_package_labels_old_oi_waterfall_as_carryover(tmp_path: Path):
+    logs = tmp_path / "logs"
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+    (snapshots / "dashboard_snapshot_latest.md").write_text("# snapshot")
+    (snapshots / "dashboard_snapshot_latest.json").write_text("{}")
+    config = tmp_path / "config.example.json"
+    config.write_text("{}")
+    write_jsonl(logs / "options_whale_scans.jsonl", [record()])
+    write_jsonl(tmp_path / "data" / "options_whale_episode_outcomes.jsonl", [record(alert_key="ep-1", episode_id="ep-1", detected_at=f"{DAY}T10:00:00-04:00", reviewed_at=f"{DAY}T10:15:00-04:00")])
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "options_review_jobs.json").write_text(json.dumps({"oi_source_day": "2026-06-10", "oi_waterfall": {"unresolved": 5}, "oi_coverage_history": [{"coverage_rate": 0.0}]}))
+    result = export_review_package(
+        day_text=DAY,
+        start_text="09:30",
+        end_text="16:00",
+        output_dir=tmp_path / "exports",
+        log_dir=logs,
+        snapshot_dir=snapshots,
+        config_example=config,
+    )
+    waterfall = json.loads((result["package_dir"] / "analytics" / "oi_coverage_waterfall.json").read_text())
+    assert waterfall["due_status"] == "previous_session_carryover"
+    assert waterfall["coverage_waterfall"] == {}
+    assert waterfall["carryover_coverage_waterfall"]["unresolved"] == 5
