@@ -126,10 +126,17 @@ def test_review_package_includes_alert_quality_review(tmp_path: Path):
     assert (package / "analytics" / "symbol_allow_penalty.json").exists()
     assert (package / "analytics" / "regime_performance.json").exists()
     assert (package / "analytics" / "noise_ratio.json").exists()
+    assert (package / "analytics" / "underlying_vs_option_profitability.json").exists()
+    assert (package / "analytics" / "stale_symbol_recovery.json").exists()
     assert "wrong-oi" not in (package / "logs" / "options_oi_reviews.jsonl").read_text()
     assert "wrong-outcome" not in (package / "data" / "options_whale_episode_outcomes.jsonl").read_text()
     assert "Scan passes with coverage warnings: 1" in result["summary"].read_text()
     assert "Episode outcomes: 1 unique episodes / 2 rows" in result["summary"].read_text()
+    summary_text = result["summary"].read_text()
+    assert "Options Whale Session Health" in summary_text
+    assert "AAPL main focus" not in summary_text
+    assert "Did the bot catch AAPL setups earlier?" not in summary_text
+    assert "Phone Conclusions" not in summary_text
     assert json.loads((package / "analytics" / "outcome_row_analytics.json").read_text())["repeated_update_rows"] == 1
 
 

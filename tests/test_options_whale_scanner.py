@@ -207,6 +207,43 @@ class OptionsWhaleScannerTests(unittest.TestCase):
             self.assertEqual(result["effective_contract_cap"], 250)
             self.assertEqual(result["contract_budget_waterfall"]["contracts_evaluated"], result["contracts_evaluated"])
 
+    def test_coverage_pressure_cuts_budget_and_recovers_stale_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_universe(root, [{"underlying_symbol": symbol, "contract_count": 100} for symbol in ("AAPL", "AAA", "BBB", "CCC", "DDD")])
+            now = datetime.now(timezone.utc)
+            state_path = root / "data" / "options_whale_scan_state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps({
+                "last_scan_duration_seconds": 20,
+                "last_contracts_scanned": 1000,
+                "last_scanned_at": {"AAA": now.isoformat(), "BBB": (now - timedelta(minutes=20)).isoformat(), "CCC": now.isoformat(), "DDD": now.isoformat()},
+                "last_updated": now.isoformat(),
+                "contract_cursors": {},
+            }), encoding="utf-8")
+            telemetry_path = root / "state" / "options_scan_loop_telemetry.json"
+            telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            telemetry_path.write_text(json.dumps([{"duration_seconds": 100.0} for _ in range(20)]), encoding="utf-8")
+            scanner = OptionsWhaleScanner({
+                "options_whale_scanner": {
+                    "enabled": True,
+                    "always_scan_symbols": ["AAPL"],
+                    "priority_seed_symbols": ["AAA", "BBB", "CCC", "DDD"],
+                    "max_contracts_per_scan": 1000,
+                    "scan_deadline_seconds": 25,
+                    "deadline_min_contracts_per_scan": 10,
+                    "coverage_warning_age_seconds": 300,
+                    "min_score": 99,
+                    "min_premium": 999999999,
+                }
+            }, FakeWhaleClient(), OptionsWhaleStorage(root), root=root)
+            result = scanner.scan()
+            self.assertTrue(result["coverage_pressure_mode"])
+            self.assertEqual(result["scan_budget_pressure_throttle_state"], "coverage_pressure_recovery")
+            self.assertLess(result["effective_contract_cap"], 250)
+            self.assertEqual(result["coverage_rotation_page"][0], "BBB")
+            self.assertIn("BBB", result["coverage_stale_symbols_prioritized"])
+
     def test_market_regime_falls_back_to_spy_qqq_bars(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

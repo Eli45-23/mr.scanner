@@ -89,11 +89,21 @@ def default_options_whale_config() -> Dict[str, Any]:
         "scan_deadline_seconds": 25,
         "deadline_contract_safety_factor": 0.90,
         "cadence_overrun_contract_safety_factor": 0.60,
-        "cadence_p95_contract_safety_factor": 0.45,
+        "cadence_p95_contract_safety_factor": 0.30,
+        "cadence_severe_overrun_multiplier": 2.0,
+        "cadence_severe_overrun_contract_safety_factor": 0.25,
         "cadence_p95_window": 20,
         "deadline_min_contracts_per_scan": 500,
         "scan_cadence_target_seconds": 30,
         "scan_cadence_overrun_multiplier": 1.50,
+        "coverage_pressure_mode_enabled": True,
+        "coverage_pressure_core_budget_fraction": 0.35,
+        "coverage_pressure_max_rotation_symbols": 8,
+        "coverage_pressure_min_stale_symbols": 5,
+        "coverage_pressure_productive_symbol_limit": 10,
+        "coverage_pressure_productive_min_samples": 4,
+        "coverage_pressure_productive_min_rate": 0.50,
+        "coverage_pressure_productive_min_mean_return": 0.0,
         "profitable_symbol_priority_enabled": True,
         "profitable_symbol_priority_min_samples": 30,
         "profitable_symbol_priority_min_executable_rate": 0.50,
@@ -109,6 +119,7 @@ def default_options_whale_config() -> Dict[str, Any]:
         "range_choppy_dashboard_penalty": 10,
         "minimum_executable_edge_rate": 0.45,
         "minimum_executable_edge_samples": 20,
+        "minimum_executable_edge_mean_return_pct": 0.0,
         "minimum_executable_edge_penalty": 5,
         "episode_noise_min_score": 80,
         "episode_noise_min_premium": 100000,
@@ -676,12 +687,14 @@ def build_executable_edge_memory(
     strong_rate: float = 0.45,
     weak_rate: float = 0.30,
     half_life_sessions: float = 2.0,
-) -> Dict[tuple[str, str], Dict[str, Any]]:
-    buckets: Dict[tuple[str, str], Dict[str, Any]] = {}
+    min_mean_return_pct: float = 0.0,
+) -> Dict[tuple[str, str, str], Dict[str, Any]]:
+    buckets: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     latest_date = max(((_parse_iso_time(row.get("detected_at") or row.get("reviewed_at")) or datetime.min.replace(tzinfo=timezone.utc)).date() for row in outcomes), default=datetime.now(timezone.utc).date())
     for row in latest_outcomes_by_key(outcomes).values():
         symbol = str(row.get("underlying_symbol") or "").upper()
         bias = str(row.get("flow_bias") or "UNKNOWN").upper()
+        dte_bucket = str(row.get("dte_bucket") or _reliability_dte_bucket(row.get("dte"))).upper()
         if not symbol or bias == "UNKNOWN":
             continue
         option_window = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == int(window_minutes) and isinstance(item.get("estimated_executable_return_pct"), (int, float))), None)
@@ -690,7 +703,7 @@ def build_executable_edge_memory(
         stamp = _parse_iso_time(row.get("detected_at") or row.get("reviewed_at"))
         age_days = max(0, (latest_date - stamp.date()).days) if stamp else 0
         weight = 0.5 ** (age_days / max(0.1, float(half_life_sessions)))
-        bucket = buckets.setdefault((symbol, bias), {"samples": 0, "positive": 0, "weighted_samples": 0.0, "weighted_positive": 0.0, "returns": []})
+        bucket = buckets.setdefault((symbol, bias, dte_bucket), {"samples": 0, "positive": 0, "weighted_samples": 0.0, "weighted_positive": 0.0, "returns": []})
         value = float(option_window["estimated_executable_return_pct"])
         bucket["samples"] += 1
         bucket["weighted_samples"] += weight
@@ -698,7 +711,7 @@ def build_executable_edge_memory(
         if value > 0:
             bucket["positive"] += 1
             bucket["weighted_positive"] += weight
-    memory: Dict[tuple[str, str], Dict[str, Any]] = {}
+    memory: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     for key, bucket in buckets.items():
         samples = int(bucket["samples"])
         rate = bucket["weighted_positive"] / bucket["weighted_samples"] if bucket["weighted_samples"] else 0.0
@@ -706,38 +719,54 @@ def build_executable_edge_memory(
         mean_return = sum(returns) / len(returns) if returns else None
         if samples < int(min_samples):
             label = "collecting_executable_edge"
-        elif rate >= float(strong_rate) and (mean_return or 0) >= 0:
+        elif rate >= float(strong_rate) and (mean_return or 0) >= float(min_mean_return_pct):
             label = "promote_symbol_bias"
-        elif rate <= float(weak_rate) or (mean_return is not None and mean_return < 0):
+        elif rate <= float(weak_rate) or (mean_return is not None and mean_return < float(min_mean_return_pct)):
             label = "penalize_symbol_bias"
         else:
             label = "neutral_symbol_bias"
-        memory[key] = {
+        payload = {
             "executable_edge_label": label,
             "executable_edge_window": int(window_minutes),
             "executable_edge_samples": samples,
             "executable_edge_positive_rate": round(rate, 4),
             "executable_edge_mean_return_pct": round(mean_return, 4) if mean_return is not None else None,
             "executable_edge_effective_samples": round(bucket["weighted_samples"], 2),
+            "executable_edge_dte_bucket": key[2],
         }
+        memory[key] = payload
+        legacy_key = (key[0], key[1])
+        current_legacy = memory.get(legacy_key)
+        if not current_legacy or int(payload.get("executable_edge_samples") or 0) > int(current_legacy.get("executable_edge_samples") or 0):
+            memory[legacy_key] = dict(payload)
     return memory
 
 
-def apply_executable_edge_memory(result: Dict[str, Any], memory: Dict[tuple[str, str], Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+def apply_executable_edge_memory(result: Dict[str, Any], memory: Dict[tuple, Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     candidate = result.get("candidate") or {}
-    key = (str(candidate.get("underlying_symbol") or "").upper(), infer_direction_bias_label(result))
-    learned = memory.get(key)
+    symbol = str(candidate.get("underlying_symbol") or "").upper()
+    bias = infer_direction_bias_label(result)
+    dte_bucket = str(candidate.get("dte_bucket") or _reliability_dte_bucket(candidate.get("dte"))).upper()
+    key = (symbol, bias, dte_bucket)
+    learned = memory.get(key) or memory.get((symbol, bias))
     if not learned:
-        result.update({"executable_edge_label": "no_executable_history", "executable_edge_score_adjustment": 0})
+        result.update({"executable_edge_label": "no_executable_history", "executable_edge_score_adjustment": 0, "executable_edge_dte_bucket": dte_bucket})
         return result
     result.update(learned)
     label = str(learned.get("executable_edge_label") or "")
     adjustment = 0
+    min_mean_return = float(cfg.get("minimum_executable_edge_mean_return_pct", 0.0))
+    edge_rate = safe_float(learned.get("executable_edge_positive_rate"))
+    mean_return = learned.get("executable_edge_mean_return_pct")
+    mean_return_value = safe_float(mean_return) if mean_return is not None else None
     if label == "promote_symbol_bias":
         adjustment = int(cfg.get("profitable_symbol_priority_bonus", 4))
     elif label == "penalize_symbol_bias":
         adjustment = -int(cfg.get("profitable_symbol_penalty", 6))
-    elif int(learned.get("executable_edge_samples") or 0) >= int(cfg.get("minimum_executable_edge_samples", 20)) and safe_float(learned.get("executable_edge_positive_rate")) < float(cfg.get("minimum_executable_edge_rate", 0.45)):
+    elif int(learned.get("executable_edge_samples") or 0) >= int(cfg.get("minimum_executable_edge_samples", 20)) and (
+        edge_rate < float(cfg.get("minimum_executable_edge_rate", 0.45))
+        or (mean_return_value is not None and mean_return_value < min_mean_return)
+    ):
         adjustment = -int(cfg.get("minimum_executable_edge_penalty", 5))
         label = "minimum_executable_edge_failed"
         result["executable_edge_label"] = label
@@ -748,9 +777,21 @@ def apply_executable_edge_memory(result: Dict[str, Any], memory: Dict[tuple[str,
         result["noise_adjusted_score"] = result["whale_score"]
         result["classification"] = classify_score(result["whale_score"])
     result["executable_edge_score_adjustment"] = adjustment
+    result["net_executable_edge_warning"] = ""
+    if int(learned.get("executable_edge_samples") or 0) >= int(cfg.get("minimum_executable_edge_samples", 20)) and (
+        edge_rate < float(cfg.get("minimum_executable_edge_rate", 0.45))
+        or (mean_return_value is not None and mean_return_value < min_mean_return)
+    ):
+        mean_text = f"{mean_return_value:.2f}%" if mean_return_value is not None else "unavailable"
+        result["net_executable_edge_warning"] = (
+            f"{symbol} {bias.lower()} {dte_bucket} executable edge is below dashboard-rank minimum "
+            f"({edge_rate:.0%} positive, mean {mean_text}"
+        )
+        result["net_executable_edge_warning"] += f" over {learned.get('executable_edge_samples')} samples)."
     result["executable_edge_reason"] = (
-        f"{key[0]} {key[1].lower()} {learned.get('executable_edge_window')}m executable option win rate "
-        f"{safe_float(learned.get('executable_edge_positive_rate')):.0%} over {learned.get('executable_edge_samples')} samples."
+        f"{symbol} {bias.lower()} {dte_bucket} {learned.get('executable_edge_window')}m executable option win rate "
+        f"{edge_rate:.0%} over {learned.get('executable_edge_samples')} samples; mean return "
+        f"{mean_return_value if mean_return_value is not None else 'unavailable'}%."
     )
     return result
 
@@ -1070,8 +1111,8 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if bias == "BEARISH" and not result.get("bearish_oversight_passed", True):
         result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + list(result.get("bearish_oversight_reasons") or [])))})
         return "Tier 3", False, "Bearish flow requires stronger confirmation before high-rank dashboard promotion."
-    if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"}:
-        return "Tier 3", False, "Recent executable option-return edge is weak; dashboard-only watch until performance improves."
+    if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"} or result.get("net_executable_edge_warning"):
+        return "Tier 3", False, "Recent net executable option-return edge is weak; dashboard-only watch until performance improves."
     if score >= int(cfg.get("tier1_min_score", 95)) and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= int(cfg.get("tier1_min_price_context", 8)):
         if cohort_reasons:
             result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": cohort_reasons})
@@ -1125,6 +1166,8 @@ def dashboard_episode_noise_reasons(result: Dict[str, Any], cfg: Dict[str, Any])
         reasons.extend(result.get("bearish_oversight_reasons") or ["bearish oversight did not pass"])
     if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"}:
         reasons.append("recent executable option edge is too weak for episode registration")
+    if result.get("net_executable_edge_warning"):
+        reasons.append("net executable option edge is below dashboard-rank minimum")
     if result.get("score_rank_validation_passed") is False:
         reasons.append("score-rank validation failed; keep out of canonical learning")
     return list(dict.fromkeys(reasons))
@@ -1337,6 +1380,49 @@ class OptionsWhaleScanner:
                 out.append(symbol)
         return out
 
+    def _recent_productive_symbols(self) -> List[str]:
+        if not bool(self.whale.get("coverage_pressure_mode_enabled", True)):
+            return []
+        outcomes = self.storage.latest_episode_outcomes(limit=5000) or self.storage.latest_outcomes(limit=5000)
+        if not outcomes:
+            return []
+        groups: Dict[str, Dict[str, Any]] = {}
+        for row in latest_outcomes_by_key(outcomes).values():
+            symbol = str(row.get("underlying_symbol") or "").upper()
+            if not symbol or str(row.get("classification") or "").upper() == "MIXED SIGNAL":
+                continue
+            option = next(
+                (
+                    item for item in row.get("option_windows") or []
+                    if int(item.get("minutes") or 0) == int(self.whale.get("symbol_bias_memory_window_minutes", 15))
+                    and isinstance(item.get("estimated_executable_return_pct"), (int, float))
+                ),
+                None,
+            )
+            if not option:
+                continue
+            bucket = groups.setdefault(symbol, {"samples": 0, "positive": 0, "returns": []})
+            value = float(option["estimated_executable_return_pct"])
+            bucket["samples"] += 1
+            bucket["returns"].append(value)
+            if value > 0:
+                bucket["positive"] += 1
+        min_samples = int(self.whale.get("coverage_pressure_productive_min_samples", 4))
+        min_rate = float(self.whale.get("coverage_pressure_productive_min_rate", 0.50))
+        min_mean = float(self.whale.get("coverage_pressure_productive_min_mean_return", 0.0))
+        ranked: List[tuple[float, float, int, str]] = []
+        for symbol, bucket in groups.items():
+            samples = int(bucket["samples"])
+            if samples < min_samples:
+                continue
+            positive_rate = bucket["positive"] / samples if samples else 0.0
+            mean_return = sum(bucket["returns"]) / samples if samples else 0.0
+            if positive_rate >= min_rate and mean_return >= min_mean:
+                ranked.append((positive_rate, mean_return, samples, symbol))
+        ranked.sort(reverse=True)
+        limit = max(0, int(self.whale.get("coverage_pressure_productive_symbol_limit", 10)))
+        return [symbol for _rate, _mean, _samples, symbol in ranked[:limit]]
+
     def _prioritized_underlyings(self, entries: List[Dict[str, Any]]) -> List[str]:
         by_symbol = {
             str(entry.get("underlying_symbol") or "").upper(): entry
@@ -1394,13 +1480,18 @@ class OptionsWhaleScanner:
             duration_p95 = None
         adaptive_contract_cap = configured_max_contracts
         pressure_duration = max(prior_duration, duration_p95 or 0.0)
+        cadence_target = max(1.0, float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))))
+        p95_over_target = duration_p95 is not None and duration_p95 > cadence_target
+        severe_pressure = pressure_duration > cadence_target * float(self.whale.get("cadence_severe_overrun_multiplier", 2.0))
+        coverage_pressure_mode = bool(self.whale.get("coverage_pressure_mode_enabled", True)) and (p95_over_target or severe_pressure)
         if bool(self.whale.get("deadline_aware_contract_budget", True)) and pressure_duration > budget_seconds:
             safety_factor = float(self.whale.get("deadline_contract_safety_factor", 0.90))
-            cadence_target = max(1.0, float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))))
-            if duration_p95 is not None and duration_p95 > cadence_target:
+            if p95_over_target:
                 safety_factor = min(safety_factor, float(self.whale.get("cadence_p95_contract_safety_factor", 0.45)))
             if pressure_duration > cadence_target * float(self.whale.get("scan_cadence_overrun_multiplier", 1.50)):
                 safety_factor = min(safety_factor, float(self.whale.get("cadence_overrun_contract_safety_factor", 0.60)))
+            if severe_pressure:
+                safety_factor = min(safety_factor, float(self.whale.get("cadence_severe_overrun_contract_safety_factor", 0.25)))
             adaptive_contract_cap = int(prior_contracts * budget_seconds / pressure_duration * safety_factor)
         min_contract_cap = max(1, int(self.whale.get("deadline_min_contracts_per_scan", 500)))
         max_contracts = min(configured_max_contracts, max(min_contract_cap, adaptive_contract_cap))
@@ -1430,11 +1521,17 @@ class OptionsWhaleScanner:
         cycle_ewma = prior_ewma * 0.7 + measured_cycle * 0.3
         dynamic_count = math.ceil(len(rotating) * cycle_ewma / target_age * float(self.whale.get("rotation_safety_factor", 1.15))) if rotating else 0
         rotation_count = min(len(rotating), max(1, int(self.whale.get("rotation_symbols_per_scan", 15)), dynamic_count)) if rotating else 0
+        if rotating and coverage_pressure_mode:
+            pressure_limit = max(1, int(self.whale.get("coverage_pressure_max_rotation_symbols", 8)))
+            stale_floor = min(len(pre_scan_stale_symbols), max(0, int(self.whale.get("coverage_pressure_min_stale_symbols", 5))))
+            rotation_count = min(len(rotating), max(stale_floor, min(rotation_count, pressure_limit)))
         rotation_page: List[str] = []
+        productive_symbols = [symbol for symbol in self._recent_productive_symbols() if symbol in set(rotating)]
         if rotating:
             stale_first = sorted(pre_scan_stale_symbols, key=lambda symbol: (-pre_scan_ages[symbol], symbol))
             cyclic = [rotating[(cursor + offset) % len(rotating)] for offset in range(len(rotating))]
-            for symbol in stale_first + cyclic:
+            prioritized = stale_first + (productive_symbols if coverage_pressure_mode else []) + cyclic
+            for symbol in prioritized:
                 if symbol not in rotation_page:
                     rotation_page.append(symbol)
                 if len(rotation_page) >= rotation_count:
@@ -1454,6 +1551,8 @@ class OptionsWhaleScanner:
         seen_contracts = set()
         scanned_underlyings: List[str] = []
         priority_budget = min(max_contracts, max(0, int(self.whale.get("priority_contract_budget", 3000))))
+        if coverage_pressure_mode:
+            priority_budget = min(priority_budget, max(1, int(max_contracts * float(self.whale.get("coverage_pressure_core_budget_fraction", 0.35)))))
         per_symbol_cap = max(1, int(self.whale.get("max_contracts_per_underlying", 600)))
         core_quota = min(per_symbol_cap, max(1, priority_budget // max(1, len(core)))) if core else 0
         rotating_budget = max_contracts - min(max_contracts, core_quota * len(core))
@@ -1525,6 +1624,10 @@ class OptionsWhaleScanner:
             "coverage_symbol_ages_seconds": symbol_ages,
             "coverage_stale_symbols": stale_symbols,
             "coverage_stale_symbols_prioritized": [symbol for symbol in rotation_page if symbol in pre_scan_stale_symbols],
+            "coverage_pressure_mode": coverage_pressure_mode,
+            "coverage_pressure_reason": "p95_over_target" if p95_over_target else "severe_scan_pressure" if severe_pressure else "",
+            "coverage_pressure_productive_symbols": productive_symbols,
+            "coverage_pressure_core_budget_fraction": float(self.whale.get("coverage_pressure_core_budget_fraction", 0.35)) if coverage_pressure_mode else None,
             "coverage_warning": f"{len(stale_symbols)} symbols exceed the {warning_age}s coverage target." if stale_symbols else "",
             "coverage_warning_type": "startup_warmup" if warmup_symbols else "sustained_miss" if stale_symbols else "none",
             "coverage_catalog_counts": catalog_counts,
@@ -1538,7 +1641,7 @@ class OptionsWhaleScanner:
             "prior_scan_duration_seconds": prior_duration or None,
             "scan_budget_pressure_duration_p95_seconds": round(duration_p95, 2) if duration_p95 is not None else None,
             "scan_budget_pressure_duration_seconds": round(pressure_duration, 2) if pressure_duration else None,
-            "scan_budget_pressure_throttle_state": "p95_over_target" if duration_p95 is not None and duration_p95 > float(self.whale.get("scan_cadence_target_seconds", self.whale.get("scan_interval_seconds", 30))) else "last_scan_over_deadline" if prior_duration > budget_seconds else "normal",
+            "scan_budget_pressure_throttle_state": "coverage_pressure_recovery" if coverage_pressure_mode else "last_scan_over_deadline" if prior_duration > budget_seconds else "normal",
             "deadline_reached_during_contract_selection": bool(deadline_skipped_symbols and deadline_monotonic is not None and time.monotonic() >= deadline_monotonic),
             "deadline_skipped_symbols": deadline_skipped_symbols,
             "deadline_skipped_symbol_count": len(deadline_skipped_symbols),
@@ -1815,6 +1918,7 @@ class OptionsWhaleScanner:
             strong_rate=float(effective_cfg.get("profitable_symbol_priority_min_executable_rate", 0.45)),
             weak_rate=float(effective_cfg.get("profitable_symbol_penalty_rate", 0.30)),
             half_life_sessions=float(effective_cfg.get("symbol_bias_memory_half_life_sessions", 2)),
+            min_mean_return_pct=float(effective_cfg.get("minimum_executable_edge_mean_return_pct", 0.0)),
         ) if bool(effective_cfg.get("profitable_symbol_priority_enabled", True)) else {}
         raw_candidates: List[Dict[str, Any]] = []
         evaluated: List[Dict[str, Any]] = []

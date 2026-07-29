@@ -461,9 +461,56 @@ def build_review_summary(
     )
     stock_record_count = len(alert_window) + len(scenario_window) + len(heads_up_window) + len(option_window)
     hide_legacy_stock_sections = bool(whale_scans or whale_episodes or whale_outcomes) and stock_record_count == 0
+    header_sections = (
+        f"""## Options Whale Session Health
+- Active evidence: Options Whale scanner records only
+- Legacy stock/AAPL records in window: 0
+- Requested window: {start_text} ET to {end_text} ET
+- Full redacted day logs are included where available.
+- Window-filtered JSONL files use source-specific timestamps: outcomes by `detected_at`, OI by `original_time`, and operational logs by their event timestamp.
+"""
+        if hide_legacy_stock_sections
+        else f"""## Market Data Status
+- Stock feed requested/status: {market_status.get("stock_feed_requested", "unavailable")} / {market_status.get("stock_feed_status", "unavailable")}
+- Options feed requested/status: {market_status.get("options_feed_requested", "unavailable")} / {market_status.get("options_feed_status", "unavailable")}
+- OPRA status: {market_status.get("opra_status", "unavailable")}
+- Rate limit mode: {market_status.get("api_rate_limit_mode", "unavailable")}
+- Websocket symbol mode: {market_status.get("websocket_symbol_limit", "unavailable")}
+- Last data check: {market_status.get("last_data_check_time") or market_status.get("timestamp") or "unavailable"}
+- Feed warnings: {"; ".join(dict.fromkeys(feed_warnings)) if feed_warnings else "None recorded"}
+- Stale/feed-related records in requested window: {len(stale_or_feed_warnings)}
+
+## Watchlist
+- AAPL main focus
+- SPY/QQQ market confirmation
+
+## What to analyze
+1. Did SIP/OPRA improve the bot's data quality?
+2. Did the bot catch AAPL setups earlier?
+3. Did Phase 3 heads-up alerts fire correctly?
+4. Did the bot separate FORMING, CONFIRMED, GOOD_POSITION, LATE, and DO_NOT_CHASE correctly?
+5. Did the bot miss any obvious bullish or bearish setup?
+6. Did option data still block or warn correctly?
+7. Did alerts come too early, on time, or too late?
+8. Were any alerts blocked by:
+   - scenario stage
+   - confirmation score
+   - stock setup score
+   - risk
+   - candle quality
+   - market conflict
+   - options/OPRA
+   - stale data
+   - SMS rules
+
+## Data window
+- Requested window: {start_text} ET to {end_text} ET
+- Full redacted day logs are included where available.
+- Window-filtered JSONL files are included for alerts, scenario engine records, Phase 3 heads-up decisions, option decisions, and market-data status.
+"""
+    )
     legacy_focus_summary = (
-        "## Legacy Stock/AAPL Review\n"
-        "_No stock/AAPL scenario records were found in this window, so the legacy stock sections are hidden. Today's active evidence is Options Whale scanner data._\n"
+        ""
         if hide_legacy_stock_sections
         else f"""## Focused Summary
 - Premarket scenario records: {len(premarket)}
@@ -503,62 +550,10 @@ def build_review_summary(
 {markdown_table(["Time", "Symbol", "Feed", "Option Score", "Stock Valid", "Option Tradable", "Dashboard", "Final SMS", "Block Reason"], option_rows)}
 """
     )
-    return f"""# Bot Review Package — {day_text}
-
-## Market Data Status
-- Stock feed requested/status: {market_status.get("stock_feed_requested", "unavailable")} / {market_status.get("stock_feed_status", "unavailable")}
-- Options feed requested/status: {market_status.get("options_feed_requested", "unavailable")} / {market_status.get("options_feed_status", "unavailable")}
-- OPRA status: {market_status.get("opra_status", "unavailable")}
-- Rate limit mode: {market_status.get("api_rate_limit_mode", "unavailable")}
-- Websocket symbol mode: {market_status.get("websocket_symbol_limit", "unavailable")}
-- Last data check: {market_status.get("last_data_check_time") or market_status.get("timestamp") or "unavailable"}
-- Feed warnings: {"; ".join(dict.fromkeys(feed_warnings)) if feed_warnings else "None recorded"}
-- Stale/feed-related records in requested window: {len(stale_or_feed_warnings)}
-
-## Watchlist
-- AAPL main focus
-- SPY/QQQ market confirmation
-
-## What to analyze
-1. Did SIP/OPRA improve the bot's data quality?
-2. Did the bot catch AAPL setups earlier?
-3. Did Phase 3 heads-up alerts fire correctly?
-4. Did the bot separate FORMING, CONFIRMED, GOOD_POSITION, LATE, and DO_NOT_CHASE correctly?
-5. Did the bot miss any obvious bullish or bearish setup?
-6. Did option data still block or warn correctly?
-7. Did alerts come too early, on time, or too late?
-8. Were any alerts blocked by:
-   - scenario stage
-   - confirmation score
-   - stock setup score
-   - risk
-   - candle quality
-   - market conflict
-   - options/OPRA
-   - stale data
-   - SMS rules
-
-## Data window
-- Requested window: {start_text} ET to {end_text} ET
-- Full redacted day logs are included where available.
-- Window-filtered JSONL files are included for alerts, scenario engine records, Phase 3 heads-up decisions, option decisions, and market-data status.
-
-{legacy_focus_summary}
-
-## Options Whale Data Quality
-- Scan passes: {len(whale_scans)}
-- Canonical flow episodes: {len(whale_episodes)}
-- Episode outcomes: {len(unique_whale_outcomes)} unique episodes / {len(whale_outcomes)} rows
-- Repeated outcome update rows: {repeated_outcome_rows}
-- 15m +0.10% underlying hit rate: {round(sum(value >= .10 for value in outcome_15m) / len(outcome_15m), 4) if outcome_15m else "unavailable"}
-- 15m executable option positive rate: {round(sum(value > 0 for value in option_15m) / len(option_15m), 4) if option_15m else "unavailable"}
-- 15m average executable option return: {round(sum(option_15m) / len(option_15m), 4) if option_15m else "unavailable"}%
-- Next-day OI reviews: {len(whale_oi)}
-- OI due status: {oi_due_status}
-- OI due reason: {oi_due_reason}
-- Scan passes with coverage warnings: {len(coverage_warnings)}
-- Latest coverage warning: {(coverage_warnings[-1].get("coverage_warning") or (coverage_warnings[-1].get("diagnostics") or {}).get("coverage_warning")) if coverage_warnings else "None"}
-
+    legacy_operational_sections = (
+        ""
+        if hide_legacy_stock_sections
+        else f"""
 ## Phone Conclusions
 - Active alert types: PHASE3_HEADS_UP, STOCK_ONLY_WARNING, NORMAL_WATCH, NORMAL_SMS
 - Mixed / No Trade: {conclusion_counts["MIXED / NO TRADE"]}
@@ -617,6 +612,29 @@ def build_review_summary(
 - Sweeps near HOD/LOD/PMH/PML/PDH/PDL: {important_level_sweeps}
 - Sweeps near 5m supply/demand: {supply_demand_sweeps}
 - Sweeps inside chop range: {sum(1 for record in liquidity_sweep_records if record.get("inside_chop_range"))}
+"""
+    )
+    return f"""# Bot Review Package — {day_text}
+
+{header_sections}
+
+{legacy_focus_summary}
+
+## Options Whale Data Quality
+- Scan passes: {len(whale_scans)}
+- Canonical flow episodes: {len(whale_episodes)}
+- Episode outcomes: {len(unique_whale_outcomes)} unique episodes / {len(whale_outcomes)} rows
+- Repeated outcome update rows: {repeated_outcome_rows}
+- 15m +0.10% underlying hit rate: {round(sum(value >= .10 for value in outcome_15m) / len(outcome_15m), 4) if outcome_15m else "unavailable"}
+- 15m executable option positive rate: {round(sum(value > 0 for value in option_15m) / len(option_15m), 4) if option_15m else "unavailable"}
+- 15m average executable option return: {round(sum(option_15m) / len(option_15m), 4) if option_15m else "unavailable"}%
+- Next-day OI reviews: {len(whale_oi)}
+- OI due status: {oi_due_status}
+- OI due reason: {oi_due_reason}
+- Scan passes with coverage warnings: {len(coverage_warnings)}
+- Latest coverage warning: {(coverage_warnings[-1].get("coverage_warning") or (coverage_warnings[-1].get("diagnostics") or {}).get("coverage_warning")) if coverage_warnings else "None"}
+
+{legacy_operational_sections}
 
 {legacy_stock_sections}
 
@@ -789,12 +807,38 @@ def export_review_package(
             session_rows.setdefault(stamp.astimezone(ET).date().isoformat(), []).append(row)
     last_sessions = sorted(session_rows)[-5:]
     regression = []
+    score_rank_trend = []
     for session in last_sessions:
         rows_for_session = session_rows[session]
         windows = [next((w for w in row.get("windows") or [] if int(w.get("minutes") or 0) == 15 and w.get("status") == "ok"), None) for row in rows_for_session]
         values = [float(w["signed_move_pct"]) for w in windows if w and isinstance(w.get("signed_move_pct"), (int, float))]
         regression.append({"session": session, "sample_count": len(rows_for_session), "underlying_coverage": round(len(values) / len(rows_for_session), 4) if rows_for_session else None, "meaningful_0_10_rate": round(sum(v >= .10 for v in values) / len(values), 4) if values else None, "mean_signed_move_pct": round(sum(values) / len(values), 4) if values else None})
-    (analytics_out / "five_session_regression.json").write_text(json.dumps({"sessions": last_sessions, "rows": regression}, indent=2, sort_keys=True), encoding="utf-8")
+        for bucket in ("75-79", "80-89", "90+"):
+            bucket_rows = []
+            for row in rows_for_session:
+                score = int(float(row.get("whale_score") or 0))
+                row_bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
+                if row_bucket == bucket:
+                    bucket_rows.append(row)
+            if not bucket_rows:
+                continue
+            underlying_values = []
+            executable_values = []
+            for row in bucket_rows:
+                underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+                option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+                if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                    underlying_values.append(float(underlying["signed_move_pct"]))
+                if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                    executable_values.append(float(option["estimated_executable_return_pct"]))
+            score_rank_trend.append({
+                "session": session,
+                "score_bucket": bucket,
+                "sample_count": len(bucket_rows),
+                "meaningful_0_10_rate": round(sum(value >= .10 for value in underlying_values) / len(underlying_values), 4) if underlying_values else None,
+                "executable_positive_rate": round(sum(value > 0 for value in executable_values) / len(executable_values), 4) if executable_values else None,
+            })
+    (analytics_out / "five_session_regression.json").write_text(json.dumps({"sessions": last_sessions, "rows": regression, "score_rank_trend": score_rank_trend}, indent=2, sort_keys=True), encoding="utf-8")
     promotion_latest = latest_records_by_key((row for row in all_outcomes if row.get("reliability_bucket") and str(row.get("classification") or "").upper() != "MIXED SIGNAL"), "reliability_bucket")
     promotion = [{"bucket": row.get("reliability_bucket"), "session_count": row.get("reliability_session_count"), "effective_samples": row.get("reliability_effective_samples"), "meaningful_rate": row.get("reliability_meaningful_rate"), "executable_positive_rate": row.get("reliability_executable_positive_rate"), "status": "promotion_ready" if row.get("reliability_qualified") and row.get("reliability_dual_metric_passed") else "collecting", "manual_approval_required": True} for row in promotion_latest.values()]
     (analytics_out / "shadow_cohort_promotion_queue.json").write_text(json.dumps(promotion, indent=2, sort_keys=True, default=str), encoding="utf-8")
@@ -804,6 +848,21 @@ def export_review_package(
     except (OSError, json.JSONDecodeError):
         latest_scan_payload = {}
     (analytics_out / "contract_budget_waterfall.json").write_text(json.dumps(latest_scan_payload.get("contract_budget_waterfall") or {}, indent=2, sort_keys=True), encoding="utf-8")
+    stale_ages = latest_scan_payload.get("coverage_symbol_ages_seconds") or {}
+    stale_rows = [
+        {"symbol": symbol, "age_seconds": age}
+        for symbol, age in stale_ages.items()
+        if age is None or isinstance(age, (int, float))
+    ]
+    stale_rows.sort(key=lambda row: (-1 if row["age_seconds"] is None else -float(row["age_seconds"]), row["symbol"]))
+    (analytics_out / "stale_symbol_recovery.json").write_text(json.dumps({
+        "coverage_warning": latest_scan_payload.get("coverage_warning") or "",
+        "coverage_pressure_mode": bool(latest_scan_payload.get("coverage_pressure_mode")),
+        "coverage_pressure_reason": latest_scan_payload.get("coverage_pressure_reason") or "",
+        "prioritized_stale_symbols": latest_scan_payload.get("coverage_stale_symbols_prioritized") or [],
+        "productive_symbols_used_under_pressure": latest_scan_payload.get("coverage_pressure_productive_symbols") or [],
+        "stale_symbols": stale_rows[:100],
+    }, indent=2, sort_keys=True), encoding="utf-8")
     cost_rows: Dict[tuple[str, str], Dict[str, Any]] = {}
     score_rows: Dict[tuple[str, str], Dict[str, Any]] = {}
     for row in all_outcomes:
@@ -842,6 +901,31 @@ def export_review_package(
     (analytics_out / "score_rank_validation.json").write_text(json.dumps(score_validation, indent=2, sort_keys=True), encoding="utf-8")
     requested_outcome_rows = whale_records.get("outcomes", [])
     unique_requested_outcomes = list(latest_records_by_key(requested_outcome_rows, "alert_key", "episode_id").values())
+    underlying_right = 0
+    option_profitable = 0
+    paired_samples = 0
+    for row in unique_requested_outcomes:
+        underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        if not underlying or not option:
+            continue
+        if not isinstance(underlying.get("signed_move_pct"), (int, float)) or not isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+            continue
+        paired_samples += 1
+        if float(underlying["signed_move_pct"]) >= .10:
+            underlying_right += 1
+        if float(option["estimated_executable_return_pct"]) > 0:
+            option_profitable += 1
+    (analytics_out / "underlying_vs_option_profitability.json").write_text(json.dumps({
+        "horizon_minutes": 15,
+        "paired_samples": paired_samples,
+        "underlying_right_count": underlying_right,
+        "underlying_right_rate": round(underlying_right / paired_samples, 4) if paired_samples else None,
+        "option_profitable_count": option_profitable,
+        "option_profitable_rate": round(option_profitable / paired_samples, 4) if paired_samples else None,
+        "gap_count": underlying_right - option_profitable,
+        "interpretation": "Separates favorable +0.10% underlying movement from actually positive executable option returns.",
+    }, indent=2, sort_keys=True), encoding="utf-8")
     (analytics_out / "outcome_row_analytics.json").write_text(json.dumps({
         "headline_grain": "unique_episode",
         "raw_outcome_rows": len(requested_outcome_rows),

@@ -1282,9 +1282,14 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
     score_groups: Dict[tuple[str, str], Dict[str, Any]] = {}
     symbol_groups: Dict[str, Dict[str, Any]] = {}
     regime_groups: Dict[str, Dict[str, Any]] = {}
+    paired_underlying_option = {"samples": 0, "underlying_right": 0, "option_profitable": 0}
+    session_rows: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
         underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+        stamp = parse_scan_timestamp(row.get("detected_at") or row.get("reviewed_at"))
+        if stamp:
+            session_rows.setdefault(stamp.astimezone(ET).date().isoformat(), []).append(row)
         direction = str(row.get("flow_bias") or "UNKNOWN").upper()
         dte = str(row.get("dte_bucket") or "UNKNOWN")
         group = groups.setdefault((direction, dte), {"direction": direction, "dte_bucket": dte, "samples": 0, "midpoint": [], "spread": [], "slippage": [], "iv": [], "decay": [], "residual": [], "executable": []})
@@ -1297,6 +1302,12 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
         score_group = score_groups.setdefault((direction, bucket), {"direction": direction, "bucket": bucket, "underlying": [], "executable": []})
         if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
         if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
+        if underlying and option and isinstance(underlying.get("signed_move_pct"), (int, float)) and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+            paired_underlying_option["samples"] += 1
+            if float(underlying["signed_move_pct"]) >= 0.10:
+                paired_underlying_option["underlying_right"] += 1
+            if float(option["estimated_executable_return_pct"]) > 0:
+                paired_underlying_option["option_profitable"] += 1
         symbol = str(row.get("underlying_symbol") or "UNKNOWN").upper()
         regime = str(row.get("market_regime") or "UNKNOWN").upper()
         for collection, key in ((symbol_groups, symbol), (regime_groups, regime)):
@@ -1377,9 +1388,51 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
         "configured_contract_cap": latest_scan.get("configured_contract_cap"),
         "stale_symbol_count": len(latest_scan.get("coverage_stale_symbols") or []),
         "throttle_state": latest_scan.get("scan_budget_pressure_throttle_state") or "unknown",
+        "coverage_pressure_mode": bool(latest_scan.get("coverage_pressure_mode")),
+        "coverage_pressure_reason": latest_scan.get("coverage_pressure_reason") or "",
         "waterfall": waterfall,
     }
-    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": score_validation, "contract_budget_waterfall": waterfall, "scan_budget_pressure": scan_budget_pressure, "symbol_allow_penalty": symbol_output(), "regime_performance": regime_output(), "outcome_row_analytics": {"raw_outcome_rows": len(raw_rows), "unique_episode_rows": len(rows), "repeated_update_rows": max(0, len(raw_rows) - len(rows)), "headline_grain": "unique_episode"}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "unique_dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
+    stale_ages = latest_scan.get("coverage_symbol_ages_seconds") or {}
+    stale_rows = [{"symbol": symbol, "age_seconds": age} for symbol, age in stale_ages.items()]
+    stale_rows.sort(key=lambda row: (-1 if row["age_seconds"] is None else -float(row["age_seconds"]), row["symbol"]))
+    score_rank_trend = []
+    for session in sorted(session_rows)[-5:]:
+        for bucket in ("75-79", "80-89", "90+"):
+            bucket_rows = []
+            for row in session_rows[session]:
+                score = int(float(row.get("whale_score") or 0))
+                row_bucket = "90+" if score >= 90 else "80-89" if score >= 80 else "75-79"
+                if row_bucket == bucket:
+                    bucket_rows.append(row)
+            if not bucket_rows:
+                continue
+            underlying_values = []
+            executable_values = []
+            for row in bucket_rows:
+                underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+                option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+                if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                    underlying_values.append(float(underlying["signed_move_pct"]))
+                if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                    executable_values.append(float(option["estimated_executable_return_pct"]))
+            score_rank_trend.append({
+                "session": session,
+                "score_bucket": bucket,
+                "sample_count": len(bucket_rows),
+                "meaningful_0_10_rate": round(sum(value >= .10 for value in underlying_values) / len(underlying_values), 4) if underlying_values else None,
+                "executable_positive_rate": round(sum(value > 0 for value in executable_values) / len(executable_values), 4) if executable_values else None,
+            })
+    samples = paired_underlying_option["samples"]
+    underlying_vs_option = {
+        "horizon_minutes": 15,
+        "paired_samples": samples,
+        "underlying_right_count": paired_underlying_option["underlying_right"],
+        "underlying_right_rate": round(paired_underlying_option["underlying_right"] / samples, 4) if samples else None,
+        "option_profitable_count": paired_underlying_option["option_profitable"],
+        "option_profitable_rate": round(paired_underlying_option["option_profitable"] / samples, 4) if samples else None,
+        "gap_count": paired_underlying_option["underlying_right"] - paired_underlying_option["option_profitable"],
+    }
+    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": score_validation, "score_rank_trend": score_rank_trend, "underlying_vs_option_profitability": underlying_vs_option, "stale_symbol_recovery": {"coverage_warning": latest_scan.get("coverage_warning") or "", "coverage_pressure_mode": bool(latest_scan.get("coverage_pressure_mode")), "coverage_pressure_reason": latest_scan.get("coverage_pressure_reason") or "", "prioritized_stale_symbols": latest_scan.get("coverage_stale_symbols_prioritized") or [], "productive_symbols_used_under_pressure": latest_scan.get("coverage_pressure_productive_symbols") or [], "stale_symbols": stale_rows[:100]}, "contract_budget_waterfall": waterfall, "scan_budget_pressure": scan_budget_pressure, "symbol_allow_penalty": symbol_output(), "regime_performance": regime_output(), "outcome_row_analytics": {"raw_outcome_rows": len(raw_rows), "unique_episode_rows": len(rows), "repeated_update_rows": max(0, len(raw_rows) - len(rows)), "headline_grain": "unique_episode"}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "unique_dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
 
 
 def canonical_episode_audit() -> Dict[str, Any]:
@@ -5033,6 +5086,10 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Penalty symbols', (qualityAnalytics.symbol_allow_penalty || []).filter(row => row.status === 'penalty_watch').length, (qualityAnalytics.symbol_allow_penalty || []).some(row => row.status === 'penalty_watch') ? 'warn' : 'good'),
         card('CHOP/RANGE weak', (qualityAnalytics.regime_performance || []).filter(row => row.dashboard_only && ((row.meaningful_0_10_rate ?? 1) < 0.3 || (row.executable_positive_rate ?? 1) < 0.5)).length, 'warn'),
         card('Budget pressure', `${qualityAnalytics.scan_budget_pressure?.throttle_state ?? 'unknown'} | cap ${qualityAnalytics.scan_budget_pressure?.effective_contract_cap ?? '—'}`, qualityAnalytics.scan_budget_pressure?.throttle_state === 'normal' ? 'good' : 'warn'),
+        card('Underlying right', qualityAnalytics.underlying_vs_option_profitability?.underlying_right_rate !== null && qualityAnalytics.underlying_vs_option_profitability?.underlying_right_rate !== undefined ? `${Math.round(qualityAnalytics.underlying_vs_option_profitability.underlying_right_rate * 100)}%` : 'No data'),
+        card('Option profitable', qualityAnalytics.underlying_vs_option_profitability?.option_profitable_rate !== null && qualityAnalytics.underlying_vs_option_profitability?.option_profitable_rate !== undefined ? `${Math.round(qualityAnalytics.underlying_vs_option_profitability.option_profitable_rate * 100)}%` : 'No data', (qualityAnalytics.underlying_vs_option_profitability?.gap_count ?? 0) > 0 ? 'warn' : 'good'),
+        card('Stale recovery', `${qualityAnalytics.stale_symbol_recovery?.prioritized_stale_symbols?.length ?? 0} prioritized`, qualityAnalytics.stale_symbol_recovery?.coverage_pressure_mode ? 'warn' : 'good'),
+        card('Score trend rows', qualityAnalytics.score_rank_trend?.length ?? 0, qualityAnalytics.score_rank_validation?.passed ? 'good' : 'warn'),
         card('Contract budget', `${qualityAnalytics.contract_budget_waterfall?.contracts_evaluated ?? 0} / ${qualityAnalytics.contract_budget_waterfall?.selected_contracts ?? 0} evaluated`),
         card('Canonical complete', `${canonicalAudit.complete_count ?? 0} / ${canonicalAudit.episode_count ?? 0}`),
         card('Canonical alert episodes', dataHealth.canonical_alert_episodes?.episode_count ?? 0),

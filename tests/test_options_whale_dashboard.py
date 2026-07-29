@@ -110,6 +110,10 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         self.assertIn("Outcome grain", html)
         self.assertIn("Penalty symbols", html)
         self.assertIn("Budget pressure", html)
+        self.assertIn("Underlying right", html)
+        self.assertIn("Option profitable", html)
+        self.assertIn("Stale recovery", html)
+        self.assertIn("Score trend rows", html)
         self.assertIn("OI due status", html)
 
     def test_whale_dashboard_uses_light_theme(self):
