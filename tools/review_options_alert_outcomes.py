@@ -24,6 +24,7 @@ LATEST_PATH = APP_DIR / "data" / "options_whale_latest.json"
 OUTCOMES_PATH = APP_DIR / "data" / "options_whale_outcomes.jsonl"
 FINAL_OUTCOME_STATUSES = {"ok"}
 OUTCOME_WINDOWS = (5, 15, 30, 60)
+SIGNIFICANT_APPEND_WINDOWS = {15, 60}
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -108,15 +109,34 @@ def completed_window_count(row: Dict[str, Any]) -> int:
         return 0
 
 
+def completed_window_minutes(row: Dict[str, Any]) -> set[int]:
+    minutes: set[int] = set()
+    for window in row.get("windows") or []:
+        try:
+            minute = int(window.get("minutes"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if str(window.get("status") or "") == "ok":
+            minutes.add(minute)
+    return minutes
+
+
 def should_append_outcome(new_row: Dict[str, Any], previous: Optional[Dict[str, Any]], *, force: bool = False) -> bool:
     if force or previous is None:
-        return True
-    if completed_window_count(new_row) > completed_window_count(previous):
         return True
     previous_status = str(previous.get("outcome_status") or "")
     new_status = str(new_row.get("outcome_status") or "")
     if previous_status == "pending" and new_status not in {"pending", ""}:
         return True
+    if completed_window_count(new_row) > completed_window_count(previous):
+        previous_minutes = completed_window_minutes(previous)
+        new_minutes = completed_window_minutes(new_row)
+        newly_completed = new_minutes - previous_minutes
+        if newly_completed & SIGNIFICANT_APPEND_WINDOWS:
+            return True
+        if int(new_row.get("pending_window_count") or 0) == 0 and int(previous.get("pending_window_count") or 0) > 0:
+            return True
+        return False
     if not isinstance(previous.get("option_bar_failure"), dict) and isinstance(new_row.get("option_bar_failure"), dict):
         return True
     if str(previous.get("option_outcome_status") or "") == "option_bars_unavailable" and str(new_row.get("option_outcome_status") or "") == "ok":

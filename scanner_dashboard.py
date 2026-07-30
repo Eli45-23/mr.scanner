@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -632,8 +632,11 @@ def options_whale_auto_scan_loop() -> None:
                 if STATE.options_scan_telemetry:
                     row = STATE.options_scan_telemetry[-1]
                     row["timestamp"] = row.get("started_at")
-                    cadence_missed, delay_missed, missed_cycles = calculate_missed_cycles(cadence, start_delay, interval)
-                    row.update({"scheduled_interval_seconds": interval, "actual_cadence_seconds": round(cadence, 3) if cadence is not None else None, "start_delay_seconds": round(start_delay, 3), "overrun_seconds": round(max(0.0, float(row.get("duration_seconds") or 0) - interval), 3), "missed_cycle_count": missed_cycles, "missed_cycle_basis": "actual_cadence", "duration_overrun": bool(float(row.get("duration_seconds") or 0) > interval), "cadence_overrun": bool(cadence is not None and cadence > interval * 1.5), "warning": bool(float(row.get("duration_seconds") or 0) > interval or (cadence is not None and cadence > interval * 1.5))})
+                    gap_multiplier = float((config.get("options_whale_scanner") or {}).get("scan_missed_cycle_gap_reset_multiplier", 3.0))
+                    max_counted_gap = max(float(interval), float(interval) * max(1.0, gap_multiplier))
+                    cadence_gap_reset = bool(cadence is not None and cadence > max_counted_gap)
+                    cadence_missed, delay_missed, missed_cycles = calculate_missed_cycles(cadence, start_delay, interval, max_counted_gap_seconds=max_counted_gap)
+                    row.update({"scheduled_interval_seconds": interval, "actual_cadence_seconds": round(cadence, 3) if cadence is not None else None, "start_delay_seconds": round(start_delay, 3), "overrun_seconds": round(max(0.0, float(row.get("duration_seconds") or 0) - interval), 3), "missed_cycle_count": missed_cycles, "missed_cycle_basis": "actual_cadence", "missed_cycle_gap_reset": cadence_gap_reset, "missed_cycle_gap_reset_threshold_seconds": round(max_counted_gap, 3), "duration_overrun": bool(float(row.get("duration_seconds") or 0) > interval), "cadence_overrun": bool(cadence is not None and not cadence_gap_reset and cadence > interval * 1.5), "warning": bool(float(row.get("duration_seconds") or 0) > interval or (cadence is not None and not cadence_gap_reset and cadence > interval * 1.5))})
                     try:
                         SCAN_LOOP_TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
                         temporary = SCAN_LOOP_TELEMETRY_PATH.with_suffix(".tmp")
@@ -649,9 +652,10 @@ def options_whale_auto_scan_loop() -> None:
             next_due = time.monotonic()
 
 
-def calculate_missed_cycles(cadence_seconds: Optional[float], start_delay_seconds: float, interval_seconds: int) -> tuple[int, int, int]:
+def calculate_missed_cycles(cadence_seconds: Optional[float], start_delay_seconds: float, interval_seconds: int, *, max_counted_gap_seconds: Optional[float] = None) -> tuple[int, int, int]:
     interval = max(1, int(interval_seconds))
-    cadence_missed = max(0, math.ceil(float(cadence_seconds) / interval) - 1) if cadence_seconds is not None else 0
+    cadence_gap_reset = bool(max_counted_gap_seconds and cadence_seconds is not None and float(cadence_seconds) > float(max_counted_gap_seconds))
+    cadence_missed = 0 if cadence_gap_reset else max(0, math.ceil(float(cadence_seconds) / interval) - 1) if cadence_seconds is not None else 0
     delay_missed = max(0, int(max(0.0, start_delay_seconds) // interval))
     return cadence_missed, delay_missed, max(cadence_missed, delay_missed)
 
@@ -1280,8 +1284,10 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
     rows = [row for row in _latest_outcome_rows() if str(row.get("classification") or "").upper() != "MIXED SIGNAL"]
     groups: Dict[tuple[str, str], Dict[str, Any]] = {}
     score_groups: Dict[tuple[str, str], Dict[str, Any]] = {}
+    score_groups_dte: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     symbol_groups: Dict[str, Dict[str, Any]] = {}
     regime_groups: Dict[str, Dict[str, Any]] = {}
+    time_groups: Dict[tuple[str, str], Dict[str, Any]] = {}
     paired_underlying_option = {"samples": 0, "underlying_right": 0, "option_profitable": 0}
     session_rows: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -1302,12 +1308,26 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
         score_group = score_groups.setdefault((direction, bucket), {"direction": direction, "bucket": bucket, "underlying": [], "executable": []})
         if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): score_group["underlying"].append(float(underlying["signed_move_pct"]))
         if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): score_group["executable"].append(float(option["estimated_executable_return_pct"]))
+        dte_score_group = score_groups_dte.setdefault((direction, dte, bucket), {"direction": direction, "dte_bucket": dte, "bucket": bucket, "underlying": [], "executable": []})
+        if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)): dte_score_group["underlying"].append(float(underlying["signed_move_pct"]))
+        if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)): dte_score_group["executable"].append(float(option["estimated_executable_return_pct"]))
         if underlying and option and isinstance(underlying.get("signed_move_pct"), (int, float)) and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
             paired_underlying_option["samples"] += 1
             if float(underlying["signed_move_pct"]) >= 0.10:
                 paired_underlying_option["underlying_right"] += 1
             if float(option["estimated_executable_return_pct"]) > 0:
                 paired_underlying_option["option_profitable"] += 1
+        if stamp:
+            local_time = stamp.astimezone(ET).time()
+            time_bucket = "morning_0930_1100" if local_time < datetime_time(11, 0) else "midday_1100_1300" if local_time < datetime_time(13, 0) else "afternoon_1300_1600"
+            time_group = time_groups.setdefault((time_bucket, direction), {"time_bucket": time_bucket, "direction": direction, "episodes": 0, "underlying": [], "meaningful_0_10": [], "executable": []})
+            time_group["episodes"] += 1
+            if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                signed = float(underlying["signed_move_pct"])
+                time_group["underlying"].append(signed)
+                time_group["meaningful_0_10"].append(signed >= 0.10)
+            if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                time_group["executable"].append(float(option["estimated_executable_return_pct"]))
         symbol = str(row.get("underlying_symbol") or "UNKNOWN").upper()
         regime = str(row.get("market_regime") or "UNKNOWN").upper()
         for collection, key in ((symbol_groups, symbol), (regime_groups, regime)):
@@ -1364,6 +1384,79 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
                 "status": status,
             })
         return sorted(output, key=lambda row: (row["status"] != "penalty_watch", -(row["executable_samples"] or 0), row["symbol"]))
+    def intraday_symbol_output() -> List[Dict[str, Any]]:
+        latest_session = sorted(session_rows)[-1] if session_rows else ""
+        latest_rows = session_rows.get(latest_session, [])
+        latest_symbols: Dict[str, Dict[str, Any]] = {}
+        for row in latest_rows:
+            option = next((item for item in row.get("option_windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+            underlying = next((item for item in row.get("windows") or [] if int(item.get("minutes") or 0) == 15 and item.get("status") == "ok"), None)
+            symbol = str(row.get("underlying_symbol") or "UNKNOWN").upper()
+            bucket_row = latest_symbols.setdefault(symbol, {"symbol": symbol, "session": latest_session, "unique_episodes": 0, "underlying": [], "meaningful_0_10": [], "executable": []})
+            bucket_row["unique_episodes"] += 1
+            if underlying and isinstance(underlying.get("signed_move_pct"), (int, float)):
+                signed = float(underlying["signed_move_pct"])
+                bucket_row["underlying"].append(signed)
+                bucket_row["meaningful_0_10"].append(signed >= 0.10)
+            if option and isinstance(option.get("estimated_executable_return_pct"), (int, float)):
+                bucket_row["executable"].append(float(option["estimated_executable_return_pct"]))
+        output = []
+        for symbol, group in latest_symbols.items():
+            executable = group["executable"]
+            positive_rate = sum(value > 0 for value in executable) / len(executable) if executable else None
+            mean_return = _avg(executable)
+            status = "collecting"
+            if len(executable) >= 4:
+                status = "allow_watch" if positive_rate is not None and positive_rate >= 0.50 and (mean_return or 0) >= 0 else "penalty_watch"
+            elif executable and ((mean_return or 0) < 0 or (positive_rate is not None and positive_rate < 0.40)):
+                status = "penalty_watch"
+            output.append({
+                "symbol": symbol,
+                "session": group["session"],
+                "unique_episodes": group["unique_episodes"],
+                "underlying_15m_samples": len(group["underlying"]),
+                "meaningful_0_10_rate": round(sum(group["meaningful_0_10"]) / len(group["meaningful_0_10"]), 4) if group["meaningful_0_10"] else None,
+                "executable_samples": len(executable),
+                "executable_positive_rate": round(positive_rate, 4) if positive_rate is not None else None,
+                "mean_executable_return_pct": mean_return,
+                "status": status,
+            })
+        return sorted(output, key=lambda row: (row["status"] != "penalty_watch", row["status"] != "allow_watch", -(row["executable_samples"] or 0), row["symbol"]))
+    def time_of_day_output() -> List[Dict[str, Any]]:
+        output = []
+        for group in time_groups.values():
+            executable = group["executable"]
+            output.append({
+                "time_bucket": group["time_bucket"],
+                "direction": group["direction"],
+                "unique_episodes": group["episodes"],
+                "meaningful_0_10_rate": round(sum(group["meaningful_0_10"]) / len(group["meaningful_0_10"]), 4) if group["meaningful_0_10"] else None,
+                "executable_samples": len(executable),
+                "executable_positive_rate": round(sum(value > 0 for value in executable) / len(executable), 4) if executable else None,
+                "mean_executable_return_pct": _avg(executable),
+            })
+        return sorted(output, key=lambda row: (row["time_bucket"], row["direction"]))
+    def score_rank_direction_dte_output() -> List[Dict[str, Any]]:
+        output = []
+        for direction, dte_bucket in sorted({(key[0], key[1]) for key in score_groups_dte}):
+            rows_for_key = []
+            for name in ("75-79", "80-89", "90+"):
+                group = score_groups_dte.get((direction, dte_bucket, name))
+                if not group:
+                    continue
+                rows_for_key.append({
+                    "bucket": name,
+                    "underlying_samples": len(group["underlying"]),
+                    "meaningful_0_10_rate": round(sum(value >= .10 for value in group["underlying"]) / len(group["underlying"]), 4) if group["underlying"] else None,
+                    "executable_samples": len(group["executable"]),
+                    "executable_positive_rate": round(sum(value > 0 for value in group["executable"]) / len(group["executable"]), 4) if group["executable"] else None,
+                })
+            meaningful_values = [row["meaningful_0_10_rate"] for row in rows_for_key if row["meaningful_0_10_rate"] is not None]
+            executable_values = [row["executable_positive_rate"] for row in rows_for_key if row["executable_positive_rate"] is not None]
+            meaningful_ok = len(meaningful_values) >= 2 and all(right >= left for left, right in zip(meaningful_values, meaningful_values[1:]))
+            executable_ok = len(executable_values) >= 2 and all(right >= left for left, right in zip(executable_values, executable_values[1:]))
+            output.append({"direction": direction, "dte_bucket": dte_bucket, "passed": meaningful_ok and executable_ok, "meaningful_monotonic": meaningful_ok, "executable_monotonic": executable_ok, "rows": rows_for_key})
+        return output
     def regime_output() -> List[Dict[str, Any]]:
         output = []
         for regime, group in regime_groups.items():
@@ -1432,7 +1525,8 @@ def options_whales_quality_analytics() -> Dict[str, Any]:
         "option_profitable_rate": round(paired_underlying_option["option_profitable"] / samples, 4) if samples else None,
         "gap_count": paired_underlying_option["underlying_right"] - paired_underlying_option["option_profitable"],
     }
-    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": score_validation, "score_rank_trend": score_rank_trend, "underlying_vs_option_profitability": underlying_vs_option, "stale_symbol_recovery": {"coverage_warning": latest_scan.get("coverage_warning") or "", "coverage_pressure_mode": bool(latest_scan.get("coverage_pressure_mode")), "coverage_pressure_reason": latest_scan.get("coverage_pressure_reason") or "", "prioritized_stale_symbols": latest_scan.get("coverage_stale_symbols_prioritized") or [], "productive_symbols_used_under_pressure": latest_scan.get("coverage_pressure_productive_symbols") or [], "stale_symbols": stale_rows[:100]}, "contract_budget_waterfall": waterfall, "scan_budget_pressure": scan_budget_pressure, "symbol_allow_penalty": symbol_output(), "regime_performance": regime_output(), "outcome_row_analytics": {"raw_outcome_rows": len(raw_rows), "unique_episode_rows": len(rows), "repeated_update_rows": max(0, len(raw_rows) - len(rows)), "headline_grain": "unique_episode"}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "unique_dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
+    score_rank_by_direction_dte = score_rank_direction_dte_output()
+    return {"timestamp": datetime.now(timezone.utc).isoformat(), "net_cost_calibration": calibration, "score_rank_validation": score_validation, "score_rank_trend": score_rank_trend, "score_rank_by_direction_dte": score_rank_by_direction_dte, "score_rank_failed_by_direction_dte": [row for row in score_rank_by_direction_dte if not row["passed"]], "time_of_day_performance": time_of_day_output(), "underlying_vs_option_profitability": underlying_vs_option, "stale_symbol_recovery": {"coverage_warning": latest_scan.get("coverage_warning") or "", "coverage_pressure_mode": bool(latest_scan.get("coverage_pressure_mode")), "coverage_pressure_reason": latest_scan.get("coverage_pressure_reason") or "", "prioritized_stale_symbols": latest_scan.get("coverage_stale_symbols_prioritized") or [], "productive_symbols_used_under_pressure": latest_scan.get("coverage_pressure_productive_symbols") or [], "stale_symbols": stale_rows[:100]}, "contract_budget_waterfall": waterfall, "scan_budget_pressure": scan_budget_pressure, "symbol_allow_penalty": symbol_output(), "intraday_symbol_score": intraday_symbol_output(), "regime_performance": regime_output(), "outcome_row_analytics": {"raw_outcome_rows": len(raw_rows), "unique_episode_rows": len(rows), "repeated_update_rows": max(0, len(raw_rows) - len(rows)), "headline_grain": "unique_episode", "repeated_rows_hidden_by_default": True}, "noise_ratio": {"dashboard_episodes": dashboard_episodes, "unique_dashboard_episodes": dashboard_episodes, "actionable_or_tier1": actionable, "ratio": round(noise_ratio, 4), "suppressed_noise_count": latest_scan.get("episode_noise_suppressed_count", 0)}, "tier1_gate_unchanged": True}
 
 
 def canonical_episode_audit() -> Dict[str, Any]:
@@ -5081,6 +5175,8 @@ WHALE_INDEX_HTML = r"""<!doctype html>
         card('Promotion-ready cohorts', (reliability.promotion_queue || []).filter(row => row.status === 'promotion_ready').length),
         card('Score rank validation', qualityAnalytics.score_rank_validation?.passed ? 'Passed' : 'Blocked', qualityAnalytics.score_rank_validation?.passed ? 'good' : 'warn'),
         card('Score rank warning', qualityAnalytics.score_rank_validation?.warning ? 'Failed' : 'OK', qualityAnalytics.score_rank_validation?.warning ? 'warn' : 'good'),
+        card('Score rank DTE fails', qualityAnalytics.score_rank_failed_by_direction_dte?.length ?? 0, (qualityAnalytics.score_rank_failed_by_direction_dte?.length ?? 0) ? 'warn' : 'good'),
+        card('Strong watch symbols', (qualityAnalytics.intraday_symbol_score || []).filter(row => row.status === 'allow_watch').length, 'good'),
         card('Noise ratio', `${qualityAnalytics.noise_ratio?.dashboard_episodes ?? 0} : ${qualityAnalytics.noise_ratio?.actionable_or_tier1 ?? 0}`, (qualityAnalytics.noise_ratio?.ratio ?? 0) > 10 ? 'warn' : 'good'),
         card('Outcome grain', `${qualityAnalytics.outcome_row_analytics?.unique_episode_rows ?? 0} unique / ${qualityAnalytics.outcome_row_analytics?.raw_outcome_rows ?? 0} rows`, (qualityAnalytics.outcome_row_analytics?.repeated_update_rows ?? 0) ? 'warn' : 'good'),
         card('Penalty symbols', (qualityAnalytics.symbol_allow_penalty || []).filter(row => row.status === 'penalty_watch').length, (qualityAnalytics.symbol_allow_penalty || []).some(row => row.status === 'penalty_watch') ? 'warn' : 'good'),
@@ -5120,7 +5216,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
           <td>${money(candidateField(item, 'strike'))}</td><td>${esc(candidateField(item, 'expiration') || '')}</td><td>${esc(candidateField(item, 'dte') ?? '')}</td><td>${esc(candidateField(item, 'moneyness') || '')}</td>
           <td>${intFmt(candidateField(item, 'volume'))}</td><td>${intFmt(candidateField(item, 'open_interest'))}</td><td>${esc(candidateField(item, 'volume_oi_ratio') ?? '')}</td><td>${money(item.contract_price_paid || candidateField(item, 'contract_price_paid') || candidateField(item, 'last') || candidateField(item, 'midpoint'))}</td>
           <td>${num(candidateField(item, 'spread_percent'), '%')}</td><td>${money(candidateField(item, 'estimated_premium'))}</td><td>${esc(freshness)}${freshnessNote}</td><td><span class="score">${esc(item.whale_score || item.score || 0)}</span></td>
-          <td>${esc(item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(memoryText(item))}</td><td>${esc(outcomeText(item))}</td><td>${esc(optionFollowText(item))}</td><td>${esc(item.reason_summary || '')}</td>
+          <td>${esc(item.dashboard_strong_watch ? 'Strong Watch' : item.classification || '')}</td><td>${esc(item.direction_label || '')}</td><td>${esc(item.price_confirmation_label || '')}</td><td>${esc(memoryText(item))}</td><td>${esc(outcomeText(item))}</td><td>${esc(optionFollowText(item))}</td><td>${esc(item.reason_summary || '')}</td>
         </tr>`;
       };
       const debugRow = (item, idx) => `
@@ -5185,6 +5281,7 @@ WHALE_INDEX_HTML = r"""<!doctype html>
       els.detailPanel.innerHTML = `
         <div class="detail-grid">
           <div class="card"><span class="label">Important Flow Info</span><div>Contract: ${esc(item.display_contract || cf('display_contract') || cf('option_symbol'))}<br>Moneyness: ${esc(item.display_moneyness || cf('display_moneyness') || cf('moneyness'))}<br>Total premium: ${money(cf('estimated_premium'))}<br>Price paid: ${money(item.contract_price_paid || cf('contract_price_paid'))}<br>Watch only — not a trade signal</div></div>
+          <div class="card"><span class="label">Dashboard watch lane</span><div>${esc(item.dashboard_strong_watch ? 'Strong dashboard watch — no notification' : item.dashboard_watch_label || 'watch only')}<br>${esc((item.dashboard_watch_reasons || []).join('; ') || 'No watch-lane note')}</div></div>
           <div class="card"><span class="label">Contract</span><div>${esc(cf('option_symbol'))} ${esc(cf('option_type'))} ${money(cf('strike'))} exp ${esc(cf('expiration'))}</div></div>
           <div class="card"><span class="label">Premium Time</span><div>${esc(flowCaution)}<br>Reported trade time ET: ${esc(formatMarketTime(cf('trade_time')))}<br>Quote time ET: ${esc(formatMarketTime(cf('quote_time')))}<br>Scanner detected ET: ${esc(formatMarketTime(cf('time_detected')))}<br>Reported trade time raw: ${esc(item.reported_trade_time || cf('reported_trade_time') || cf('trade_time') || 'unavailable')}<br>Quote time raw: ${esc(item.reported_quote_time || cf('reported_quote_time') || cf('quote_time') || 'unavailable')}<br>Scanner detected raw: ${esc(item.scanner_detected_time || cf('scanner_detected_time') || cf('time_detected') || 'unavailable')}<br>Delay: ${esc(item.premium_trade_delay_seconds ?? cf('premium_trade_delay_seconds') ?? 'n/a')} seconds<br>Trade print age: ${ageText}<br>Fresh flow label: ${esc(freshLabel)}<br>Stale warning: ${esc(staleWarning || item.premium_timing_warning || cf('premium_timing_warning') || 'None')}</div></div>
           <div class="card"><span class="label">Pressure</span><div>${esc(item.premium_pressure_label || cf('premium_pressure_label') || 'unknown')} | ${esc(item.premium_pressure_confidence || cf('premium_pressure_confidence') || '')}<br>${esc(item.premium_pressure_reason || cf('premium_pressure_reason') || '')}</div></div>

@@ -96,6 +96,7 @@ def default_options_whale_config() -> Dict[str, Any]:
         "deadline_min_contracts_per_scan": 500,
         "scan_cadence_target_seconds": 30,
         "scan_cadence_overrun_multiplier": 1.50,
+        "scan_missed_cycle_gap_reset_multiplier": 3.0,
         "coverage_pressure_mode_enabled": True,
         "coverage_pressure_core_budget_fraction": 0.35,
         "coverage_pressure_max_rotation_symbols": 8,
@@ -129,6 +130,16 @@ def default_options_whale_config() -> Dict[str, Any]:
         "episode_noise_require_aligned_regime": True,
         "episode_noise_block_regimes": ["CHOPPY", "RANGE_BOUND"],
         "episode_noise_min_price_confirmation_score": 6,
+        "dashboard_strong_watch_enabled": True,
+        "dashboard_strong_watch_min_score": 85,
+        "dashboard_strong_watch_min_price_confirmation_score": 7,
+        "dashboard_strong_watch_min_premium": 150000,
+        "dashboard_strong_watch_max_spread_percent": 10,
+        "dashboard_strong_watch_min_direction_confidence": "MEDIUM",
+        "late_bullish_0dte_extension_risk_enabled": True,
+        "late_bullish_0dte_cutoff_et": "13:15",
+        "late_bullish_0dte_min_price_confirmation_score": 8,
+        "late_bullish_0dte_score_penalty": 6,
         "active_episode_quote_minutes": 75,
         "active_episode_quote_limit": 500,
         "index_0dte_min_score": 85,
@@ -1111,6 +1122,9 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if bias == "BEARISH" and not result.get("bearish_oversight_passed", True):
         result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + list(result.get("bearish_oversight_reasons") or [])))})
         return "Tier 3", False, "Bearish flow requires stronger confirmation before high-rank dashboard promotion."
+    if result.get("late_extension_risk"):
+        result.update({"cohort_tier1_gate_passed": False, "cohort_tier1_gate_reasons": list(dict.fromkeys(cohort_reasons + [result.get("late_extension_risk_reason") or "late 0DTE extension risk"]))})
+        return "Tier 3", False, "Late 0DTE bullish extension is dashboard-only until price confirmation improves."
     if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"} or result.get("net_executable_edge_warning"):
         return "Tier 3", False, "Recent net executable option-return edge is weak; dashboard-only watch until performance improves."
     if score >= int(cfg.get("tier1_min_score", 95)) and result.get("aggression_side") == "near_ask" and safe_float(candidate.get("estimated_premium")) >= float(cfg.get("min_premium", 100000)) and (spread is None or safe_float(spread) <= cfg.get("max_spread_percent", 15)) and result.get("price_context_score", 0) >= int(cfg.get("tier1_min_price_context", 8)):
@@ -1124,6 +1138,104 @@ def result_alert_tier(result: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str,
     if score >= 75:
         return "Tier 3", False, "Unusual but unclear; watch only."
     return "Ignore", False, "Below whale-flow threshold."
+
+
+def _detected_market_time(result: Dict[str, Any]) -> Optional[datetime_time]:
+    candidate = result.get("candidate") or {}
+    stamp = _parse_iso_time(candidate.get("time_detected") or candidate.get("trade_time") or result.get("timestamp"))
+    return stamp.astimezone(MARKET_TIMEZONE).time() if stamp else None
+
+
+def _clock_value(value: Any) -> Optional[datetime_time]:
+    try:
+        hour_text, minute_text = str(value).strip().split(":", 1)
+        return datetime_time(int(hour_text), int(minute_text[:2]))
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_late_0dte_extension_gate(result: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    if not bool(cfg.get("late_bullish_0dte_extension_risk_enabled", True)):
+        result["late_extension_risk"] = False
+        return result
+    candidate = result.get("candidate") or {}
+    cutoff = _clock_value(cfg.get("late_bullish_0dte_cutoff_et", "13:15"))
+    detected_time = _detected_market_time(result)
+    is_bullish_call = infer_direction_bias_label(result) == "BULLISH" and str(candidate.get("option_type") or "").lower() == "call"
+    is_zero_dte = int(candidate.get("dte") or 0) == 0
+    price_score = safe_float(result.get("price_confirmation_score"))
+    min_price = float(cfg.get("late_bullish_0dte_min_price_confirmation_score", 8))
+    if not (cutoff and detected_time and is_bullish_call and is_zero_dte and detected_time >= cutoff and price_score < min_price):
+        result["late_extension_risk"] = False
+        return result
+    original = int(result.get("whale_score") or 0)
+    penalty = int(cfg.get("late_bullish_0dte_score_penalty", 6))
+    result["late_extension_risk"] = True
+    result["late_extension_risk_reason"] = (
+        f"Late 0DTE bullish call after {cutoff.strftime('%H:%M')} ET needs price confirmation "
+        f"{min_price:g}+; observed {price_score:g}."
+    )
+    result["pre_late_extension_whale_score"] = original
+    result["late_extension_score_adjustment"] = -penalty
+    result["whale_score"] = max(0, original - penalty)
+    result["noise_adjusted_score"] = result["whale_score"]
+    result["classification"] = classify_score(result["whale_score"])
+    warnings = list(result.get("score_warnings") or [])
+    warnings.append("late 0DTE bullish extension risk; dashboard-only unless confirmation improves")
+    result["score_warnings"] = list(dict.fromkeys(warnings))
+    return result
+
+
+def apply_dashboard_strong_watch(result: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    result.setdefault("dashboard_watch_label", "")
+    result.setdefault("dashboard_strong_watch", False)
+    result.setdefault("dashboard_watch_reasons", [])
+    if not bool(cfg.get("dashboard_strong_watch_enabled", True)):
+        return result
+    if result.get("should_notify") or result.get("alert_tier") == "Tier 1":
+        return result
+    candidate = result.get("candidate") or {}
+    confidence_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    required_confidence = str(cfg.get("dashboard_strong_watch_min_direction_confidence", "MEDIUM")).upper()
+    observed_confidence = str(result.get("direction_confidence") or candidate.get("direction_confidence") or "LOW").upper()
+    spread = candidate.get("spread_percent")
+    reasons: List[str] = []
+    if int(result.get("whale_score") or 0) < int(cfg.get("dashboard_strong_watch_min_score", 85)):
+        reasons.append("score below strong-watch threshold")
+    if safe_float(result.get("price_confirmation_score")) < float(cfg.get("dashboard_strong_watch_min_price_confirmation_score", 7)):
+        reasons.append("price confirmation below strong-watch threshold")
+    if safe_float(candidate.get("estimated_premium")) < float(cfg.get("dashboard_strong_watch_min_premium", 150000)):
+        reasons.append("premium below strong-watch threshold")
+    if spread is None or safe_float(spread) > float(cfg.get("dashboard_strong_watch_max_spread_percent", 10)):
+        reasons.append("spread too wide for strong watch")
+    if confidence_rank.get(observed_confidence, 0) < confidence_rank.get(required_confidence, 1):
+        reasons.append("direction confidence below strong-watch threshold")
+    if bool(candidate.get("stale_trade_print")) or str(candidate.get("fresh_flow_label") or "").lower() != "fresh premium print":
+        reasons.append("not a fresh premium print")
+    if not _aligned_regime_for_episode(result):
+        reasons.append("regime not aligned with flow direction")
+    if str(result.get("market_regime") or "").upper() in {"CHOPPY", "RANGE_BOUND"}:
+        reasons.append("choppy/range-bound regime is context only")
+    if str(result.get("executable_edge_label") or "") in {"penalize_symbol_bias", "minimum_executable_edge_failed"} or result.get("net_executable_edge_warning"):
+        reasons.append("net executable edge is weak")
+    if result.get("late_extension_risk"):
+        reasons.append("late extension risk")
+    if infer_direction_bias_label(result) == "BEARISH" and not result.get("bearish_oversight_passed", True):
+        reasons.append("bearish oversight failed")
+    if reasons:
+        result["dashboard_watch_label"] = "watch_only"
+        result["dashboard_watch_reasons"] = list(dict.fromkeys(reasons))
+        return result
+    lock_reasons = []
+    if result.get("score_rank_validation_passed") is False:
+        lock_reasons.append("Tier-1 locked: score-rank validation failed")
+    if not result.get("reliability_qualified"):
+        lock_reasons.append("Tier-1 locked: reliability cohort still collecting")
+    result["dashboard_watch_label"] = "strong_dashboard_watch"
+    result["dashboard_strong_watch"] = True
+    result["dashboard_watch_reasons"] = lock_reasons or ["high-quality dashboard watch; no notification without Tier-1 proof"]
+    result["notification_eligible"] = False
+    return result
 
 
 def _aligned_regime_for_episode(result: Dict[str, Any]) -> bool:
@@ -1168,6 +1280,8 @@ def dashboard_episode_noise_reasons(result: Dict[str, Any], cfg: Dict[str, Any])
         reasons.append("recent executable option edge is too weak for episode registration")
     if result.get("net_executable_edge_warning"):
         reasons.append("net executable option edge is below dashboard-rank minimum")
+    if result.get("late_extension_risk"):
+        reasons.append(result.get("late_extension_risk_reason") or "late 0DTE extension risk")
     if result.get("score_rank_validation_passed") is False:
         reasons.append("score-rank validation failed; keep out of canonical learning")
     return list(dict.fromkeys(reasons))
@@ -2030,6 +2144,7 @@ class OptionsWhaleScanner:
             else:
                 result.update({"executable_edge_label": "disabled_or_no_history", "executable_edge_score_adjustment": 0})
             result = apply_bearish_flow_oversight(result, effective_cfg)
+            result = apply_late_0dte_extension_gate(result, effective_cfg)
             if str(result.get("market_regime") or "").upper() in {"CHOPPY", "RANGE_BOUND"}:
                 original_regime_score = int(result.get("whale_score") or 0)
                 regime_penalty = int(effective_cfg.get("range_choppy_dashboard_penalty", 10))
@@ -2050,6 +2165,7 @@ class OptionsWhaleScanner:
                 should_notify = False
                 notify_reason = "DEBUG LOOSE MODE — not alert quality; notifications disabled."
             result.update({"alert_tier": tier, "should_notify": should_notify, "notify_reason": notify_reason, "disclaimer": DISCLAIMER})
+            result = apply_dashboard_strong_watch(result, effective_cfg)
             if debug_loose:
                 result["debug_loose_mode"] = True
                 result["debug_label"] = "DEBUG LOOSE MODE — not alert quality"

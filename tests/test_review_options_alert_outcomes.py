@@ -163,6 +163,28 @@ class ReviewOptionsAlertOutcomesTests(unittest.TestCase):
         self.assertEqual(forced["appended_count"], 1)
         self.assertEqual(len(rows), 2)
 
+    def test_should_append_outcome_suppresses_non_significant_repeated_updates(self):
+        previous = {
+            "outcome_status": "pending",
+            "completed_window_count": 2,
+            "pending_window_count": 2,
+            "windows": [{"minutes": 5, "status": "ok"}, {"minutes": 15, "status": "ok"}],
+        }
+        thirty_minute_update = {
+            "outcome_status": "pending",
+            "completed_window_count": 3,
+            "pending_window_count": 1,
+            "windows": [{"minutes": 5, "status": "ok"}, {"minutes": 15, "status": "ok"}, {"minutes": 30, "status": "ok"}],
+        }
+        final_update = {
+            "outcome_status": "ok",
+            "completed_window_count": 4,
+            "pending_window_count": 0,
+            "windows": [{"minutes": 5, "status": "ok"}, {"minutes": 15, "status": "ok"}, {"minutes": 30, "status": "ok"}, {"minutes": 60, "status": "ok"}],
+        }
+        self.assertFalse(review_tool.should_append_outcome(thirty_minute_update, previous))
+        self.assertTrue(review_tool.should_append_outcome(final_update, previous))
+
     def test_pending_alert_later_appends_when_windows_complete(self):
         detected = datetime(2026, 6, 18, 16, 33, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -8,7 +8,9 @@ from scanner.options_whale_scanner import (
     OptionsWhaleScanner,
     apply_index_0dte_noise_filter,
     apply_bearish_flow_oversight,
+    apply_dashboard_strong_watch,
     apply_executable_edge_memory,
+    apply_late_0dte_extension_gate,
     apply_symbol_bias_memory,
     apply_reliability_adjustment,
     attach_flow_episode_context,
@@ -646,6 +648,44 @@ class OptionsWhaleScannerTests(unittest.TestCase):
         self.assertEqual(tier, "Tier 2")
         self.assertFalse(notify)
         self.assertIn("score-rank", reason)
+
+    def test_late_bullish_zero_dte_extension_gate_penalizes_weak_confirmation(self):
+        result = {
+            "candidate": {"dte": 0, "option_type": "CALL", "time_detected": "2026-07-29T18:20:00Z"},
+            "flow_bias": "BULLISH",
+            "whale_score": 88,
+            "price_confirmation_score": 6,
+            "classification": "PREMIUM",
+        }
+        gated = apply_late_0dte_extension_gate(result, {"late_bullish_0dte_score_penalty": 6})
+        self.assertTrue(gated["late_extension_risk"])
+        self.assertEqual(gated["whale_score"], 82)
+        self.assertIn("Late 0DTE bullish", gated["late_extension_risk_reason"])
+
+    def test_strong_dashboard_watch_never_notifies(self):
+        result = {
+            "candidate": {
+                "dte": 1,
+                "option_type": "CALL",
+                "estimated_premium": 250000,
+                "spread_percent": 4,
+                "fresh_flow_label": "Fresh premium print",
+            },
+            "flow_bias": "BULLISH",
+            "direction_confidence": "HIGH",
+            "market_regime": "TRENDING_UP",
+            "whale_score": 88,
+            "price_confirmation_score": 8,
+            "alert_tier": "Tier 2",
+            "should_notify": False,
+            "reliability_qualified": False,
+            "score_rank_validation_passed": False,
+        }
+        watched = apply_dashboard_strong_watch(result, {})
+        self.assertTrue(watched["dashboard_strong_watch"])
+        self.assertEqual(watched["dashboard_watch_label"], "strong_dashboard_watch")
+        self.assertFalse(watched["notification_eligible"])
+        self.assertFalse(watched["should_notify"])
 
     def test_universal_tier1_gate_blocks_misaligned_bullish_flow(self):
         result = {

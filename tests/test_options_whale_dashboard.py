@@ -133,6 +133,7 @@ class OptionsWhaleDashboardTests(unittest.TestCase):
         cadence_missed, delay_missed, total = scanner_dashboard.calculate_missed_cycles(107.5, 0, 30)
         self.assertEqual((cadence_missed, delay_missed, total), (3, 0, 3))
         self.assertEqual(scanner_dashboard.calculate_missed_cycles(29.5, 0, 30)[2], 0)
+        self.assertEqual(scanner_dashboard.calculate_missed_cycles(3600, 0, 30, max_counted_gap_seconds=90)[2], 0)
 
     def test_oi_job_persists_prior_session_selection_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
